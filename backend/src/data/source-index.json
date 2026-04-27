@@ -1,0 +1,198 @@
+{
+  "description": "资料库结构化索引，用于 AI 引导搜索定位。按书籍类型分组，标注时间范围和关键内容标签。",
+  "categories": {
+    "编年体": {
+      "description": "按年份编排的史料，适合通过时间/年号/皇帝定位",
+      "books": [
+        {
+          "slug": "guoque",
+          "title": "国榷",
+          "timeRange": "1328-1644",
+          "segments": [
+            { "chapters": "卷一~卷四", "era": "太祖洪武", "years": "1328-1398" },
+            { "chapters": "卷五~卷六", "era": "惠帝建文", "years": "1399-1402" },
+            { "chapters": "卷七~卷十一", "era": "成祖永乐", "years": "1403-1424" },
+            { "chapters": "卷十二~卷十三", "era": "仁宗洪熙·宣宗宣德", "years": "1425-1435" },
+            { "chapters": "卷十四~卷二十", "era": "英宗正统·代宗景泰·英宗天顺", "years": "1436-1464" },
+            { "chapters": "卷二十一~卷三十", "era": "宪宗成化", "years": "1465-1487" },
+            { "chapters": "卷三十一~卷四十", "era": "孝宗弘治", "years": "1488-1505" },
+            { "chapters": "卷四十一~卷五十", "era": "武宗正德", "years": "1506-1521" },
+            { "chapters": "卷五十一~卷七十", "era": "世宗嘉靖", "years": "1522-1566" },
+            { "chapters": "卷七十一~卷七十五", "era": "穆宗隆庆", "years": "1567-1572" },
+            { "chapters": "卷七十六~卷九十", "era": "神宗万历", "years": "1573-1620" },
+            { "chapters": "卷九十一~卷九十二", "era": "光宗泰昌·熹宗天启", "years": "1620-1627" },
+            { "chapters": "卷九十三~卷一百零四", "era": "思宗崇祯", "years": "1628-1644" }
+          ]
+        },
+        {
+          "slug": "ming-tong-jian",
+          "title": "明通鉴",
+          "timeRange": "1352-1644",
+          "segments": [
+            { "chapters": "前编卷一~前编卷四", "era": "起兵至建国", "years": "1352-1368" },
+            { "chapters": "第一卷~第十卷", "era": "洪武", "years": "1368-1398" },
+            { "chapters": "第十一卷~第十五卷", "era": "建文·永乐", "years": "1399-1424" },
+            { "chapters": "第十六卷~第三十卷", "era": "洪熙至天顺", "years": "1425-1464" },
+            { "chapters": "第三十一卷~第五十卷", "era": "成化至正德", "years": "1465-1521" },
+            { "chapters": "第五十一卷~第七十卷", "era": "嘉靖·隆庆", "years": "1522-1572" },
+            { "chapters": "第七十一卷~第九十卷", "era": "万历·泰昌·天启", "years": "1573-1627" },
+            { "chapters": "第九十一卷~第一百卷", "era": "崇祯", "years": "1628-1644" }
+          ]
+        },
+        {
+          "slug": "ming-shi-lu",
+          "title": "明实录",
+          "timeRange": "1368-1644",
+          "segments": [
+            { "chapters": "明太祖实录", "era": "太祖洪武", "years": "1368-1398" },
+            { "chapters": "明实录太宗实录", "era": "成祖永乐", "years": "1403-1424" },
+            { "chapters": "明实录仁宗实录", "era": "仁宗洪熙", "years": "1424-1425" },
+            { "chapters": "明实录宣宗实录", "era": "宣宗宣德", "years": "1425-1435" },
+            { "chapters": "明实录英宗实录", "era": "英宗正统·天顺", "years": "1436-1464" },
+            { "chapters": "明实录宪宗实录", "era": "宪宗成化", "years": "1465-1487" },
+            { "chapters": "明实录孝宗实录", "era": "孝宗弘治", "years": "1488-1505" },
+            { "chapters": "明实录武宗实录", "era": "武宗正德", "years": "1506-1521" },
+            { "chapters": "明实录世宗实录", "era": "世宗嘉靖", "years": "1522-1566" },
+            { "chapters": "明实录穆宗实录", "era": "穆宗隆庆", "years": "1567-1572" },
+            { "chapters": "明实录神宗实录", "era": "神宗万历", "years": "1573-1620" },
+            { "chapters": "明实录光宗实录", "era": "光宗泰昌", "years": "1620" },
+            { "chapters": "明实录熹宗实录", "era": "熹宗天启", "years": "1621-1627" },
+            { "chapters": "明实录崇祯实录", "era": "思宗崇祯", "years": "1628-1644" }
+          ]
+        }
+      ]
+    },
+    "纪事本末体": {
+      "description": "按事件编排，每卷一个专题，适合通过事件名/关键词定位",
+      "books": [
+        {
+          "slug": "mingshi-jishi-benmo",
+          "title": "明史纪事本末",
+          "timeRange": "1368-1644",
+          "tags": ["开国","靖难","土木之变","夺门","大礼议","倭患","严嵩","张居正","万历三大征","东林","矿税","辽事","魏忠贤","流寇","甲申之变"]
+        }
+      ]
+    },
+    "纪传体": {
+      "description": "按人物立传，适合通过人名定位",
+      "books": [
+        {
+          "slug": "zuiwei-lu",
+          "title": "罪惟录",
+          "timeRange": "1368-1644",
+          "tags": ["帝纪","列传","志","世家"]
+        },
+        {
+          "slug": "shiku-shu",
+          "title": "石匮书",
+          "timeRange": "1368-1644",
+          "tags": ["列传","纪事"]
+        },
+        {
+          "slug": "guochao-xianzhenlu",
+          "title": "国朝献征录",
+          "timeRange": "1368-1620",
+          "tags": ["人物传记","碑铭","行状"]
+        },
+        {
+          "slug": "donglin-liezhuan",
+          "title": "东林列传",
+          "timeRange": "1580-1630",
+          "tags": ["东林党","顾宪成","高攀龙","左光斗","杨涟","魏忠贤"]
+        }
+      ]
+    },
+    "典章制度": {
+      "description": "法律、官制、礼仪制度，适合制度/官职/法律相关查询",
+      "books": [
+        {
+          "slug": "da-ming-hui-dian",
+          "title": "大明会典",
+          "tags": ["官制","礼仪","军制","刑法","科举","赋役","朝贡"]
+        },
+        {
+          "slug": "da-ming-lv",
+          "title": "大明律",
+          "tags": ["刑法","名例律","吏律","户律","礼律","兵律","刑律","工律"]
+        },
+        {
+          "slug": "guochao-dianhui",
+          "title": "国朝典汇",
+          "tags": ["典章","制度"]
+        }
+      ]
+    },
+    "晚明专题": {
+      "description": "专门记述晚明（万历末至南明）事件",
+      "books": [
+        {
+          "slug": "mingji-beilue",
+          "title": "明季北略",
+          "timeRange": "1627-1644",
+          "tags": ["崇祯","流寇","李自成","张献忠","甲申之变","满清入关"]
+        },
+        {
+          "slug": "mingji-nanlue",
+          "title": "明季南略",
+          "timeRange": "1644-1662",
+          "tags": ["南明","弘光","隆武","永历","郑成功"]
+        },
+        {
+          "slug": "sanchao-liaoshi-shilu",
+          "title": "三朝辽事实录",
+          "timeRange": "1595-1628",
+          "tags": ["辽东","努尔哈赤","萨尔浒","袁崇焕","辽事"]
+        },
+        {
+          "slug": "chongzhen-changbian",
+          "title": "崇祯长编",
+          "timeRange": "1628-1644",
+          "tags": ["崇祯","末年政治"]
+        }
+      ]
+    },
+    "笔记杂纂": {
+      "description": "掌故、轶事、杂记，适合补充细节",
+      "books": [
+        {
+          "slug": "wanli-yehuo-bian",
+          "title": "万历野获编",
+          "timeRange": "1368-1620",
+          "tags": ["掌故","典故","人物逸闻","制度沿革"]
+        },
+        {
+          "slug": "shu-yuan-zaji",
+          "title": "菽园杂记",
+          "timeRange": "1436-1487",
+          "tags": ["成化朝","典章","人物"]
+        },
+        {
+          "slug": "ershier-shi-zhaji",
+          "title": "廿二史札记",
+          "tags": ["史学批评","考证","明史编纂"]
+        }
+      ]
+    },
+    "文集": {
+      "description": "臣僚奏疏、文章汇编",
+      "books": [
+        {
+          "slug": "huangming-jingshi-wenbian",
+          "title": "皇明经世文编",
+          "timeRange": "1368-1620",
+          "tags": ["奏疏","策论","政论","经济","军事","边防"]
+        }
+      ]
+    },
+    "明史底本": {
+      "description": "《明史》本身的不同版本",
+      "books": [
+        {
+          "slug": "siku-mingshi",
+          "title": "明史（四库全书本）",
+          "tags": ["四库全书","校勘"]
+        }
+      ]
+    }
+  }
+}

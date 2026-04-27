@@ -1,0 +1,331 @@
+[
+  {
+    "slug": "ming-shi",
+    "title": "明史",
+    "author": "张廷玉等",
+    "dynasty": "明",
+    "category": "base",
+    "sourceType": "epub",
+    "sourceUrl": "local://sample.epub",
+    "description": "当前阅读器的底本，首次启动时自动从本地 EPUB 拆分章节与段落入库。"
+  },
+  {
+    "slug": "mingshi-jishi-benmo",
+    "title": "明史纪事本末",
+    "author": "谷应泰",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%98%8E%E5%8F%B2%E7%B4%80%E4%BA%8B%E6%9C%AC%E6%9C%AB",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "明史紀事本末",
+      "recommendedMaxPages": 80
+    },
+    "description": "适合与《明史》本纪、列传互证事件经过。"
+  },
+  {
+    "slug": "guoque",
+    "title": "国榷",
+    "author": "谈迁",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%9C%8B%E6%A6%B7",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "國榷",
+      "recommendedMaxPages": 104
+    },
+    "description": "晚明叙事细密，适合和《明史》交叉比对时间线与记载差异。"
+  },
+  {
+    "slug": "mingji-beilue",
+    "title": "明季北略",
+    "author": "计六奇",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%98%8E%E5%AD%A3%E5%8C%97%E7%95%A5/%E5%8D%B701",
+    "crawl": {
+      "mode": "allpages",
+      "allPagesPrefix": "明季北略/"
+    },
+    "description": "偏重晚明北方局势，可作为晚明事件的补充材料。"
+  },
+  {
+    "slug": "da-ming-hui-dian",
+    "title": "大明会典",
+    "author": "李东阳等",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%A4%A7%E6%98%8E%E6%9C%83%E5%85%B8/%E6%9C%83%E5%85%B8%E5%87%A1%E4%BE%8B",
+    "crawl": {
+      "mode": "allpages",
+      "allPagesPrefix": "明㑹典 (四庫全書本)/",
+      "excludeTitleParts": ["全覽"]
+    },
+    "description": "制度与官制类资料，主要用于职官百科与制度背景。"
+  },
+  {
+    "slug": "ming-shi-lu",
+    "title": "明实录",
+    "author": "明代官修",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%98%8E%E5%AF%A6%E9%8C%84",
+    "crawl": {
+      "mode": "allpages",
+      "allPagesPrefix": "明實錄/",
+      "extraPages": [
+        "https://zh.wikisource.org/wiki/%E5%A4%A7%E6%98%8E%E5%A4%AA%E7%A5%96%E9%AB%98%E7%9A%87%E5%B8%9D%E5%AF%A6%E9%8C%84"
+      ]
+    },
+    "description": "官修编年史料，适合做时间线核对；完整版体量极大，默认先导入代表性卷页。"
+  },
+  {
+    "slug": "wanli-yehuo-bian",
+    "title": "万历野获编",
+    "author": "沈德符",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E8%90%AC%E6%9B%86%E9%87%8E%E7%8D%B2%E7%B7%A8",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "萬曆野獲編",
+      "recommendedMaxPages": 48
+    },
+    "description": "沈德符笔记，记载万历朝掌故、人物与制度，与《明史》互证细节极为有用。"
+  },
+  {
+    "slug": "mingji-nanlue",
+    "title": "明季南略",
+    "author": "计六奇",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%98%8E%E5%AD%A3%E5%8D%97%E7%95%A5",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "明季南略",
+      "recommendedMaxPages": 18
+    },
+    "description": "计六奇所著，记南明史事，与《明季北略》互补，适合晚明史料比对。"
+  },
+  {
+    "slug": "shiku-shu",
+    "title": "石匮书",
+    "author": "张岱",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E7%9F%B3%E5%8C%AE%E6%9B%B8",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "石匱書",
+      "recommendedMaxPages": 30
+    },
+    "description": "张岱私修明史，叙事生动，多可与官修《明史》互证，尤重人物描写。"
+  },
+  {
+    "slug": "zuiwei-lu",
+    "title": "罪惟录",
+    "author": "查继佐",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E7%BD%AA%E6%83%9F%E9%8C%84",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "罪惟錄",
+      "recommendedMaxPages": 40
+    },
+    "description": "查继佐私撰明史，多记隐事与异闻，可与《明史》和《国榷》互参。"
+  },
+  {
+    "slug": "guochao-xianzhenlu",
+    "title": "国朝献征录",
+    "author": "焦竑",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%9C%8B%E6%9C%9D%E7%8D%BB%E5%BE%B5%E9%8C%84",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "國朝獻徵錄",
+      "recommendedMaxPages": 60
+    },
+    "description": "焦竑辑录明代人物传记与事迹，是研究明代人物的重要资料来源。"
+  },
+  {
+    "slug": "sanchao-liaoshi-shilu",
+    "title": "三朝辽事实录",
+    "author": "清初官修",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E4%B8%89%E6%9C%9D%E9%81%BC%E4%BA%8B%E5%AF%A6%E9%8C%84",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "三朝遼事實錄",
+      "recommendedMaxPages": 12
+    },
+    "description": "记明末辽事，可与《明史》兵志、列传及《明实录》相关部分互证。"
+  },
+  {
+    "slug": "tianxia-junguo-libingshu",
+    "title": "天下郡国利病书",
+    "author": "顾炎武",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%A4%A9%E4%B8%8B%E9%83%A1%E5%9C%8B%E5%88%A9%E7%97%85%E6%9B%B8_(%E5%9B%9B%E9%83%A8%E5%8F%A2%E5%88%8A%E6%9C%AC)/%E5%BA%8F",
+    "crawl": {
+      "mode": "allpages",
+      "allPagesPrefix": "天下郡國利病書 (四部叢刊本)/",
+      "excludeTitleParts": ["冊次"]
+    },
+    "description": "顾炎武地理政治名著，详载明代各省府州县沿革与利病，适合地名与制度考证。"
+  },
+  {
+    "slug": "shu-yuan-zaji",
+    "title": "菽园杂记",
+    "author": "陆容",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E8%8F%BD%E5%9C%92%E9%9B%9C%E8%A8%98_(%E5%9B%9B%E5%BA%AB%E5%85%A8%E6%9B%B8%E6%9C%AC)",
+    "crawl": {
+      "mode": "allpages",
+      "allPagesPrefix": "菽園雜記 (四庫全書本)/",
+      "excludeTitleParts": ["全覽"]
+    },
+    "description": "陆容笔记，记明中期典章制度与人物掌故，可补《明史》志书之缺。"
+  },
+  {
+    "slug": "ershier-shi-zhaji",
+    "title": "廿二史札记（明史部分）",
+    "author": "赵翼",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%BB%BF%E4%BA%8C%E5%8F%B2%E5%8A%84%E8%A8%98",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "廿二史劄記",
+      "recommendedMaxPages": 10
+    },
+    "description": "赵翼考史笔记，其中明史部分对《明史》编纂体例与史实多有考辨，是重要的史学批评资料。"
+  },
+  {
+    "slug": "mingshi-lu-wanli",
+    "title": "万历起居注",
+    "author": "明代官修",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E8%90%AC%E6%9B%86%E8%B5%B7%E5%B1%85%E6%B3%A8",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "萬曆起居注",
+      "recommendedMaxPages": 20
+    },
+    "description": "万历朝日常起居与朝政活动实录，是研究万历年间政治的第一手资料。"
+  },
+  {
+    "slug": "siku-mingshi",
+    "title": "明史（四库全书本）",
+    "author": "张廷玉等",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%98%8E%E5%8F%B2_(%E5%9B%9B%E5%BA%AB%E5%85%A8%E6%9B%B8%E6%9C%AC)",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "明史 (四庫全書本)",
+      "recommendedMaxPages": 80
+    },
+    "description": "四库全书系统中的《明史》文本，可与当前 EPUB 底本互校。"
+  },
+  {
+    "slug": "guochao-dianhui",
+    "title": "国朝典汇",
+    "author": "徐学聚",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "ctext",
+    "sourceUrl": "https://ctext.org/wiki.pl?if=gb&res=7380507",
+    "crawl": {
+      "mode": "toc",
+      "recommendedMaxPages": 12
+    },
+    "description": "徐学聚辑明代典章制度资料；当前可抓取来源为 CText OCR，质量需在检索结果中谨慎使用。"
+  },
+  {
+    "slug": "donglin-liezhuan",
+    "title": "东林列传",
+    "author": "陈鼎",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E6%9D%B1%E6%9E%97%E5%88%97%E5%82%B3_(%E5%9B%9B%E5%BA%AB%E5%85%A8%E6%9B%B8%E6%9C%AC)",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "東林列傳 (四庫全書本)",
+      "recommendedMaxPages": 28
+    },
+    "description": "东林人物传记资料，适合晚明党争与人物关系检索。"
+  },
+  {
+    "slug": "huangming-jingshi-wenbian",
+    "title": "皇明经世文编",
+    "author": "陈子龙等辑",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "ctext",
+    "sourceUrl": "https://ctext.org/wiki.pl?if=gb&res=259380",
+    "crawl": {
+      "mode": "toc",
+      "recommendedMaxPages": 120
+    },
+    "description": "明代经世文献总集；CText 目录有 513 个章节页，当前默认限速导入前 120 章，避免一次性大量抓取导致远端阻断。"
+  },
+  {
+    "slug": "chongzhen-changbian",
+    "title": "崇祯长编",
+    "author": "汪楫等",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "wikisource",
+    "sourceUrl": "https://zh.wikisource.org/wiki/%E5%B4%87%E7%A6%8E%E9%95%B7%E7%B7%A8",
+    "crawl": {
+      "mode": "toc",
+      "sameTitlePrefix": "崇禎長編",
+      "recommendedMaxPages": 4
+    },
+    "description": "崇祯朝编年史料，适合晚明政治与军事事件互证。"
+  },
+  {
+    "slug": "da-ming-lv",
+    "title": "大明律",
+    "author": "怀效锋、王旭 译注",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "local-epub",
+    "sourceUrl": "local://database",
+    "description": "明代基本法典，适合制度与刑法相关条目检索。"
+  },
+  {
+    "slug": "ming-tong-jian",
+    "title": "明通鉴",
+    "author": "夏燮",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "local-epub",
+    "sourceUrl": "local://database",
+    "description": "清人夏燮编撰的明代编年通史，适合与《明史》纪传互证。"
+  }
+]

@@ -1,0 +1,24 @@
+{
+  "name": "mingshi-reader-ai",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Interactive Ming History AI reader built from EPUB with local persistence and OpenAI-compatible AI services.",
+  "scripts": {
+    "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev -- --host 127.0.0.1",
+    "build": "npm --prefix frontend run build",
+    "start": "npm --prefix backend run start",
+    "import:sources": "npm --prefix backend run import:sources",
+    "import:targeted": "npm --prefix backend run import:targeted",
+    "import:local-text": "npm --prefix backend run import:local-text",
+    "electron:dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run electron:wait\"",
+    "electron:wait": "wait-on tcp:3100 tcp:5173 && electron electron/main.cjs",
+    "electron:start": "wait-on tcp:3100 && electron electron/main.cjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "electron": "^37.2.1",
+    "wait-on": "^9.0.1"
+  }
+}

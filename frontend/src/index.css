@@ -1,0 +1,48 @@
+:root {
+  color: #261912;
+  background:
+    radial-gradient(circle at top left, rgba(255, 239, 202, 0.85), transparent 32%),
+    radial-gradient(circle at top right, rgba(204, 162, 104, 0.14), transparent 28%),
+    linear-gradient(180deg, #f6efe1, #e9d9bc 55%, #efe4ce);
+  font-family: "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  min-width: 320px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}

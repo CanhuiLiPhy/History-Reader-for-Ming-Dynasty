@@ -1,0 +1,202 @@
+{
+  "mapMeta": {
+    "title": "明代地理资料索引",
+    "canvasWidth": 960,
+    "canvasHeight": 640,
+    "note": "为便于阅读器交互而制作的示意坐标，不是严格测绘地图。"
+  },
+  "regions": [
+    {
+      "id": "beijing",
+      "name": "京师",
+      "kind": "capital",
+      "aliases": ["北京", "北直隶", "顺天府"],
+      "modernEquivalent": "北京市",
+      "summary": "永乐后为全国政治中心。",
+      "lat": 39.9042,
+      "lng": 116.4074,
+      "x": 710,
+      "y": 160
+    },
+    {
+      "id": "nanjing",
+      "name": "南京",
+      "kind": "capital",
+      "aliases": ["应天府", "南直隶"],
+      "modernEquivalent": "江苏省南京市",
+      "summary": "明初首都，永乐迁都后仍保留陪都地位。",
+      "lat": 32.0603,
+      "lng": 118.7969,
+      "x": 670,
+      "y": 360
+    },
+    {
+      "id": "shandong",
+      "name": "山东",
+      "kind": "province",
+      "aliases": ["山东承宣布政使司"],
+      "modernEquivalent": "今山东省及周边部分地区",
+      "summary": "东部沿海重地，海运与边防皆重要。",
+      "lat": 36.6512,
+      "lng": 117.1201,
+      "x": 760,
+      "y": 260
+    },
+    {
+      "id": "shanxi",
+      "name": "山西",
+      "kind": "province",
+      "aliases": ["山西承宣布政使司"],
+      "modernEquivalent": "今山西省为主",
+      "summary": "九边重镇所在，兼具北边防务与商贸功能。",
+      "lat": 37.8706,
+      "lng": 112.5489,
+      "x": 630,
+      "y": 230
+    },
+    {
+      "id": "henan",
+      "name": "河南",
+      "kind": "province",
+      "aliases": ["河南承宣布政使司"],
+      "modernEquivalent": "今河南省大部",
+      "summary": "中原腹地，是漕运、粮运与交通枢纽。",
+      "lat": 34.7657,
+      "lng": 113.7536,
+      "x": 620,
+      "y": 300
+    },
+    {
+      "id": "shanxi-west",
+      "name": "陕西",
+      "kind": "province",
+      "aliases": ["陕西承宣布政使司"],
+      "modernEquivalent": "今陕西省、甘肃东部等地",
+      "summary": "西北军事重地，与边镇、茶马互市关系密切。",
+      "lat": 34.3416,
+      "lng": 108.9398,
+      "x": 500,
+      "y": 270
+    },
+    {
+      "id": "zhejiang",
+      "name": "浙江",
+      "kind": "province",
+      "aliases": ["浙江承宣布政使司"],
+      "modernEquivalent": "今浙江省及周边部分地区",
+      "summary": "东南财赋与海防要区。",
+      "lat": 30.2741,
+      "lng": 120.1551,
+      "x": 760,
+      "y": 400
+    },
+    {
+      "id": "jiangxi",
+      "name": "江西",
+      "kind": "province",
+      "aliases": ["江西承宣布政使司"],
+      "modernEquivalent": "今江西省大部",
+      "summary": "江右文教与粮赋重要区域。",
+      "lat": 28.6829,
+      "lng": 115.8582,
+      "x": 660,
+      "y": 420
+    },
+    {
+      "id": "huguang",
+      "name": "湖广",
+      "kind": "province",
+      "aliases": ["湖广承宣布政使司"],
+      "modernEquivalent": "今湖北、湖南大部",
+      "summary": "中南大区，后期“湖广熟，天下足”影响深远。",
+      "lat": 30.5465,
+      "lng": 114.3419,
+      "x": 580,
+      "y": 410
+    },
+    {
+      "id": "fujian",
+      "name": "福建",
+      "kind": "province",
+      "aliases": ["福建承宣布政使司"],
+      "modernEquivalent": "今福建省大部",
+      "summary": "海贸、海防与倭患频仍之地。",
+      "lat": 26.0745,
+      "lng": 119.2965,
+      "x": 780,
+      "y": 470
+    },
+    {
+      "id": "guangdong",
+      "name": "广东",
+      "kind": "province",
+      "aliases": ["广东承宣布政使司"],
+      "modernEquivalent": "今广东省及周边部分地区",
+      "summary": "南海贸易中心，外洋交通重要门户。",
+      "lat": 23.1291,
+      "lng": 113.2644,
+      "x": 640,
+      "y": 530
+    },
+    {
+      "id": "guangxi",
+      "name": "广西",
+      "kind": "province",
+      "aliases": ["广西承宣布政使司"],
+      "modernEquivalent": "今广西壮族自治区大部",
+      "summary": "西南边疆要区，与土司治理关系密切。",
+      "lat": 25.2345,
+      "lng": 110.1799,
+      "x": 540,
+      "y": 530
+    },
+    {
+      "id": "sichuan",
+      "name": "四川",
+      "kind": "province",
+      "aliases": ["四川承宣布政使司"],
+      "modernEquivalent": "今四川、重庆大部",
+      "summary": "西南腹地，兼具粮饷、军政与移民重建功能。",
+      "lat": 30.5728,
+      "lng": 104.0668,
+      "x": 420,
+      "y": 410
+    },
+    {
+      "id": "yunnan",
+      "name": "云南",
+      "kind": "province",
+      "aliases": ["云南承宣布政使司"],
+      "modernEquivalent": "今云南省大部",
+      "summary": "西南边疆重地，土司与军镇并存。",
+      "lat": 25.0389,
+      "lng": 102.7183,
+      "x": 310,
+      "y": 520
+    },
+    {
+      "id": "guizhou",
+      "name": "贵州",
+      "kind": "province",
+      "aliases": ["贵州承宣布政使司"],
+      "modernEquivalent": "今贵州省及周边部分地区",
+      "summary": "明中后期建省后治理地位上升。",
+      "lat": 26.6477,
+      "lng": 106.6302,
+      "x": 430,
+      "y": 500
+    },
+    {
+      "id": "liaodong",
+      "name": "辽东",
+      "kind": "military-region",
+      "aliases": ["辽东都司"],
+      "modernEquivalent": "今辽宁东部及周边地区",
+      "summary": "虽非承宣布政使司之一，但对明代北边防务极其关键。",
+      "lat": 41.2672,
+      "lng": 123.2369,
+      "x": 850,
+      "y": 160
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+# === 依赖 ===
+node_modules/
+
+# === 构建产物 ===
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# === 运行时缓存（含数据库、拆分EPUB）===
+backend/.cache/
+backend/src/.cache/
+.cache/
+
+# === 敏感文件（API密钥、个人配置）===
+backend/.env
+CLAUDE.md
+
+# === 私有数据目录 ===
+donotpack/
+database/
+
+# === 原始数据源 ===
+*.epub
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# === 系统文件 ===
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# === IDE ===
+.idea/
+.vscode/
+*.code-workspace
+
+# === 日志 ===
+*.log
+npm-debug.log*
