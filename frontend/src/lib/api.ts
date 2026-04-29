@@ -5,11 +5,14 @@ import type {
   ChronologyResponse,
   CustomAction,
   DefaultsPayload,
+  DbReaderChaptersPayload,
+  DbReaderChapterPayload,
   EmperorPayload,
   GeocodeResponse,
   GeographyPayload,
   OfficialsPayload,
   OfficeSearchPayload,
+  ReadableBook,
   ReignConversionResponse,
   ReferenceCompareResponse,
   ReferenceLookupResponse,
@@ -56,9 +59,32 @@ export async function fetchDefaults(): Promise<DefaultsPayload> {
   return parseJsonResponse<DefaultsPayload>(response);
 }
 
-export async function fetchBookMeta(): Promise<BookMeta> {
-  const response = await fetchWithTimeout("/api/book/meta");
+export async function fetchBookMeta(slug?: string): Promise<BookMeta> {
+  const url = new URL("/api/book/meta", window.location.origin);
+  if (slug) url.searchParams.set("slug", slug);
+  const response = await fetchWithTimeout(url);
   return parseJsonResponse<BookMeta>(response);
+}
+
+export async function fetchLibraryBooks(): Promise<{ books: ReadableBook[] }> {
+  const response = await fetchWithTimeout("/api/library/books");
+  return parseJsonResponse<{ books: ReadableBook[] }>(response);
+}
+
+export async function fetchReaderChapters(slug: string): Promise<DbReaderChaptersPayload> {
+  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapters`);
+  return parseJsonResponse<DbReaderChaptersPayload>(response);
+}
+
+export async function fetchReaderChapter(slug: string, index: number): Promise<DbReaderChapterPayload> {
+  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapter/${index}`);
+  return parseJsonResponse<DbReaderChapterPayload>(response);
+}
+
+export function libraryEpubUrl(slug: string): string {
+  // Suffix `.epub` so epub.js detects this as a zip file rather than a
+  // directory base URL (which would make it fetch META-INF/container.xml).
+  return `/api/library/books/${encodeURIComponent(slug)}/source.epub`;
 }
 
 export async function searchBook(
@@ -66,6 +92,7 @@ export async function searchBook(
   mode: "hybrid" | "ai",
   aiSettings: AiSettings,
   limit = 18,
+  slug?: string,
 ): Promise<SearchResponse> {
   const response = await fetchWithTimeout("/api/book/search", {
     method: "POST",
@@ -74,6 +101,7 @@ export async function searchBook(
       q: query,
       mode,
       limit,
+      slug,
       aiSettings: mode === "ai" ? aiSettings : undefined,
     }),
   });
@@ -106,11 +134,16 @@ export async function runAiAction(payload: {
   aiSettings: AiSettings;
   customAction?: CustomAction;
 }): Promise<AiActionResponse> {
+  // QA chain: up to 4 sequential AI calls (qaPlan + book scope + reference
+  // filter + final answer) plus web search. Each backend AI call can take up
+  // to 180s, so the chain can run for several minutes on slow models. Be
+  // generous on the frontend abort.
+  const timeoutMs = payload.type === "qa" ? 360000 : 180000;
   const response = await fetchWithTimeout("/api/ai/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
+  }, timeoutMs);
   return parseJsonResponse<AiActionResponse>(response);
 }
 
@@ -144,15 +177,16 @@ export async function lookupReference(query: string, aiSettings: AiSettings): Pr
   return parseJsonResponse<ReferenceLookupResponse>(response);
 }
 
-export async function compareReference(selectedText: string, aiSettings: AiSettings): Promise<ReferenceCompareResponse> {
+export async function compareReference(selectedText: string, aiSettings: AiSettings, currentBookSlug?: string): Promise<ReferenceCompareResponse> {
   const response = await fetchWithTimeout("/api/reference/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       selectedText,
       aiSettings,
+      currentBookSlug,
     }),
-  });
+  }, 300000);
   return parseJsonResponse<ReferenceCompareResponse>(response);
 }
 

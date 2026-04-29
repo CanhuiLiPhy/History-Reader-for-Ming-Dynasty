@@ -1,0 +1,29 @@
+/* Bundled fonts. Loaded via <link> from index.html so they apply to the main
+   document AND the EPUB iframe (epub.js inherits parent stylesheets via theme
+   override; we also call rendition.themes.font() which re-uses these names). */
+
+@font-face {
+  font-family: "ShoujinTi";
+  src: url("/fonts/shoujin-simplified.ttf") format("truetype");
+  font-display: swap;
+  unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF;
+}
+
+@font-face {
+  font-family: "ShoujinTi";
+  src: url("/fonts/shoujin-traditional.ttf") format("truetype");
+  font-display: swap;
+  unicode-range: U+3400-4DBF, U+20000-2A6DF, U+2A700-2B73F, U+2B740-2B81F, U+F900-FAFF;
+}
+
+@font-face {
+  font-family: "LXGWWenKai";
+  src: url("/fonts/lxgw-wenkai.ttf") format("truetype");
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "FZHanWZKJ";
+  src: url("/fonts/kaiti.ttf") format("truetype");
+  font-display: swap;
+}

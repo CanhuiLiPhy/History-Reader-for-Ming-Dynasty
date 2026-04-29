@@ -21,6 +21,12 @@ const charactersData = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, "characte
 const emperorsData = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, "emperors.json"), "utf8"));
 const geographyData = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, "geography.json"), "utf8"));
 const officialsData = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, "officials.json"), "utf8"));
+let officialsExtended = { offices: [], sections: [], chronology: [], princes: [], poems: {} };
+try {
+  officialsExtended = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, "officials-extended.json"), "utf8"));
+} catch {
+  // optional file; if missing, just use empty structures
+}
 
 const SALARY_REFERENCE = {
   正一品: "月俸米参考约 87 石，属最高档俸给。",
@@ -785,14 +791,14 @@ async function buildQuestionPlan({ selection, question, bookContext, aiSettings 
  * @param {number} limit - max results
  * @param {object} [aiSettings] - if provided, uses AI to narrow book scope first
  */
-async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tokenTracker = null) {
+async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tokenTracker = null, excludeSlug = "ming-shi") {
   const SEARCH_LIMIT = 200; // fetch many candidates per batch
 
   // Step 1: AI-guided book scoping
   let bookSlugs = [];
   if (aiReady(aiSettings)) {
     try {
-      const catalog = getBookCatalogForAI();
+      const catalog = getBookCatalogForAI(excludeSlug);
       const searchHint = [
         plan.people.length ? `人物：${plan.people.join("、")}` : "",
         plan.events.length ? `事件：${plan.events.join("、")}` : "",
@@ -831,7 +837,7 @@ async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tok
     if (!keywords.length) continue;
     const result = searchReferenceParagraphs({
       keywords,
-      excludeSlug: "ming-shi",
+      excludeSlug,
       limit: SEARCH_LIMIT,
       ...searchOpts
     });
@@ -1199,8 +1205,9 @@ export async function lookupReadingReference(query, aiSettings) {
   return payload;
 }
 
-export async function runCrossSourceComparison(selectedText, aiSettings) {
+export async function runCrossSourceComparison(selectedText, aiSettings, currentBookSlug = "ming-shi") {
   await initializeLibrary();
+  const excludeSlug = currentBookSlug || "ming-shi";
 
   // Token usage tracking
   const tokenUsage = { small: { prompt: 0, completion: 0, calls: 0 }, large: { prompt: 0, completion: 0, calls: 0 } };
@@ -1258,7 +1265,8 @@ export async function runCrossSourceComparison(selectedText, aiSettings) {
     }),
     10,
     aiSettings,
-    tokenUsage
+    tokenUsage,
+    excludeSlug
   );
 
   const payload = {
@@ -1301,11 +1309,11 @@ export async function runCrossSourceComparison(selectedText, aiSettings) {
   const smallTotal = tokenUsage.small.prompt + tokenUsage.small.completion;
   const largeTotal = tokenUsage.large.prompt + tokenUsage.large.completion;
   if (smallTotal > 0 || largeTotal > 0) {
-    payload.reportMarkdown += `\n\n---\n<small>本次检索消耗：小模型 ${smallTotal} tokens（${tokenUsage.small.calls}次调用，输入${tokenUsage.small.prompt}/输出${tokenUsage.small.completion}）`;
+    let line = `本次检索消耗：小模型 ${smallTotal} tokens（${tokenUsage.small.calls}次调用，输入${tokenUsage.small.prompt}/输出${tokenUsage.small.completion}）`;
     if (largeTotal > 0) {
-      payload.reportMarkdown += `，大模型 ${largeTotal} tokens（${tokenUsage.large.calls}次调用，输入${tokenUsage.large.prompt}/输出${tokenUsage.large.completion}，模型${payload.model}）`;
+      line += `，大模型 ${largeTotal} tokens（${tokenUsage.large.calls}次调用，输入${tokenUsage.large.prompt}/输出${tokenUsage.large.completion}，模型${payload.model}）`;
     }
-    payload.reportMarkdown += `</small>`;
+    payload.reportMarkdown += `\n\n---\n\n> ${line}`;
   }
 
   return payload;
@@ -1407,9 +1415,20 @@ export function getEmperorPayload() {
 }
 
 export function getOfficialsPayload() {
+  // Annotate parsed offices with salary references so the UI can show 俸禄
+  // alongside rank without requiring frontend lookup.
+  const officesWithSalary = officialsExtended.offices.map((o) => ({
+    ...o,
+    salary: SALARY_REFERENCE[o.rank] || "",
+  }));
   return {
     institutions: OFFICIAL_PROFILES,
-    characters: charactersData.characters
+    characters: charactersData.characters,
+    offices: officesWithSalary,
+    sections: officialsExtended.sections,
+    chronology: officialsExtended.chronology,
+    princes: officialsExtended.princes,
+    poems: officialsExtended.poems,
   };
 }
 

@@ -23,6 +23,7 @@ export type ChapterSummary = {
 };
 
 export type BookMeta = {
+  slug?: string;
   metadata: {
     title: string;
     creator: string;
@@ -36,6 +37,51 @@ export type BookMeta = {
     segmentCount: number;
     totalChars: number;
   };
+};
+
+export type ReadableBook = {
+  slug: string;
+  title: string;
+  author: string;
+  dynasty: string;
+  category: string;
+  description: string;
+  chapterCount: number;
+  paragraphCount: number;
+  charCount: number;
+  hasEpub: boolean;
+};
+
+export type DbReaderChapterSummary = {
+  order: number;
+  rawOrder: number;
+  label: string;
+  paragraphCount: number;
+  charCount: number;
+};
+
+export type DbReaderChaptersPayload = {
+  slug: string;
+  title: string;
+  author: string;
+  chapters: DbReaderChapterSummary[];
+};
+
+export type DbReaderParagraph = {
+  id: number;
+  content: string;
+  hash: string;
+  anchor: string;
+};
+
+export type DbReaderChapterPayload = {
+  slug: string;
+  bookTitle: string;
+  chapter: string;
+  chapterIndex: number;
+  rawOrder: number;
+  chapterCount: number;
+  paragraphs: DbReaderParagraph[];
 };
 
 export type SearchResult = {
@@ -129,7 +175,7 @@ export type ReaderHighlight = {
   cfiRange: string;
   text: string;
   color: string;
-  kind: "highlight" | "underline";
+  kind: "highlight" | "underline" | "circle";
   createdAt: string;
 };
 
@@ -323,9 +369,44 @@ export type CharacterRecord = {
   keywords: string[];
 };
 
+export type OfficeRecord = {
+  name: string;
+  count: string;
+  rank: string;
+  department: string;
+  notes: string;
+  section: string;
+  salary: string;
+};
+
+export type OfficeChronologyEntry = {
+  scope: string;
+  era: string;
+  yearLabel: string;
+  gregorian: number;
+  position: string;
+  people: string[];
+};
+
+export type OfficeSection = {
+  name: string;
+  description: string;
+};
+
+export type PrinceRecord = {
+  section: string;
+  title: string;
+  name: string;
+};
+
 export type OfficialsPayload = {
   institutions: OfficialInstitution[];
   characters: CharacterRecord[];
+  offices?: OfficeRecord[];
+  sections?: OfficeSection[];
+  chronology?: OfficeChronologyEntry[];
+  princes?: PrinceRecord[];
+  poems?: Record<string, string>;
 };
 
 export type OfficeSearchPayload = {

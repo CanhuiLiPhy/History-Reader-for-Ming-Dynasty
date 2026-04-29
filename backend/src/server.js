@@ -3,12 +3,13 @@ import path from "node:path";
 import cors from "cors";
 import express from "express";
 import mime from "mime-types";
-import { FRONTEND_DIST, PORT, BOOK_PATH, getPublicDefaults } from "./config/defaults.js";
+import { FRONTEND_DIST, PORT, getPublicDefaults } from "./config/defaults.js";
 import { explainReignTerm } from "./data/reign-map.js";
-import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook } from "./services/book-service.js";
+import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook, resolveBookEpubPath, bookEpubExists, DEFAULT_BOOK_SLUG } from "./services/book-service.js";
 import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, synthesizeSpeech } from "./services/ai-service.js";
 import { initializeLibrary } from "./services/library-db.js";
 import { ensureSplitEpub } from "./services/epub-splitter.js";
+import { getReadableBooks, getReaderChapters, getReaderChapter } from "./services/library-reader.js";
 import {
   answerReadingQuestion,
   convertChronologyTerm,
@@ -57,10 +58,78 @@ app.get("/api/reference/overview", async (_req, res, next) => {
   }
 });
 
-app.get("/api/book/meta", async (_req, res, next) => {
+app.get("/api/book/meta", async (req, res, next) => {
   try {
-    const meta = await getBookMeta();
+    const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
+    const meta = await getBookMeta(slug);
     res.json(meta);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// New: list all readable books
+app.get("/api/library/books", async (_req, res, next) => {
+  try {
+    const books = await getReadableBooks();
+    res.json({ books });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// New: chapter list for DB-reader (non-EPUB books)
+app.get("/api/library/books/:slug/chapters", async (req, res, next) => {
+  try {
+    const slug = String(req.params.slug || "").trim();
+    if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
+    const data = await getReaderChapters(slug);
+    if (!data) { res.status(404).json({ error: "未找到该书。" }); return; }
+    res.json(data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// New: chapter content for DB-reader
+app.get("/api/library/books/:slug/chapter/:index", async (req, res, next) => {
+  try {
+    const slug = String(req.params.slug || "").trim();
+    const index = Number.parseInt(String(req.params.index || "0"), 10);
+    if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
+    if (!Number.isFinite(index) || index < 0) { res.status(400).json({ error: "章节索引无效。" }); return; }
+    const data = await getReaderChapter(slug, index);
+    if (!data) { res.status(404).json({ error: "未找到该章节。" }); return; }
+    res.json(data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// New: per-book EPUB blob (for books that ship an EPUB file).
+// URL ends in `.epub` so epub.js's URL sniffer treats this as a zip blob
+// rather than a directory base URL (which would make it fetch META-INF/container.xml).
+app.get("/api/library/books/:slug/source.epub", async (req, res, next) => {
+  try {
+    const slug = String(req.params.slug || "").trim();
+    if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
+    if (!bookEpubExists(slug)) { res.status(404).json({ error: "该书无 EPUB 文件。" }); return; }
+    const epubPath = resolveBookEpubPath(slug);
+    try {
+      const splitPath = await ensureSplitEpub(epubPath);
+      const stat = await fs.stat(splitPath);
+      res.type("application/epub+zip");
+      res.setHeader("Content-Length", stat.size);
+      const { createReadStream } = await import("node:fs");
+      createReadStream(splitPath).pipe(res);
+    } catch (splitError) {
+      console.error("epub-splitter failed for", slug, splitError.message, "→ serving original");
+      const stat = await fs.stat(epubPath);
+      res.type("application/epub+zip");
+      res.setHeader("Content-Length", stat.size);
+      const { createReadStream } = await import("node:fs");
+      createReadStream(epubPath).pipe(res);
+    }
   } catch (error) {
     next(error);
   }
@@ -72,6 +141,7 @@ async function handleBookSearch(req, res, next) {
     const query = String(payload.q || "").trim();
     const mode = String(payload.mode || "hybrid");
     const limit = Number.parseInt(String(payload.limit || "20"), 10);
+    const slug = String(payload.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
     const aiSettings = resolveAiSettings(payload.aiSettings || {
       baseURL: payload.baseURL,
       apiKey: payload.apiKey,
@@ -96,7 +166,7 @@ async function handleBookSearch(req, res, next) {
       }
     }
 
-    const result = await searchBook(query, { limit, expandedQueries });
+    const result = await searchBook(query, { limit, expandedQueries, slug });
     res.json({
       ...result,
       aiExpansion
@@ -150,17 +220,17 @@ app.post("/api/reference/lookup", async (req, res, next) => {
   }
 });
 
-app.post("/api/reference/compare", async (req, res, next) => {
+app.post("/api/reference/compare", async (req, res, _next) => {
   try {
-    const { selectedText = "", aiSettings: clientAiSettings = {} } = req.body || {};
+    const { selectedText = "", aiSettings: clientAiSettings = {}, currentBookSlug = DEFAULT_BOOK_SLUG } = req.body || {};
     if (!String(selectedText).trim()) {
-      res.status(400).json({ error: "缺少待比对的《明史》选段。" });
+      res.status(400).json({ error: "缺少待比对的选段。" });
       return;
     }
     const aiSettings = resolveAiSettings(clientAiSettings);
     const result = await Promise.race([
-      runCrossSourceComparison(String(selectedText).trim(), aiSettings),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 180000))
+      runCrossSourceComparison(String(selectedText).trim(), aiSettings, String(currentBookSlug || DEFAULT_BOOK_SLUG)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 280000))
     ]);
     res.json(result);
   } catch (error) {
@@ -352,9 +422,11 @@ app.post("/api/ai/speech", async (req, res, next) => {
   }
 });
 
-app.get("/book/source.epub", async (_req, res, next) => {
+app.get("/book/source.epub", async (req, res, next) => {
   try {
-    const splitPath = await ensureSplitEpub(BOOK_PATH);
+    const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
+    const epubPath = resolveBookEpubPath(slug);
+    const splitPath = await ensureSplitEpub(epubPath);
     const stat = await fs.stat(splitPath);
     res.type("application/epub+zip");
     res.setHeader("Content-Length", stat.size);
@@ -363,11 +435,13 @@ app.get("/book/source.epub", async (_req, res, next) => {
   } catch (error) {
     console.error("epub-splitter failed, serving original:", error.message);
     try {
-      const stat = await fs.stat(BOOK_PATH);
+      const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
+      const epubPath = resolveBookEpubPath(slug);
+      const stat = await fs.stat(epubPath);
       res.type("application/epub+zip");
       res.setHeader("Content-Length", stat.size);
       const { createReadStream } = await import("node:fs");
-      createReadStream(BOOK_PATH).pipe(res);
+      createReadStream(epubPath).pipe(res);
     } catch (fallbackError) {
       next(fallbackError);
     }

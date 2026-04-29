@@ -24,7 +24,9 @@ export const PROJECT_ROOT = projectRoot;
 export const BACKEND_ROOT = backendRoot;
 export const CACHE_ROOT = path.join(backendRoot, ".cache");
 export const FRONTEND_DIST = path.join(projectRoot, "frontend", "dist");
-export const BOOK_PATH = process.env.BOOK_PATH || path.join(projectRoot, "sample.epub");
+export const BOOK_PATH = process.env.BOOK_PATH
+  ? (path.isAbsolute(process.env.BOOK_PATH) ? process.env.BOOK_PATH : path.join(backendRoot, process.env.BOOK_PATH.replace(/^\.\//, "")))
+  : path.join(backendRoot, "mingshi.epub");
 export const PORT = Number.parseInt(process.env.PORT || "3100", 10);
 
 export const DEFAULT_AI_SETTINGS = {
@@ -46,7 +48,7 @@ export const APP_DEFAULTS = {
   title: "明史 AI 阅读器",
   subtitle: "以《明史》为底本的交互式本地阅读与 AI 研读工具",
   bookPath: BOOK_PATH,
-  version: "1.0.0",
+  version: "0.3.0",
   autoAnnotation: true,
   customActions: DEFAULT_CUSTOM_ACTIONS
 };

@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { ACTION_PROMPTS, DEFAULT_CUSTOM_ACTIONS } from "../config/prompts.js";
 import { DEFAULT_AI_SETTINGS } from "../config/defaults.js";
 
-const CHAT_COMPLETION_TIMEOUT_MS = 60000;
+const CHAT_COMPLETION_TIMEOUT_MS = 180000;
 
 function normalizeBaseUrl(url) {
   return (url || "").replace(/\/+$/, "");

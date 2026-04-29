@@ -17,37 +17,27 @@ import { execFileSync } from "node:child_process";
 import unzipper from "unzipper";
 import { CACHE_ROOT } from "../config/defaults.js";
 
-let splitEpubPath = null;
+// Cache split EPUB paths by source-file fingerprint so multi-book mode works.
+const splitEpubPaths = new Map();
 
 /**
- * Returns the path to a chapter-split EPUB.  Caches to disk so the split
- * only happens once per original file.
+ * Returns the path to a chapter-split EPUB.  Caches by source file fingerprint
+ * so different EPUBs each get their own cache entry.
  */
 export async function ensureSplitEpub(originalEpubPath) {
-  if (splitEpubPath && fs.existsSync(splitEpubPath)) return splitEpubPath;
-
-  // Use only file size for fingerprint (not path or mtime) so the pre-packaged
-  // split epub works on any machine regardless of file path or modification time.
   const stat = fs.statSync(originalEpubPath);
   const fingerprint = crypto.createHash("sha1")
     .update(`${stat.size}`)
     .digest("hex")
     .slice(0, 12);
 
+  const cached = splitEpubPaths.get(fingerprint);
+  if (cached && fs.existsSync(cached)) return cached;
+
   const outPath = path.join(CACHE_ROOT, `split-${fingerprint}.epub`);
   if (fs.existsSync(outPath)) {
-    splitEpubPath = outPath;
+    splitEpubPaths.set(fingerprint, outPath);
     return outPath;
-  }
-
-  // Fallback: if any split-*.epub already exists in cache, use it
-  // (handles pre-packaged releases where fingerprint may differ)
-  if (fs.existsSync(CACHE_ROOT)) {
-    const existing = fs.readdirSync(CACHE_ROOT).find(f => f.startsWith("split-") && f.endsWith(".epub"));
-    if (existing) {
-      splitEpubPath = path.join(CACHE_ROOT, existing);
-      return splitEpubPath;
-    }
   }
 
   // Extract to a TEMPORARY directory (don't clobber the main extract cache)
@@ -57,13 +47,25 @@ export async function ensureSplitEpub(originalEpubPath) {
   const directory = await unzipper.Open.file(originalEpubPath);
   await directory.extract({ path: tmpDir, concurrency: 5 });
 
-  const result = splitAndRepack(tmpDir, outPath);
-  console.log(`epub-splitter: split ${result.splitCount} files → ${result.totalChapters} chapters`);
+  let result = { splitCount: 0, totalChapters: 0 };
+  try {
+    result = splitAndRepack(tmpDir, outPath);
+  } catch (error) {
+    console.warn(`epub-splitter: ${path.basename(originalEpubPath)} split failed (${error.message}); using original.`);
+  }
+  console.log(`epub-splitter: ${path.basename(originalEpubPath)} split ${result.splitCount} files → ${result.totalChapters} chapters`);
 
-  // Clean up temp dir
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  splitEpubPath = outPath;
+  // splitAndRepack only handles EPUBs with an OEBPS/ layout; for OPS/, EPUB/,
+  // or flat structures it bails out without writing outPath. epub.js can render
+  // the original EPUB just fine — fall back so downstream stat()/extract() work.
+  if (!fs.existsSync(outPath)) {
+    splitEpubPaths.set(fingerprint, originalEpubPath);
+    return originalEpubPath;
+  }
+
+  splitEpubPaths.set(fingerprint, outPath);
   return outPath;
 }
 

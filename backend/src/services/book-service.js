@@ -1,13 +1,44 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import unzipper from "unzipper";
 import Fuse from "fuse.js";
 import { XMLParser } from "fast-xml-parser";
 import { parse } from "node-html-parser";
-import { BOOK_PATH, CACHE_ROOT } from "../config/defaults.js";
+import { BACKEND_ROOT, BOOK_PATH, CACHE_ROOT } from "../config/defaults.js";
 import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
+
+const BOOKS_DIR = path.join(BACKEND_ROOT, "books");
+export const DEFAULT_BOOK_SLUG = "ming-shi";
+
+export function resolveBookEpubPath(slug) {
+  // ming-shi defaults to BOOK_PATH (env-configurable for the legacy single-book setup)
+  if (!slug || slug === DEFAULT_BOOK_SLUG) {
+    if (BOOK_PATH && fsSync.existsSync(BOOK_PATH)) return BOOK_PATH;
+    const fallback = path.join(BOOKS_DIR, `${DEFAULT_BOOK_SLUG}.epub`);
+    if (fsSync.existsSync(fallback)) return fallback;
+    return BOOK_PATH; // last resort, may not exist
+  }
+  return path.join(BOOKS_DIR, `${slug}.epub`);
+}
+
+export function bookEpubExists(slug) {
+  return fsSync.existsSync(resolveBookEpubPath(slug));
+}
+
+export function listEpubBookSlugs() {
+  const slugs = new Set();
+  if (fsSync.existsSync(BOOKS_DIR)) {
+    for (const f of fsSync.readdirSync(BOOKS_DIR)) {
+      const m = f.match(/^(.+)\.epub$/);
+      if (m) slugs.add(m[1]);
+    }
+  }
+  if (BOOK_PATH && fsSync.existsSync(BOOK_PATH)) slugs.add(DEFAULT_BOOK_SLUG);
+  return [...slugs];
+}
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -15,7 +46,8 @@ const parser = new XMLParser({
   trimValues: true
 });
 
-let cachedBook = null;
+// Per-slug in-memory cache so multi-book mode can keep multiple parsed EPUBs hot.
+const bookCacheBySlug = new Map();
 const MAX_SEARCH_QUERY_LENGTH = 120;
 const MAX_RETRIEVAL_QUERY_LENGTH = 32;
 const MAX_FUSE_QUERY_LENGTH = 24;
@@ -398,9 +430,10 @@ function toSnippet(text, query) {
   return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
 }
 
-async function loadBook() {
+async function loadBook(slug = DEFAULT_BOOK_SLUG) {
+  const epubPath = resolveBookEpubPath(slug);
   // Use the chapter-split EPUB so that TOC hrefs match what the browser loads.
-  const splitEpubPath = await ensureSplitEpub(BOOK_PATH);
+  const splitEpubPath = await ensureSplitEpub(epubPath);
   const extractDir = await extractEpub(splitEpubPath);
   const container = await readXml(path.join(extractDir, "META-INF", "container.xml"));
   const opfRelativePath = container.container.rootfiles.rootfile["@_full-path"];
@@ -487,6 +520,7 @@ async function loadBook() {
   });
 
   return {
+    slug,
     metadata: {
       title: getMetadataValue(metadata, "dc:title") || "明史",
       creator: getMetadataValue(metadata, "dc:creator") || "张廷玉",
@@ -500,15 +534,15 @@ async function loadBook() {
   };
 }
 
-export async function getBookData() {
-  if (!cachedBook) {
-    cachedBook = await loadBook();
+export async function getBookData(slug = DEFAULT_BOOK_SLUG) {
+  if (!bookCacheBySlug.has(slug)) {
+    bookCacheBySlug.set(slug, await loadBook(slug));
   }
-  return cachedBook;
+  return bookCacheBySlug.get(slug);
 }
 
-export async function getBookMeta() {
-  const book = await getBookData();
+export async function getBookMeta(slug = DEFAULT_BOOK_SLUG) {
+  const book = await getBookData(slug);
   return {
     metadata: book.metadata,
     tocTree: book.tocTree,
@@ -530,8 +564,8 @@ export async function getBookMeta() {
 }
 
 export async function searchBook(query, options = {}) {
-  const { limit = 20, expandedQueries = [] } = options;
-  const book = await getBookData();
+  const { limit = 20, expandedQueries = [], slug = DEFAULT_BOOK_SLUG } = options;
+  const book = await getBookData(slug);
   const safeQuery = sanitizeQuery(query);
   const primarySearchQuery = sanitizeQuery(createRetrievalQuery(safeQuery) || safeQuery, MAX_FUSE_QUERY_LENGTH);
   const normalizedExpandedQueries = expandedQueries.map((item) => sanitizeQuery(item, MAX_FUSE_QUERY_LENGTH));
@@ -600,8 +634,8 @@ export async function searchBook(query, options = {}) {
   };
 }
 
-export async function buildPersonChronology(person) {
-  const search = await searchBook(person, { limit: 32 });
+export async function buildPersonChronology(person, slug = DEFAULT_BOOK_SLUG) {
+  const search = await searchBook(person, { limit: 32, slug });
   const timeline = search.results.map((result, index) => ({
     id: `${person}-${index + 1}`,
     chapterTitle: result.chapterTitle,
@@ -617,8 +651,8 @@ export async function buildPersonChronology(person) {
   };
 }
 
-export async function getContextSnippets(query, limit = 6) {
-  const search = await searchBook(createRetrievalQuery(query), { limit });
+export async function getContextSnippets(query, limit = 6, slug = DEFAULT_BOOK_SLUG) {
+  const search = await searchBook(createRetrievalQuery(query), { limit, slug });
   return search.results.map((item, index) => ({
     index: index + 1,
     chapterTitle: item.chapterTitle,

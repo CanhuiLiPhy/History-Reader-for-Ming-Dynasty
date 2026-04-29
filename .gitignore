@@ -17,12 +17,25 @@ CLAUDE.md
 # === 私有数据目录 ===
 donotpack/
 database/
+archive/
 
 # === 原始数据源 ===
 *.epub
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# === 字体文件（商用字库不应入公开仓库；用户由 fetch-fonts 脚本下载） ===
+frontend/public/fonts/*.ttf
+frontend/public/fonts/*.otf
+frontend/public/fonts/*.woff*
+
+# === 内置 Node 运行时（用户自己装；不入仓库） ===
+runtime/
+
+# === 发布包 ===
+*.zip
+*.tar.gz
 
 # === 系统文件 ===
 .DS_Store

@@ -686,6 +686,28 @@ function splitLocalTextIntoParagraphRows(source, rawText, options = {}) {
   return rows;
 }
 
+function readTextFileWithDetectedEncoding(filePath, encodingHint) {
+  const buf = fs.readFileSync(filePath);
+  // BOM detection
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return new TextDecoder("utf-8").decode(buf.slice(3));
+  }
+  if (encodingHint) {
+    return new TextDecoder(encodingHint).decode(buf);
+  }
+  // Try UTF-8 first; fall back to GBK if too many replacement chars
+  const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+  const replacements = (utf8.match(/�/g) || []).length;
+  if (replacements > 30 || replacements / Math.max(1, utf8.length) > 0.005) {
+    try {
+      return new TextDecoder("gb18030", { fatal: false }).decode(buf);
+    } catch {
+      try { return new TextDecoder("gbk", { fatal: false }).decode(buf); } catch { return utf8; }
+    }
+  }
+  return utf8;
+}
+
 export async function importLocalTextSource(slug, filePath, options = {}) {
   await initializeLibrary();
   const source = BOOKS_BY_SLUG.get(slug);
@@ -695,7 +717,7 @@ export async function importLocalTextSource(slug, filePath, options = {}) {
   if (!filePath) {
     throw new Error("缺少本地文本文件路径。");
   }
-  const rawText = fs.readFileSync(filePath, "utf8");
+  const rawText = readTextFileWithDetectedEncoding(filePath, options.encoding);
   const rows = splitLocalTextIntoParagraphRows(source, rawText, {
     chapterRegex: options.chapterRegex,
     anchor: options.anchor || `local://${path.basename(filePath)}`
@@ -806,20 +828,21 @@ export function deriveKeywordsFromText(text) {
 
 /**
  * Returns a compact book catalog string for AI-guided search scoping.
- * Cached in memory after first call.
+ * Cached per excludeSlug since the catalog depends on which book is being read.
  */
-let cachedCatalog = null;
-export function getBookCatalogForAI() {
-  if (cachedCatalog) return cachedCatalog;
+const cachedCatalogBySlug = new Map();
+export function getBookCatalogForAI(excludeSlug = "ming-shi") {
+  if (cachedCatalogBySlug.has(excludeSlug)) return cachedCatalogBySlug.get(excludeSlug);
   const db = getDb();
   const books = db.prepare(`
     SELECT slug, title, author, description, chapter_count, paragraph_count
-    FROM books WHERE slug != 'ming-shi' AND paragraph_count > 0
+    FROM books WHERE slug != ? AND paragraph_count > 0
     ORDER BY title
-  `).all();
+  `).all(excludeSlug);
   const lines = books.map(b =>
     `${b.slug}: 《${b.title}》(${b.author || "佚名"}) ${b.chapter_count}章/${b.paragraph_count}段 — ${b.description || ""}`
   );
-  cachedCatalog = lines.join("\n");
-  return cachedCatalog;
+  const catalog = lines.join("\n");
+  cachedCatalogBySlug.set(excludeSlug, catalog);
+  return catalog;
 }

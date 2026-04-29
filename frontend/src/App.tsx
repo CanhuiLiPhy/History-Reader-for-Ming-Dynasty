@@ -1,3 +1,4 @@
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { startTransition, useEffect, useRef, useState } from "react";
 import ePub from "epubjs";
 import L from "leaflet";
@@ -35,10 +36,14 @@ import {
   fetchBookMeta,
   fetchDefaults,
   fetchEmperors,
+  fetchLibraryBooks,
   fetchOfficials,
   fetchPersonChronology,
+  fetchReaderChapters,
+  fetchReaderChapter,
   fetchTimeline,
   geocodePlaces,
+  libraryEpubUrl,
   lookupReference,
   runAiAction,
   searchBook,
@@ -54,6 +59,8 @@ import type {
   BookMeta,
   ChronologyResponse,
   CustomAction,
+  DbReaderChaptersPayload,
+  DbReaderChapterPayload,
   DefaultsPayload,
   EmperorPayload,
   GeocodePlace,
@@ -61,6 +68,7 @@ import type {
   FamilyTreeNode,
   OfficialsPayload,
   OfficeSearchPayload,
+  ReadableBook,
   ReignConversionResponse,
   ReaderBookmark,
   ReaderHighlight,
@@ -165,6 +173,9 @@ type EpubRenditionLike = {
   currentLocation?: () => EpubLocationLike | null;
   themes: {
     default: (styles: Record<string, Record<string, string>>) => void;
+    fontSize?: (size: string) => void;
+    font?: (family: string) => void;
+    override?: (key: string, value: string, priority?: boolean) => void;
   };
   annotations: {
     add: (type: string, cfiRange: string, data?: object, callback?: unknown, className?: string, styles?: object) => void;
@@ -202,6 +213,37 @@ declare global {
       totalLocations: number;
     };
   }
+}
+
+// Strip wikisource/four-library prefix from chapter labels so display reads like
+// "卷01" instead of "明史紀事本末/卷01" or "天下郡國利病書 (四部叢刊本)/冊七".
+function normalizeChapterLabel(label: string) {
+  if (!label) return "";
+  const lastSlash = label.lastIndexOf("/");
+  return (lastSlash >= 0 ? label.slice(lastSlash + 1) : label).trim() || label;
+}
+
+// Extract the section prefix (before the LAST '/') for 2-level TOC grouping.
+// Returns "" if no slash (flat list).
+function chapterSectionPrefix(label: string) {
+  if (!label) return "";
+  const lastSlash = label.lastIndexOf("/");
+  return lastSlash >= 0 ? label.slice(0, lastSlash).trim() : "";
+}
+
+function formatChars(n: number) {
+  return n.toLocaleString();
+}
+
+// Rank → numeric for sorting (正一品 < 从一品 < 正二品 < ...). Entries with no
+// recognized rank go to the end.
+const RANK_NUMERALS = ["一", "二", "三", "四", "五", "六", "七", "八", "九"];
+function rankOrder(rank: string): number {
+  if (!rank) return 999;
+  const m = rank.match(/^(正|从)([一二三四五六七八九])品/);
+  if (!m) return 999;
+  const tier = RANK_NUMERALS.indexOf(m[2]);
+  return tier * 2 + (m[1] === "从" ? 1 : 0);
 }
 
 function storageKey(name: string) {
@@ -319,6 +361,19 @@ function App() {
   const autoAnnotateRef = useRef(true);
   const [, setDefaults] = useState<DefaultsPayload | null>(null);
   const [meta, setMeta] = useState<BookMeta | null>(null);
+  // Multi-book reading state (v0.3)
+  const [readableBooks, setReadableBooks] = useState<ReadableBook[]>([]);
+  const [currentBookSlug, setCurrentBookSlug] = useState<string>("ming-shi");
+  const [bookSwitching, setBookSwitching] = useState(false);
+  const [bookMenuOpen, setBookMenuOpen] = useState(false);
+  const [dbReaderChapters, setDbReaderChapters] = useState<DbReaderChaptersPayload | null>(null);
+  const [dbReaderChapter, setDbReaderChapter] = useState<DbReaderChapterPayload | null>(null);
+  const [dbReaderIndex, setDbReaderIndex] = useState(0);
+  const [dbReaderLoading, setDbReaderLoading] = useState(false);
+  // DB-reader pagination (CSS columns flow horizontally; we scroll viewport-wise)
+  const dbReaderHostRef = useRef<HTMLDivElement | null>(null);
+  const [dbPageIndex, setDbPageIndex] = useState(0);
+  const [dbPageTotal, setDbPageTotal] = useState(1);
   const [activeTab, setActiveTab] = useState<SidebarTab>("toc");
   const [bootError, setBootError] = useState("");
   const [loadingBoot, setLoadingBoot] = useState(true);
@@ -333,7 +388,11 @@ function App() {
   const [currentChapterIndex, setCurrentChapterIndex] = useState(0);
   const [locationsReady, setLocationsReady] = useState(false);
   const [selectionText, setSelectionText] = useState("");
-  const [highlightStyle, setHighlightStyle] = useState<{ kind: "highlight" | "underline"; color: string }>({ kind: "highlight", color: "#efc24f" });
+  const [highlightStyle, setHighlightStyle] = useState<{ kind: "highlight" | "underline" | "circle"; color: string }>({ kind: "highlight", color: "#efc24f" });
+  // Bumped after layout-changing events (sidebar collapse, etc.) so the
+  // highlights effect re-runs and forces annotations to re-render after epub.js
+  // has settled in its new dimensions.
+  const [highlightRedrawTick, setHighlightRedrawTick] = useState(0);
   const [selectionCfi, setSelectionCfi] = useState("");
   const [selectionOverlay, setSelectionOverlay] = useState<SelectionOverlay>({
     visible: false,
@@ -389,14 +448,23 @@ function App() {
   const [reignResult, setReignResult] = useState<ReignConversionResponse | null>(null);
   const [reignLoading, setReignLoading] = useState(false);
   const [referenceFilter, setReferenceFilter] = useState("");
+  // Officials panel sub-tabs (v0.3 extended data)
+  const [officialsTab, setOfficialsTab] = useState<"institutions" | "offices" | "chronology" | "princes">("institutions");
+  const [officeRankFilter, setOfficeRankFilter] = useState("");
+  const [chronologyFilter, setChronologyFilter] = useState("");
   const [openResourcePanel, setOpenResourcePanel] = useState<string | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
   const [selectedTreeEmperor, setSelectedTreeEmperor] = useState<FamilyTreeNode | null>(null);
   const [readerLayout, setReaderLayout] = useState<"horizontal" | "vertical">("horizontal");
   const [scriptVariant, setScriptVariant] = useState<"simplified" | "traditional">("traditional");
   const [pageSpread, setPageSpread] = useState<"single" | "double">("single");
+  // v0.3 reading theme + font controls
+  const [readerTheme, setReaderTheme] = useState<"default" | "sepia" | "dark" | "green">("default");
+  const [readerFontFamily, setReaderFontFamily] = useState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">("fangsong");
+  const [readerFontSize, setReaderFontSize] = useState<number>(20);
+  const [readerFontColor, setReaderFontColor] = useState<string>("");
   const [mapQuery, setMapQuery] = useState("");
   const [mapLoading, setMapLoading] = useState(false);
   const [mapResult, setMapResult] = useState<GeocodeResponse | null>(null);
@@ -412,7 +480,7 @@ function App() {
       try {
         const [
           defaultsData,
-          metaData,
+          libraryBooksData,
           savedAiSettings,
           savedHighlights,
           savedNotes,
@@ -423,10 +491,15 @@ function App() {
           savedReaderLayout,
           savedScriptVariant,
           savedPageSpread,
+          savedBookSlug,
+          savedReaderTheme,
+          savedReaderFontFamily,
+          savedReaderFontSize,
+          savedReaderFontColor,
         ] =
           await Promise.all([
             fetchDefaults(),
-            fetchBookMeta(),
+            fetchLibraryBooks(),
             readPersistedState<AiSettings | null>(storageKey("ai-settings"), null),
             readPersistedState<ReaderHighlight[]>(storageKey("highlights"), []),
             readPersistedState<ReaderNote[]>(storageKey("notes"), []),
@@ -437,6 +510,11 @@ function App() {
             readPersistedState<"horizontal" | "vertical">(storageKey("reader-layout"), "horizontal"),
             readPersistedState<"simplified" | "traditional">(storageKey("script-variant"), "traditional"),
             readPersistedState<"single" | "double">(storageKey("page-spread"), "single"),
+            readPersistedState<string>(storageKey("current-book-slug"), "ming-shi"),
+            readPersistedState<"default" | "sepia" | "dark" | "green">(storageKey("reader-theme"), "default"),
+            readPersistedState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">(storageKey("reader-font-family"), "fangsong"),
+            readPersistedState<number>(storageKey("reader-font-size"), 20),
+            readPersistedState<string>(storageKey("reader-font-color"), ""),
           ]);
 
         if (cancelled) return;
@@ -451,8 +529,38 @@ function App() {
             );
         const nextCustomActions = normalizeActions(savedCustomActions.length ? savedCustomActions : defaultsData.ai.customActions);
 
+        // Resolve initial book: persisted slug if it exists in library and is readable, else ming-shi
+        const persistedBook = libraryBooksData.books.find((b) => b.slug === savedBookSlug);
+        const initialBook = persistedBook && (persistedBook.hasEpub || persistedBook.paragraphCount > 0)
+          ? persistedBook
+          : libraryBooksData.books.find((b) => b.slug === "ming-shi") || libraryBooksData.books[0];
+        const initialSlug = initialBook?.slug || "ming-shi";
+
+        // Fetch the initial book's content (meta for EPUB books, chapters for DB books)
+        let initialMeta: BookMeta | null = null;
+        let initialDbChapters: DbReaderChaptersPayload | null = null;
+        let initialDbChapter: DbReaderChapterPayload | null = null;
+        try {
+          if (initialBook?.hasEpub) {
+            initialMeta = await fetchBookMeta(initialSlug);
+          } else if (initialBook) {
+            initialDbChapters = await fetchReaderChapters(initialSlug);
+            if (initialDbChapters.chapters.length > 0) {
+              initialDbChapter = await fetchReaderChapter(initialSlug, 0);
+            }
+          }
+        } catch (error) {
+          if (!cancelled) setBootError(error instanceof Error ? error.message : `加载《${initialBook?.title || initialSlug}》失败。`);
+        }
+        if (cancelled) return;
+
         setDefaults(defaultsData);
-        setMeta(metaData);
+        setReadableBooks(libraryBooksData.books);
+        setCurrentBookSlug(initialSlug);
+        setMeta(initialMeta);
+        setDbReaderChapters(initialDbChapters);
+        setDbReaderChapter(initialDbChapter);
+        setDbReaderIndex(0);
         setCustomActions(nextCustomActions);
         setAiSettings(mergeAiSettings(defaultsData, savedAiSettings, nextCustomActions));
         setHighlights(savedHighlights);
@@ -463,6 +571,10 @@ function App() {
         setReaderLayout(savedReaderLayout);
         setScriptVariant(savedScriptVariant);
         setPageSpread(savedPageSpread);
+        setReaderTheme(savedReaderTheme);
+        setReaderFontFamily(savedReaderFontFamily);
+        setReaderFontSize(savedReaderFontSize);
+        setReaderFontColor(savedReaderFontColor);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -519,6 +631,88 @@ function App() {
     if (!hasLoadedLocalState) return;
     void writePersistedState(storageKey("last-location"), lastLocation);
   }, [lastLocation, hasLoadedLocalState]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("current-book-slug"), currentBookSlug);
+  }, [currentBookSlug, hasLoadedLocalState]);
+
+  // v0.3 — apply reader theme + font controls to both DB-reader (CSS vars on
+  // document root) and the EPUB rendition (epub.js iframe styles).
+  useEffect(() => {
+    const presets: Record<typeof readerTheme, { bg: string; color: string }> = {
+      default: { bg: "#fcf8ee", color: "#1f160f" },
+      sepia: { bg: "#f1e4c8", color: "#3a2810" },
+      dark: { bg: "#1a1814", color: "#dcc89a" },
+      green: { bg: "#dde9d4", color: "#23371b" },
+    };
+    // Bundled font names come first (always available); system fonts second
+    // (cover characters the bundled font may miss); generic last as final
+    // safety net.
+    const families: Record<typeof readerFontFamily, string> = {
+      serif: '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
+      fangsong: '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", serif',
+      kaiti: '"LXGWWenKai", "FZHanWZKJ", "KaiTi", "STKaiti", "BiauKai", "楷体", serif',
+      lishu: '"LiSu", "STLiti", "SimLi", "隶书", "FZHanWZKJ", serif',
+      shoujin: '"ShoujinTi", "FZHanWZKJ", "LXGWWenKai", "KaiTi", "STKaiti", serif',
+    };
+    const preset = presets[readerTheme];
+    const color = readerFontColor || preset.color;
+    const family = families[readerFontFamily];
+    const sizePx = `${readerFontSize}px`;
+
+    const root = document.documentElement;
+    root.style.setProperty("--reader-bg", preset.bg);
+    root.style.setProperty("--reader-color", color);
+    root.style.setProperty("--reader-font-family", family);
+    root.style.setProperty("--reader-font-size", sizePx);
+    root.dataset.readerTheme = readerTheme;
+
+    // Apply to live epub.js rendition if present.
+    // !important is required because EPUBs ship their own stylesheets that
+    // would otherwise win the cascade over rendition.themes.
+    const rendition = renditionRef.current;
+    if (rendition?.themes) {
+      try {
+        rendition.themes.default({
+          body: {
+            color: `${color} !important`,
+            background: `${preset.bg} !important`,
+            "font-family": `${family} !important`,
+            "font-size": `${sizePx} !important`,
+            "line-height": "1.92 !important",
+            "letter-spacing": "0.01em",
+            "max-width": "none !important",
+          },
+          p: { "text-indent": "2em" },
+        });
+        rendition.themes.fontSize?.(sizePx);
+        rendition.themes.font?.(family);
+      } catch {
+        // some epub.js APIs unavailable; CSS-vars fallback covers the host
+      }
+    }
+  }, [readerTheme, readerFontFamily, readerFontSize, readerFontColor, readerReady]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("reader-theme"), readerTheme);
+  }, [readerTheme, hasLoadedLocalState]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("reader-font-family"), readerFontFamily);
+  }, [readerFontFamily, hasLoadedLocalState]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("reader-font-size"), readerFontSize);
+  }, [readerFontSize, hasLoadedLocalState]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("reader-font-color"), readerFontColor);
+  }, [readerFontColor, hasLoadedLocalState]);
 
   useEffect(() => {
     readerLayoutRef.current = readerLayout;
@@ -798,6 +992,145 @@ function App() {
     }
   }
 
+  // Selection handler for the DB-reader (non-EPUB books) — mirrors the
+  // selection event the epub.js reader emits, so AI / compare / lookup can
+  // all reuse the same `selectionText` state.
+  function handleDbReaderSelection(event: ReactMouseEvent<HTMLDivElement>) {
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() || "";
+    if (!text) {
+      setSelectionOverlay((prev) => ({ ...prev, visible: false }));
+      return;
+    }
+    const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+    const rect = range?.getBoundingClientRect();
+    const popupHeight = 60;
+    const belowY = rect ? rect.bottom + window.scrollY + 12 : event.clientY + 12;
+    const aboveY = rect ? rect.top + window.scrollY - popupHeight - 12 : belowY;
+    const top = (belowY + popupHeight < window.innerHeight + window.scrollY) ? belowY : Math.max(8, aboveY);
+    const left = rect ? rect.left + window.scrollX + (rect.width / 2) : event.clientX;
+    setSelectionText(text);
+    setSelectionCfi(`db:${currentBookSlug}:${dbReaderIndex}`);
+    setSelectionOverlay({ visible: true, top, left });
+  }
+
+  // Switch to a different book; tears down current rendition and refetches data.
+  async function switchBook(slug: string) {
+    if (slug === currentBookSlug) {
+      setBookMenuOpen(false);
+      return;
+    }
+    const target = readableBooks.find((b) => b.slug === slug);
+    if (!target) return;
+    setBookMenuOpen(false);
+    setBookSwitching(true);
+    try {
+      // Reset reader-related transient state. Setting meta to null first forces
+      // the EPUB reader effect to tear down BEFORE the new slug arrives — avoids
+      // a window where ePub() is constructed with the new slug URL but the old
+      // meta's chapter href, which would render a blank page.
+      setReaderReady(false);
+      setLocationsReady(false);
+      setCurrentCfi("");
+      setCurrentHref("");
+      setCurrentSectionLabel("");
+      setProgress(0);
+      setChapterPageCurrent(1);
+      setChapterPageTotal(1);
+      setCurrentChapterIndex(0);
+      initialLocationRef.current = "";
+      pendingAnchorRef.current = "";
+      currentCfiRef.current = "";
+      setMeta(null);
+      setDbReaderChapters(null);
+      setDbReaderChapter(null);
+      setDbReaderIndex(0);
+      setCurrentBookSlug(slug);
+
+      if (target.hasEpub) {
+        const newMeta = await fetchBookMeta(slug);
+        setMeta(newMeta);
+      } else {
+        const chaptersData = await fetchReaderChapters(slug);
+        setDbReaderChapters(chaptersData);
+        if (chaptersData.chapters.length > 0) {
+          const firstChapter = await fetchReaderChapter(slug, 0);
+          setDbReaderChapter(firstChapter);
+        }
+      }
+    } catch (error) {
+      setBootError(error instanceof Error ? error.message : "切换书籍失败。");
+    } finally {
+      setBookSwitching(false);
+    }
+  }
+
+  // Load a chapter for DB-reader (non-EPUB books)
+  async function loadDbReaderChapter(index: number) {
+    if (!dbReaderChapters || index < 0 || index >= dbReaderChapters.chapters.length) return;
+    setDbReaderLoading(true);
+    try {
+      const data = await fetchReaderChapter(currentBookSlug, index);
+      setDbReaderChapter(data);
+      setDbReaderIndex(index);
+      setDbPageIndex(0);
+      // Force scroll back to start; effect below recomputes page totals
+      requestAnimationFrame(() => {
+        if (dbReaderHostRef.current) dbReaderHostRef.current.scrollLeft = 0;
+      });
+    } catch (error) {
+      setBootError(error instanceof Error ? error.message : "加载章节失败。");
+    } finally {
+      setDbReaderLoading(false);
+    }
+  }
+
+  function flipDbPage(direction: -1 | 1) {
+    const host = dbReaderHostRef.current;
+    if (!host) return;
+    host.scrollBy({ left: direction * host.clientWidth, behavior: "smooth" });
+  }
+
+  function jumpDbPage(target: number) {
+    const host = dbReaderHostRef.current;
+    if (!host) return;
+    const clamped = Math.max(0, Math.min(dbPageTotal - 1, target));
+    host.scrollTo({ left: clamped * host.clientWidth, behavior: "smooth" });
+  }
+
+  // Recompute total pages whenever the chapter content or theme/font changes.
+  useEffect(() => {
+    const isDbReaderActive = readableBooks.find((b) => b.slug === currentBookSlug)?.hasEpub === false;
+    if (!isDbReaderActive) return;
+    const host = dbReaderHostRef.current;
+    if (!host) return;
+    const recompute = () => {
+      const article = host.querySelector<HTMLElement>(".db-reader-article");
+      if (article) {
+        // Each column = exactly one viewport width so scrollBy(clientWidth)
+        // flips one full page.
+        article.style.columnWidth = host.clientWidth + "px";
+      }
+      const total = Math.max(1, Math.ceil(host.scrollWidth / Math.max(1, host.clientWidth)));
+      setDbPageTotal(total);
+      setDbPageIndex(Math.round(host.scrollLeft / Math.max(1, host.clientWidth)));
+    };
+    // Wait one frame so CSS columns have finished laying out
+    const id = requestAnimationFrame(recompute);
+    const onResize = () => recompute();
+    window.addEventListener("resize", onResize);
+    const onScroll = () => {
+      setDbPageIndex(Math.round(host.scrollLeft / Math.max(1, host.clientWidth)));
+    };
+    host.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      cancelAnimationFrame(id);
+      window.removeEventListener("resize", onResize);
+      host.removeEventListener("scroll", onScroll);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarCollapsed, assistantCollapsed, currentBookSlug, readableBooks]);
+
   async function openLocation(target: string) {
     if (!renditionRef.current) return;
 
@@ -821,19 +1154,32 @@ function App() {
       } catch { /* fall through to href attempts */ }
     }
 
-    // href target — pass directly to epubjs.
-    // After EPUB splitting, each chapter is its own file, so display(href) works reliably.
-    const candidates = uniqueValues([target, normalizedTarget, `OEBPS/${normalizedTarget.replace(/^OEBPS\//, "")}`]);
+    // href target — try several path variants because epub.js stores spine
+    // entries under href keys that depend on the EPUB's internal layout
+    // (OEBPS/, EPUB/, OPS/, or flat). We try the absolute path first, then
+    // strip the leading directory so e.g. "EPUB/xhtml/foo.xhtml" also tries
+    // "xhtml/foo.xhtml" (which is what epub.js may have keyed it as).
+    const stripFirstDir = normalizedTarget.replace(/^[^/]+\//, "");
+    const candidates = uniqueValues([
+      target,
+      normalizedTarget,
+      stripFirstDir,
+      `OEBPS/${stripFirstDir}`,
+    ]);
     for (const candidate of candidates) {
       try {
         await renditionRef.current.display(candidate);
-
-
         window.setTimeout(() => scrollPendingAnchorIntoView(), 60);
         return;
       } catch {
         // Try next candidate
       }
+    }
+    // Final fallback: just display the first spine item (no target).
+    try {
+      await renditionRef.current.display();
+    } catch {
+      // give up
     }
   }
 
@@ -886,7 +1232,7 @@ function App() {
     const hostWidth = Math.round(hostRect.width) || 800;
     const hostHeight = Math.round(hostRect.height) || 600;
 
-    const book = ePub("/book/source.epub") as EpubBookLike;
+    const book = ePub(libraryEpubUrl(currentBookSlug)) as EpubBookLike;
     const rendition = book.renderTo(host, {
       width: hostWidth,
       height: hostHeight,
@@ -909,10 +1255,70 @@ function App() {
         "font-family": '"Source Han Serif SC", "Noto Serif SC", "Songti SC", serif',
         "line-height": "1.92",
         "letter-spacing": "0.01em",
+        "max-width": "none",
+        "margin": "0 auto",
       },
       p: {
         "text-indent": "2em",
       },
+      "div, section, article": {
+        "max-width": "none",
+      },
+    });
+
+    // Inject bundled @font-face + width/font !important overrides into each
+    // rendered section. Without this, EPUB's own stylesheets win over
+    // rendition.themes.default and the user's font/theme picks have no effect.
+    const FONT_FACE_CSS = `
+      @font-face { font-family: "ShoujinTi"; src: url("${window.location.origin}/fonts/shoujin-simplified.ttf") format("truetype"); font-display: swap; unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF; }
+      @font-face { font-family: "ShoujinTi"; src: url("${window.location.origin}/fonts/shoujin-traditional.ttf") format("truetype"); font-display: swap; unicode-range: U+3400-4DBF, U+F900-FAFF, U+20000-2A6DF; }
+      @font-face { font-family: "LXGWWenKai"; src: url("${window.location.origin}/fonts/lxgw-wenkai.ttf") format("truetype"); font-display: swap; }
+      @font-face { font-family: "FZHanWZKJ"; src: url("${window.location.origin}/fonts/kaiti.ttf") format("truetype"); font-display: swap; }
+    `;
+    const LAYOUT_OVERRIDE_CSS = `
+      /* Only neutralize EPUB's own width caps — never set explicit width or
+         padding on html/body, since that interferes with epub.js paginated
+         flow's column-width calculation and makes content overflow. */
+      html, body {
+        max-width: none !important;
+        margin: 0 !important;
+        box-sizing: border-box !important;
+      }
+      body *:not(code):not(pre) {
+        font-family: inherit !important;
+      }
+      /* Some EPUBs (e.g. 三朝辽事实录) cap paragraphs to 40em which prevents
+         text from filling the reader on wider viewports. Strip max-width and
+         auto margins on common text-flow elements. */
+      body p, body div, body section, body article, body blockquote,
+      .calibre, .calibre1, .calibre_4, .calibre_5, .calibre_6,
+      .x-ebookmaker-cover {
+        max-width: none !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+      }
+      img, table, figure {
+        max-width: 100% !important;
+        height: auto !important;
+      }
+    `;
+    type RenditionHooks = { hooks?: { content?: { register?: (cb: (contents: EpubContentsLike) => void) => void } } };
+    const hooksHost = rendition as unknown as RenditionHooks;
+    hooksHost.hooks?.content?.register?.((contents: EpubContentsLike) => {
+      const doc = contents.document;
+      if (!doc.querySelector("#mingshi-injected-fonts")) {
+        const style = doc.createElement("style");
+        style.id = "mingshi-injected-fonts";
+        style.textContent = FONT_FACE_CSS;
+        doc.head.appendChild(style);
+      }
+      // Layout overrides go LAST in <head> so they win the cascade.
+      if (!doc.querySelector("#mingshi-injected-layout")) {
+        const style = doc.createElement("style");
+        style.id = "mingshi-injected-layout";
+        style.textContent = LAYOUT_OVERRIDE_CSS;
+        doc.head.appendChild(style);
+      }
     });
 
     rendition.on("selected", (cfiRange: string, contents: EpubContentsLike) => {
@@ -1038,17 +1444,37 @@ function App() {
 
     void init();
 
-    // Resize handler: update epubjs dimensions so pagination recalculates
+    // Resize handler: update epubjs dimensions so pagination recalculates.
+    // ResizeObserver also picks up sidebar/assistant collapse/expand which
+    // change reader width without firing window resize. Guard against feedback
+    // loops by ignoring sub-pixel changes and debouncing through rAF.
+    let lastW = 0;
+    let lastH = 0;
+    let resizePending = false;
     const onResize = () => {
-      const rect = host.getBoundingClientRect();
-      const w = Math.round(rect.width) || 800;
-      const h = Math.round(rect.height) || 600;
-      rendition.resize?.(w, h);
+      if (resizePending) return;
+      resizePending = true;
+      window.requestAnimationFrame(() => {
+        resizePending = false;
+        const rect = host.getBoundingClientRect();
+        const w = Math.round(rect.width) || 800;
+        const h = Math.round(rect.height) || 600;
+        if (Math.abs(w - lastW) < 2 && Math.abs(h - lastH) < 2) return;
+        lastW = w;
+        lastH = h;
+        rendition.resize?.(w, h);
+      });
     };
     window.addEventListener("resize", onResize);
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(() => onResize());
+      resizeObserver.observe(host);
+    }
 
     return () => {
       window.removeEventListener("resize", onResize);
+      resizeObserver?.disconnect();
       if (chapterJumpTimerRef.current) {
         window.clearTimeout(chapterJumpTimerRef.current);
       }
@@ -1070,9 +1496,9 @@ function App() {
       bookRef.current = null;
       renditionRef.current = null;
     };
-  // EPUB 初始化必须只随书籍元数据与本地状态加载完成而运行；加入内部回调依赖会销毁并重建 reader。
+  // EPUB 初始化随当前书籍 slug 与元数据变更：切书时销毁旧 rendition 并以新 EPUB URL 重新构建。
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta, hasLoadedLocalState]);
+  }, [meta, hasLoadedLocalState, currentBookSlug]);
 
   useEffect(() => {
     currentCfiRef.current = currentCfi;
@@ -1107,21 +1533,32 @@ function App() {
     if (!readerReady || !renditionRef.current) return;
 
     const rendition = renditionRef.current;
+    const epubType = (kind: ReaderHighlight["kind"]) =>
+      kind === "underline" ? "underline" : kind === "circle" ? "underline" : "highlight";
+
     for (const item of highlights) {
-      const type = item.kind === "underline" ? "underline" : "highlight";
-      rendition.annotations.remove(item.cfiRange, type);
+      rendition.annotations.remove(item.cfiRange, epubType(item.kind));
     }
 
     for (const item of highlights) {
-      const type = item.kind === "underline" ? "underline" : "highlight";
-      const styles =
-        item.kind === "underline"
-          ? { stroke: item.color, "stroke-width": "2", "stroke-opacity": "0.95" }
-          : { fill: item.color, "fill-opacity": "0.28", "mix-blend-mode": "multiply" };
+      const type = epubType(item.kind);
+      let styles: Record<string, string>;
+      if (item.kind === "circle" || item.kind === "underline") {
+        // marks-pane 的 Underline 同时画 <rect> 和 <line>，且 <line> 的 stroke
+        // 被硬编码成 "black"。我们走 inline style: color = 想要的颜色，配合
+        // App.css 里 `g.reader-underline/circle line { stroke: currentColor
+        // !important }` 把颜色传到 line，并用 `display:none` 干掉那个空心 rect。
+        styles = {
+          style: `color: ${item.color || "#d4231b"}`,
+        };
+      } else {
+        // 高亮（3 色）保留矩形填充
+        styles = { fill: item.color, "fill-opacity": "0.28", "mix-blend-mode": "multiply", stroke: "none" };
+      }
 
-      rendition.annotations.add(type, item.cfiRange, {}, undefined, `reader-${type}`, styles);
+      rendition.annotations.add(type, item.cfiRange, {}, undefined, `reader-${item.kind}`, styles);
     }
-  }, [highlights, readerReady]);
+  }, [highlights, readerReady, highlightRedrawTick]);
 
   useEffect(() => {
     if (!readerReady || !renditionRef.current || !currentCfiRef.current) return;
@@ -1157,12 +1594,15 @@ function App() {
   // Resize epubjs rendition when sidebars collapse/expand
   useEffect(() => {
     if (!readerReady || !renditionRef.current || !readerHostRef.current) return;
+    // Wait for CSS transition (max 150ms now) to finish, then resize + force a
+    // fresh annotation render once epub.js has redrawn the view.
     const timer = window.setTimeout(() => {
       const rect = readerHostRef.current?.getBoundingClientRect();
-      if (rect) {
-        renditionRef.current?.resize?.(Math.round(rect.width), Math.round(rect.height));
+      if (rect && renditionRef.current) {
+        renditionRef.current.resize?.(Math.round(rect.width), Math.round(rect.height));
+        window.setTimeout(() => setHighlightRedrawTick((t) => t + 1), 80);
       }
-    }, 300); // delay to let CSS transition finish
+    }, 170);
     return () => window.clearTimeout(timer);
   }, [sidebarCollapsed, assistantCollapsed, readerReady]);
 
@@ -1199,7 +1639,7 @@ function App() {
     };
   }, [activeTab, emperorsData, officialsData]);
 
-  function addSelectionHighlight(kind: "highlight" | "underline", color: string) {
+  function addSelectionHighlight(kind: "highlight" | "underline" | "circle", color: string) {
     if (!selectionCfi || !selectionText.trim()) return;
     const item: ReaderHighlight = {
       id: crypto.randomUUID(),
@@ -1276,7 +1716,7 @@ function App() {
   }
 
   function removeHighlight(target: ReaderHighlight) {
-    renditionRef.current?.annotations?.remove(target.cfiRange, target.kind === "underline" ? "underline" : "highlight");
+    renditionRef.current?.annotations?.remove(target.cfiRange, target.kind === "highlight" ? "highlight" : "underline");
     setHighlights((current) => current.filter((item) => item.id !== target.id));
   }
 
@@ -1355,7 +1795,7 @@ function App() {
       setCompareLoading(true);
       setReferenceError("");
       const effectiveText = supplement ? `${targetText.trim()}\n【用户补充说明】${supplement}` : targetText.trim();
-      const response = await compareReference(effectiveText, aiSettings);
+      const response = await compareReference(effectiveText, aiSettings, currentBookSlug);
       startTransition(() => {
         setReferenceCompare(response);
       });
@@ -1617,7 +2057,7 @@ function App() {
       `导出时间：${new Date().toLocaleString("zh-CN")}`,
       "",
       ...highlights.flatMap((highlight, index) => [
-        `## ${index + 1}. ${highlight.kind === "underline" ? "下划线" : "高亮"} · ${formatTime(highlight.createdAt)}`,
+        `## ${index + 1}. ${highlight.kind === "underline" ? "下划线" : highlight.kind === "circle" ? "圈点" : "高亮"} · ${formatTime(highlight.createdAt)}`,
         "",
         highlight.text,
         "",
@@ -1646,9 +2086,13 @@ function App() {
     setNewActionTemplate("");
   }
 
-  const readingStats = meta
-    ? `${meta.metadata.creator} · ${meta.stats.chapterCount} 个原书章节 · 约 ${meta.stats.totalChars.toLocaleString()} 字`
-    : "";
+  const currentBook = readableBooks.find((b) => b.slug === currentBookSlug) || null;
+  // Header line: "书名·作者 · 约 N 字"
+  const readingStats = currentBook
+    ? `《${currentBook.title}》·${currentBook.author || "佚名"} · 约 ${formatChars(currentBook.charCount || (meta?.stats.totalChars ?? 0))} 字`
+    : meta
+      ? `${meta.metadata.creator} · 约 ${formatChars(meta.stats.totalChars)} 字`
+      : "";
   const hasSelection = Boolean(selectionText.trim());
   const selectionHighlight = selectionCfi
     ? highlights.find((item) => item.cfiRange === selectionCfi || (selectionText && item.text === selectionText))
@@ -1669,16 +2113,48 @@ function App() {
       <aside className={`sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}>
         <div className="brand-card">
           <div className="brand-row">
-            <div className="brand-chip">明史</div>
+            <div className="book-selector">
+              <button
+                type="button"
+                className="book-selector-trigger"
+                onClick={() => setBookMenuOpen((v) => !v)}
+                disabled={bookSwitching}
+                title="切换阅读书目"
+              >
+                <LibraryBig size={14} />
+                <span className="book-selector-label">{currentBook?.title || "选择书目"}</span>
+                <span className="book-selector-caret">▾</span>
+              </button>
+              {bookMenuOpen && (
+                <div className="book-selector-menu" role="menu">
+                  {readableBooks.map((book) => (
+                    <button
+                      key={book.slug}
+                      type="button"
+                      className={`book-selector-item ${book.slug === currentBookSlug ? "is-active" : ""}`}
+                      onClick={() => void switchBook(book.slug)}
+                      role="menuitem"
+                    >
+                      <div className="book-selector-item-title">
+                        《{book.title}》
+                        {book.hasEpub ? <span className="book-tag book-tag-epub">原典</span> : <span className="book-tag book-tag-db">检索</span>}
+                      </div>
+                      <div className="book-selector-item-meta">
+                        {(book.author || "佚名")} · 约 {formatChars(book.charCount)} 字
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button type="button" className="ghost-button compact-button sidebar-collapse-btn" onClick={() => setSidebarCollapsed(true)} title="折叠侧边栏">
               &lsaquo;
             </button>
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v0.2</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v0.3</button>
           </h1>
-          <p>{"以本书为底本的本地阅读与智能研读工具"}</p>
           <span className="muted-text">{readingStats}</span>
         </div>
 
@@ -1707,7 +2183,47 @@ function App() {
                 <span>目录跳转</span>
               </div>
               <div className="toc-tree">
-                {(meta?.inPageToc?.length ?? 0) > 0
+                {currentBook?.hasEpub === false ? (
+                  // DB-reader chapter list — group by section prefix when chapters use "{section}/{name}" labels
+                  (() => {
+                    const chapters = dbReaderChapters?.chapters ?? [];
+                    const useGrouping = chapters.some((c) => chapterSectionPrefix(c.label));
+                    if (!useGrouping) {
+                      return chapters.map((chapter) => (
+                        <button
+                          key={chapter.order}
+                          type="button"
+                          className={`toc-leaf ${chapter.order === dbReaderIndex ? "is-active" : ""}`}
+                          onClick={() => void loadDbReaderChapter(chapter.order)}
+                        >
+                          {normalizeChapterLabel(chapter.label)}
+                        </button>
+                      ));
+                    }
+                    const groups = new Map<string, typeof chapters>();
+                    for (const ch of chapters) {
+                      const prefix = chapterSectionPrefix(ch.label) || "其他";
+                      if (!groups.has(prefix)) groups.set(prefix, []);
+                      groups.get(prefix)!.push(ch);
+                    }
+                    const activePrefix = chapters[dbReaderIndex] ? (chapterSectionPrefix(chapters[dbReaderIndex].label) || "其他") : "";
+                    return [...groups.entries()].map(([section, items]) => (
+                      <details key={section} className="toc-section" open={section === activePrefix}>
+                        <summary className="toc-section-summary">{section}（{items.length}）</summary>
+                        {items.map((chapter) => (
+                          <button
+                            key={chapter.order}
+                            type="button"
+                            className={`toc-leaf toc-leaf-sub ${chapter.order === dbReaderIndex ? "is-active" : ""}`}
+                            onClick={() => void loadDbReaderChapter(chapter.order)}
+                          >
+                            {normalizeChapterLabel(chapter.label)}
+                          </button>
+                        ))}
+                      </details>
+                    ));
+                  })()
+                ) : (meta?.inPageToc?.length ?? 0) > 0
                   ? (meta?.inPageToc ?? []).map((item) => (
                       <TocNode key={item.href} item={item} onSelect={openLocation} />
                     ))
@@ -1967,6 +2483,53 @@ function App() {
                     <option value="double">双栏对开分页</option>
                   </select>
                 </label>
+                <div className="divider" />
+                <div className="panel-headline small">
+                  <Highlighter size={14} />
+                  <span>页面外观</span>
+                </div>
+                <label className="field-label">
+                  阅读主题
+                  <select className="select-input" value={readerTheme} onChange={(e) => setReaderTheme(e.target.value as "default" | "sepia" | "dark" | "green")}>
+                    <option value="default">默认（米白）</option>
+                    <option value="sepia">古籍米黄</option>
+                    <option value="dark">夜间</option>
+                    <option value="green">护眼绿</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  正文字体
+                  <select className="select-input" value={readerFontFamily} onChange={(e) => setReaderFontFamily(e.target.value as "serif" | "fangsong" | "kaiti" | "lishu" | "shoujin")}>
+                    <option value="serif">宋体（系统）</option>
+                    <option value="fangsong">仿宋（系统）</option>
+                    <option value="kaiti">楷书（霞鹜文楷·内置）</option>
+                    <option value="lishu">隶书（系统）</option>
+                    <option value="shoujin">瘦金体（方正·内置）</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  字号 {readerFontSize}px
+                  <input
+                    type="range"
+                    min={13}
+                    max={28}
+                    step={1}
+                    value={readerFontSize}
+                    onChange={(e) => setReaderFontSize(Number(e.target.value))}
+                  />
+                </label>
+                <label className="field-label">
+                  字色（留空则跟随主题）
+                  <div className="inline-actions">
+                    <input
+                      type="color"
+                      value={readerFontColor || "#1f160f"}
+                      onChange={(e) => setReaderFontColor(e.target.value)}
+                      style={{ width: 48, height: 32, padding: 0, border: "none", background: "transparent" }}
+                    />
+                    <button type="button" className="ghost-button compact-button" onClick={() => setReaderFontColor("")}>重置</button>
+                  </div>
+                </label>
                 <button type="button" className="secondary-button" onClick={() => setOpenResourcePanel("custom-actions")}>
                   自定义 AI 操作（{customActions.length} 个）
                 </button>
@@ -1994,46 +2557,103 @@ function App() {
 
       <main className="reader-column">
         <header className="reader-toolbar">
-          <div>
-            <div className="current-label">{currentSectionLabel || meta?.metadata.title || "载入中…"}</div>
-            <div className="muted-text">
-              第 {currentChapterIndex + 1}/333 章 · 本章 {chapterPageCurrent}/{chapterPageTotal} 页 · {meta?.metadata.creator}
-            </div>
-          </div>
-          <div className="toolbar-actions">
-            <button type="button" className="ghost-button" onClick={goPrevPage}>
-              上一页
-            </button>
-            <button type="button" className="ghost-button" onClick={goNextPage}>
-              下一页
-            </button>
-            <button type="button" className="ghost-button" onClick={createBookmark}>
-              <Bookmark size={16} />
-              书签
-            </button>
-          </div>
+          {currentBook?.hasEpub === false ? (
+            <>
+              <div>
+                <div className="current-label">{normalizeChapterLabel(dbReaderChapter?.chapter || dbReaderChapters?.title || "载入中…")}</div>
+                <div className="muted-text">
+                  第 {dbReaderIndex + 1}/{dbReaderChapters?.chapters.length || "?"} 章 · 本章 {dbPageIndex + 1}/{dbPageTotal} 页 · {currentBook?.author || dbReaderChapters?.author || ""}
+                </div>
+              </div>
+              <div className="toolbar-actions">
+                <button type="button" className="ghost-button" onClick={() => flipDbPage(-1)} disabled={dbPageIndex <= 0}>
+                  上一页
+                </button>
+                <button type="button" className="ghost-button" onClick={() => flipDbPage(1)} disabled={dbPageIndex >= dbPageTotal - 1}>
+                  下一页
+                </button>
+                <button type="button" className="ghost-button" disabled={dbReaderIndex <= 0 || dbReaderLoading} onClick={() => void loadDbReaderChapter(dbReaderIndex - 1)}>
+                  上一章
+                </button>
+                <button type="button" className="ghost-button" disabled={!dbReaderChapters || dbReaderIndex >= (dbReaderChapters.chapters.length - 1) || dbReaderLoading} onClick={() => void loadDbReaderChapter(dbReaderIndex + 1)}>
+                  下一章
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                <div className="current-label">{currentSectionLabel || meta?.metadata.title || "载入中…"}</div>
+                <div className="muted-text">
+                  第 {currentChapterIndex + 1}/{meta?.stats.chapterCount || "?"} 章 · 本章 {chapterPageCurrent}/{chapterPageTotal} 页 · {meta?.metadata.creator}
+                </div>
+              </div>
+              <div className="toolbar-actions">
+                <button type="button" className="ghost-button" onClick={goPrevPage}>
+                  上一页
+                </button>
+                <button type="button" className="ghost-button" onClick={goNextPage}>
+                  下一页
+                </button>
+                <button type="button" className="ghost-button" onClick={createBookmark}>
+                  <Bookmark size={16} />
+                  书签
+                </button>
+              </div>
+            </>
+          )}
         </header>
 
         <section className="reader-card">
           {loadingBoot && <div className="overlay-message">正在载入书籍与本地资料…</div>}
           {bootError && <div className="overlay-message error-box">{bootError}</div>}
-          <div ref={readerHostRef} className="reader-host" />
-          <div className="page-turn-zone page-turn-left" onClick={goPrevPage} />
-          <div className="page-turn-zone page-turn-right" onClick={goNextPage} />
+          {bookSwitching && <div className="overlay-message">切换书目中…</div>}
+          {currentBook?.hasEpub === false ? (
+            <div className="db-reader-host" ref={dbReaderHostRef} onMouseUp={handleDbReaderSelection}>
+              {dbReaderLoading && <div className="overlay-message">载入章节…</div>}
+              {dbReaderChapter ? (
+                <article className="db-reader-article">
+                  <h2 className="db-reader-chapter-title">{normalizeChapterLabel(dbReaderChapter.chapter)}</h2>
+                  {dbReaderChapter.paragraphs.map((p) => (
+                    <p key={p.id} className="db-reader-paragraph" data-paragraph-id={p.id}>{p.content}</p>
+                  ))}
+                </article>
+              ) : (!dbReaderLoading && <div className="overlay-message muted-text">无内容</div>)}
+              <div className="page-turn-zone page-turn-left" onClick={() => flipDbPage(-1)} />
+              <div className="page-turn-zone page-turn-right" onClick={() => flipDbPage(1)} />
+            </div>
+          ) : (
+            <>
+              <div ref={readerHostRef} className="reader-host" />
+              <div className="page-turn-zone page-turn-left" onClick={goPrevPage} />
+              <div className="page-turn-zone page-turn-right" onClick={goNextPage} />
+            </>
+          )}
         </section>
 
         <footer className="reader-footer">
-          <input
-            type="range"
-            min={1}
-            max={chapterPageTotal}
-            step={1}
-            value={chapterPageCurrent}
-            onChange={(event) => {
-              const targetPage = Number.parseInt(event.target.value, 10);
-              jumpToPage(targetPage);
-            }}
-          />
+          {currentBook?.hasEpub === false ? (
+            <input
+              type="range"
+              min={1}
+              max={Math.max(1, dbPageTotal)}
+              step={1}
+              value={dbPageIndex + 1}
+              onChange={(event) => jumpDbPage(Number.parseInt(event.target.value, 10) - 1)}
+            />
+          ) : (
+            <input
+              type="range"
+              min={1}
+              max={chapterPageTotal}
+              step={1}
+              value={chapterPageCurrent}
+              onChange={(event) => {
+                const targetPage = Number.parseInt(event.target.value, 10);
+                jumpToPage(targetPage);
+              }}
+            />
+          )}
           <div className="footer-meta">
             <span>当前位置已自动保存{locationsReady ? "" : " · 正在生成章节定位映射"}</span>
             <span>{ttsStatus || "AI / 浏览器朗读已就绪"}</span>
@@ -2270,7 +2890,7 @@ function App() {
             <div className="result-list compact">
               {highlights.slice(0, 12).map((item) => (
                 <div key={item.id} className="result-card static-card">
-                  <div className="result-title">{item.kind === "underline" ? "下划线" : "高亮"} · {formatTime(item.createdAt)}</div>
+                  <div className="result-title">{item.kind === "underline" ? "下划线" : item.kind === "circle" ? "圈点" : "高亮"} · {formatTime(item.createdAt)}</div>
                   <div className="result-snippet">{item.text}</div>
                   <div className="inline-actions">
                     <button type="button" className="ghost-button" onClick={() => openLocation(item.cfiRange)}>
@@ -2301,8 +2921,11 @@ function App() {
                   <span className="color-dot" style={{ backgroundColor: item.color }} />
                 </button>
               ))}
-              <button type="button" className={`color-pick ${highlightStyle.kind === "underline" ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "underline", color: "#9b4d2d" })} title="下划线">
+              <button type="button" className={`color-pick ${highlightStyle.kind === "underline" ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "underline", color: "#d4231b" })} title="下划线（正红）">
                 <span className="underline-icon">U</span>
+              </button>
+              <button type="button" className={`color-pick ${highlightStyle.kind === "circle" ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "circle", color: "#d4231b" })} title="圈点（正红 · 古文勾画法）">
+                <span className="circle-icon">⠿</span>
               </button>
             </div>
             <button type="button" className="toolbar-mini" onClick={() => addSelectionHighlight(highlightStyle.kind, highlightStyle.color)}>
@@ -2439,49 +3062,186 @@ function App() {
 
             {openResourcePanel === "officials" && (
               <div className="stack-gap">
-                <div className="muted-text">按品级与职责浏览，或检索"兵部尚书""巡抚""首辅"等职位线索。</div>
-                <input
-                  className="text-input"
-                  value={referenceFilter}
-                  onChange={(event) => setReferenceFilter(event.target.value)}
-                  placeholder="筛选官署名称或品级"
-                />
-                <div className="detail-grid">
-                  {filteredInstitutions?.slice(0, 12).map((item) => (
-                    <div key={item.id} className="detail-item">
-                      <strong>{item.name}</strong>
-                      <span>{item.rank}</span>
-                      <span>{item.salaryReference}</span>
-                      <span>{item.responsibilities.slice(0, 2).join("；")}</span>
-                    </div>
+                <div className="officials-tabs">
+                  {([
+                    ["institutions", `官署（${officialsData?.institutions.length ?? 0}）`],
+                    ["offices", `官职（${officialsData?.offices?.length ?? 0}）`],
+                    ["chronology", `历任（${officialsData?.chronology?.length ?? 0}）`],
+                    ["princes", `藩王（${officialsData?.princes?.length ?? 0}）`],
+                  ] as const).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`tab-button ${officialsTab === key ? "is-active" : ""}`}
+                      onClick={() => setOfficialsTab(key)}
+                    >
+                      {label}
+                    </button>
                   ))}
                 </div>
-                <input
-                  className="text-input"
-                  value={officeSearchQuery}
-                  onChange={(event) => setOfficeSearchQuery(event.target.value)}
-                  placeholder="检索职位历任线索"
-                />
-                <div className="inline-actions">
-                  <button type="button" className="primary-button" onClick={() => void handleOfficeSearch()} disabled={officeSearchLoading || !officeSearchQuery.trim()}>
-                    {officeSearchLoading ? "检索中…" : "检索职位"}
-                  </button>
-                </div>
-                {officeSearchResult && (
-                  <div className="result-list compact">
-                    {officeSearchResult.bookResults.slice(0, 4).map((item) => (
-                      <button key={item.id} type="button" className="result-card" onClick={() => { openLocation(item.chapterHref); setOpenResourcePanel(null); }}>
-                        <div className="result-title">{item.chapterTitle}</div>
-                        <div className="result-snippet">{item.snippet}</div>
+
+                {officialsTab === "institutions" && (
+                  <>
+                    <div className="muted-text">按品级与职责浏览，或检索"兵部尚书""巡抚""首辅"等职位线索。</div>
+                    <input
+                      className="text-input"
+                      value={referenceFilter}
+                      onChange={(event) => setReferenceFilter(event.target.value)}
+                      placeholder="筛选官署名称或品级"
+                    />
+                    <div className="detail-grid">
+                      {filteredInstitutions?.slice(0, 12).map((item) => (
+                        <div key={item.id} className="detail-item">
+                          <strong>{item.name}</strong>
+                          <span>{item.rank}</span>
+                          <span>{item.salaryReference}</span>
+                          <span>{item.responsibilities.slice(0, 2).join("；")}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <input
+                      className="text-input"
+                      value={officeSearchQuery}
+                      onChange={(event) => setOfficeSearchQuery(event.target.value)}
+                      placeholder="检索职位历任线索（穿透到明史/参考资料库）"
+                    />
+                    <div className="inline-actions">
+                      <button type="button" className="primary-button" onClick={() => void handleOfficeSearch()} disabled={officeSearchLoading || !officeSearchQuery.trim()}>
+                        {officeSearchLoading ? "检索中…" : "检索职位"}
                       </button>
-                    ))}
-                    {officeSearchResult.referenceResults.slice(0, 4).map((item) => (
-                      <div key={`${item.bookSlug}-${item.index}`} className="result-card static-card">
-                        <div className="result-title">{item.bookTitle} · {item.chapter}</div>
-                        <div className="result-snippet">{item.snippet}</div>
+                    </div>
+                    {officeSearchResult && (
+                      <div className="result-list compact">
+                        {officeSearchResult.bookResults.slice(0, 4).map((item) => (
+                          <button key={item.id} type="button" className="result-card" onClick={() => { openLocation(item.chapterHref); setOpenResourcePanel(null); }}>
+                            <div className="result-title">{item.chapterTitle}</div>
+                            <div className="result-snippet">{item.snippet}</div>
+                          </button>
+                        ))}
+                        {officeSearchResult.referenceResults.slice(0, 4).map((item) => (
+                          <div key={`${item.bookSlug}-${item.index}`} className="result-card static-card">
+                            <div className="result-title">{item.bookTitle} · {item.chapter}</div>
+                            <div className="result-snippet">{item.snippet}</div>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    )}
+                  </>
+                )}
+
+                {officialsTab === "offices" && (
+                  <>
+                    <div className="muted-text">明代官职全表（共 {officialsData?.offices?.length ?? 0} 职），来自《明史·职官志》整理。可按官名/品级/部门筛选。</div>
+                    <input
+                      className="text-input"
+                      value={officeRankFilter}
+                      onChange={(event) => setOfficeRankFilter(event.target.value)}
+                      placeholder="筛选 如：兵部 / 正二品 / 都察院"
+                    />
+                    <div className="office-table">
+                      {(() => {
+                        const q = officeRankFilter.trim();
+                        const filtered = (officialsData?.offices ?? [])
+                          .filter((o) => !q || `${o.name} ${o.rank} ${o.department} ${o.section}`.includes(q))
+                          .slice()
+                          .sort((a, b) => rankOrder(a.rank) - rankOrder(b.rank) || a.department.localeCompare(b.department) || a.name.localeCompare(b.name))
+                          .slice(0, 200);
+                        return filtered.map((o, i) => (
+                          <div key={`${o.name}-${o.department}-${i}`} className="office-row">
+                            <div className="office-row-name">{o.name}</div>
+                            <div className="office-row-rank">{o.rank}</div>
+                            <div className="office-row-count muted-text">{o.count}</div>
+                            <div className="office-row-dept muted-text">{o.department}</div>
+                            <div className="office-row-salary muted-text" title={o.salary}>{o.salary ? o.salary.split("，")[0] : ""}</div>
+                          </div>
+                        ));
+                      })()}
+                      {(officialsData?.offices?.length ?? 0) > 200 && officeRankFilter.trim() === "" && (
+                        <div className="muted-text" style={{ textAlign: "center", padding: "0.5rem" }}>仅显示前 200 条，请用上方筛选。</div>
+                      )}
+                    </div>
+                  </>
+                )}
+
+                {officialsTab === "chronology" && (
+                  <>
+                    <div className="muted-text">明代七卿/南京七卿/内阁辅臣 历任年表（{officialsData?.chronology?.length ?? 0} 条）。可按人名/职位/年号/公元年份筛选。</div>
+                    <input
+                      className="text-input"
+                      value={chronologyFilter}
+                      onChange={(event) => setChronologyFilter(event.target.value)}
+                      placeholder="筛选 如：张居正 / 兵部尚书 / 1572 / 嘉靖"
+                    />
+                    <div className="chronology-list">
+                      {(() => {
+                        const q = chronologyFilter.trim();
+                        const filtered = (officialsData?.chronology ?? []).filter((c) => {
+                          if (!q) return true;
+                          const haystack = `${c.era} ${c.yearLabel} ${c.gregorian} ${c.position} ${c.scope} ${c.people.join(" ")}`;
+                          return haystack.includes(q);
+                        }).slice(0, 200);
+                        return filtered.map((c, i) => (
+                          <div key={`${c.gregorian}-${c.scope}-${c.position}-${i}`} className="chronology-row">
+                            <div className="chronology-year">{c.gregorian} <span className="muted-text">{c.era?.replace(/^附：/, "")}</span></div>
+                            <div className="chronology-pos"><span className="chronology-scope">{c.scope}</span> {c.position}</div>
+                            <div className="chronology-people">{c.people.join("、")}</div>
+                          </div>
+                        ));
+                      })()}
+                      {chronologyFilter.trim() === "" && (officialsData?.chronology?.length ?? 0) > 200 && (
+                        <div className="muted-text" style={{ textAlign: "center", padding: "0.5rem" }}>仅显示前 200 条，请用上方筛选。</div>
+                      )}
+                    </div>
+                  </>
+                )}
+
+                {officialsTab === "princes" && (
+                  <>
+                    <div className="muted-text">明代藩王列表（{officialsData?.princes?.length ?? 0} 人），含字辈命名诗 {Object.keys(officialsData?.poems ?? {}).length} 套。</div>
+                    <input
+                      className="text-input"
+                      value={chronologyFilter}
+                      onChange={(event) => setChronologyFilter(event.target.value)}
+                      placeholder="筛选 如：朱棣 / 秦王 / 楚府"
+                    />
+                    <details className="prince-section">
+                      <summary>字辈命名诗（{Object.keys(officialsData?.poems ?? {}).length}）</summary>
+                      <div className="poem-grid">
+                        {Object.entries(officialsData?.poems ?? {}).map(([k, v]) => (
+                          <div key={k} className="poem-row">
+                            <strong>{k}</strong>
+                            <span>{v}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                    <div className="prince-list">
+                      {(() => {
+                        const q = chronologyFilter.trim();
+                        const grouped = new Map<string, Array<{ section: string; title: string; name: string }>>();
+                        for (const p of officialsData?.princes ?? []) {
+                          if (q && !`${p.name} ${p.title} ${p.section}`.includes(q)) continue;
+                          const key = p.section || "未分类";
+                          const arr = grouped.get(key) ?? [];
+                          arr.push(p);
+                          grouped.set(key, arr);
+                        }
+                        return [...grouped.entries()].slice(0, 30).map(([section, items]) => (
+                          <details key={section} className="prince-section" open={Boolean(q)}>
+                            <summary>{section}（{items.length}）</summary>
+                            <div className="prince-grid">
+                              {items.map((p, i) => (
+                                <span key={`${p.name}-${i}`} className="prince-chip">
+                                  {p.title && <em>{p.title}</em>}
+                                  {p.name}
+                                </span>
+                              ))}
+                            </div>
+                          </details>
+                        ));
+                      })()}
+                    </div>
+                  </>
                 )}
               </div>
             )}
@@ -2695,20 +3455,16 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v0.2（内测版）</p>
-              <p>以《明史》为底本的交互式本地阅读与 AI 研读工具。</p>
-              <p><strong>v0.2 更新内容：</strong></p>
+              <p><strong>版本：</strong>v0.3（内测版）</p>
+              <p>以《明史》为底本，整合 22 部明代史籍的交互式本地阅读 + AI 研读工具。</p>
+              <p><strong>v0.3 更新内容：</strong></p>
               <ul>
-                <li>EPUB 按章节自动拆分，修复目录跳转和章内翻页</li>
-                <li>史料交叉比对优化：AI 引导书目定位 + 查看原文弹窗</li>
-                <li>资料库扩充至 23 部、约 43.6 万段（完整导入国榷、罪惟录、明实录14部、明通鉴、大明律、皇明经世文编等）</li>
-                <li>古今地名地图：AI 推断古地名坐标 + 中研院历史地名查询</li>
-                <li>皇帝世系图（可交互，含19帝 + 唐王/淮王支系）</li>
-                <li>笔记折叠与编辑、书签命名、导出功能</li>
-                <li>AI 操作前可附加补充说明</li>
-                <li>模型选择支持自定义模型名称，兼容多平台 API</li>
-                <li>繁简体切换（默认繁体）、竖排模式（实验性）</li>
-                <li>Safari 选段兼容修复、朗读暂停/停止控件</li>
+                <li>多书阅读：左上角下拉切换 22 部史籍，含明史、国榷、明通鉴、罪惟录、明实录、明史纪事本末、大明会典等</li>
+                <li>带 EPUB 的书走原典渲染（明史/国榷/明通鉴/崇祯长编/罪惟录/三朝辽事实录/大明律），其余书走数据库章节阅读</li>
+                <li>史料交叉比对自动排除当前阅读的本书（避免与正在读的书自比）</li>
+                <li>章节名清洗：去除「(四部叢刊本)/」一类 wikisource 前缀</li>
+                <li>字体/字号/字色/主题预设可在设置面板中切换</li>
+                <li>新增「圈点」批注（古文圈点法）与现有三色高亮并存</li>
               </ul>
               <p><strong>数据来源声明：</strong></p>
               <ul>

@@ -34,7 +34,16 @@ function stripHtml(html) {
   root.querySelectorAll("style, script, noscript").forEach(el => el.remove());
   const title = root.querySelector("h1, h2, h3, h4")?.textContent?.trim() || "";
   const body = root.querySelector("body") || root;
-  return { title, text: normalizeText(body.textContent || "") };
+  // Walk block-level elements so each paragraph keeps its boundary; falling back
+  // to body textContent for layouts that don't use <p>/<div> structure.
+  const blocks = body.querySelectorAll("p, div, h1, h2, h3, h4, h5, h6, li, dt, dd, blockquote, pre");
+  const parts = [];
+  for (const node of blocks) {
+    const text = normalizeText(node.textContent || "");
+    if (text) parts.push(text);
+  }
+  const joined = parts.length ? parts.join("\n") : normalizeText(body.textContent || "");
+  return { title, text: joined };
 }
 
 function normalizeHref(baseDir, href) {
