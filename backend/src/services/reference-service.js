@@ -737,6 +737,10 @@ function scoreReferenceContext(item, tokens = []) {
 
 function buildReferenceSearchPlan(data = {}) {
   return {
+    // Default true for backwards compat: if the AI didn't return the field
+    // (older planner runs / fallback path), assume the question wants library
+    // lookup. The new prompt explicitly sets false for chitchat / off-topic.
+    needsLibraryLookup: data.needsLibraryLookup !== false,
     selectionRelevant: data.selectionRelevant !== false,
     needWebSearch: Boolean(data.needWebSearch),
     people: unique(data.people || []).slice(0, 5),
@@ -748,6 +752,41 @@ function buildReferenceSearchPlan(data = {}) {
     webQuery: String(data.webQuery || "").trim(),
     note: String(data.note || "").trim()
   };
+}
+
+// Drop reference contexts that the AI judges irrelevant to the question.
+// One small-model call returning a JSON array of "kept" indices. Cheaper than
+// asking the main QA model to filter inline (which is unreliable to parse).
+async function filterRelevantReferences({ question, selection, references, aiSettings }) {
+  if (!references.length || !aiReady(aiSettings)) return references;
+  // For tiny questions and tiny reference sets, skip the filter — overhead
+  // would be larger than the benefit.
+  if (references.length <= 1) return references;
+  const promptList = references
+    .map((item, i) => `[${i + 1}] 《${item.bookTitle}》${item.chapter}：${String(item.content || "").slice(0, 120)}`)
+    .join("\n");
+  try {
+    const { data } = await runStructuredJsonPrompt({
+      prompt: {
+        system: "你是史料相关性评审助手。判断哪些片段与用户问题直接相关，剔除无关片段。只输出 JSON。",
+        userTemplate: `用户问题：{{question}}\n用户选段：{{selection}}\n\n候选片段（编号从 1 开始）：\n{{context}}\n\n输出 JSON：{"keep": [...编号]}\n\n判定标准：\n- 片段必须与问题中的人物 / 事件 / 制度 / 地名 / 时代有具体内容呼应才算相关\n- 仅含相同朝代 / 模糊背景信息不算相关\n- 宁可少留也不要把不相关的留下；如果都不相关，输出 {"keep": []}\n- 不要输出 markdown`
+      },
+      variables: { question, selection, context: promptList },
+      aiSettings,
+      temperature: 0,
+      maxTokens: 200,
+      modelStrategy: "small",
+    });
+    const keep = Array.isArray(data?.keep)
+      ? data.keep.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 1 && n <= references.length)
+      : [];
+    if (!keep.length) return [];
+    const set = new Set(keep);
+    return references.filter((_, i) => set.has(i + 1));
+  } catch {
+    // On any error, be conservative: keep all (current behavior).
+    return references;
+  }
 }
 
 async function buildQuestionPlan({ selection, question, bookContext, aiSettings }) {
@@ -1472,7 +1511,41 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
     bookContext,
     aiSettings
   });
-  const referenceContexts = await collectReferenceContexts(plan, 10, aiSettings);
+
+  // Short-circuit when the planner says the question doesn't need a library
+  // lookup at all (e.g. greetings, chitchat, programming questions, modern
+  // current events). Fall through to a slim direct-answer prompt with no
+  // reference context attached, and return empty contextSnippets so the UI
+  // doesn't show "已检索 X 条" cards that were never used.
+  if (!plan.needsLibraryLookup && aiReady(aiSettings)) {
+    try {
+      const result = await runPromptTemplate({
+        prompt: {
+          system: "你是 AI 助手。用户的问题与明代史无关，直接简明回答即可，不要硬扯到史料。",
+          userTemplate: `用户问题：{{question}}\n${cleanSelection ? "（用户在阅读《明史》，但问题与选段无直接关联）\n选段：{{selection}}\n" : ""}\n直接回答（200 字以内）。`
+        },
+        variables: { question: cleanQuestion, selection: cleanSelection },
+        aiSettings,
+        temperature: 0.3,
+        maxTokens: 600,
+        modelStrategy: "large",
+      });
+      return { answer: result.text, model: result.model, contextSnippets: [] };
+    } catch {
+      // fall through to the full chain on any error
+    }
+  }
+
+  const rawReferences = await collectReferenceContexts(plan, 10, aiSettings);
+  // Filter out references that turn out to be off-topic. The QA prompt is
+  // told to "宁可不引用" but in practice models still pull in tangential
+  // materials; an explicit relevance gate keeps the chain honest.
+  const referenceContexts = await filterRelevantReferences({
+    question: cleanQuestion,
+    selection: cleanSelection,
+    references: rawReferences,
+    aiSettings,
+  });
   const shouldSearchWeb = (!cleanSelection || !plan.selectionRelevant || plan.needWebSearch) && Boolean(plan.webQuery || cleanQuestion);
   const webResults = shouldSearchWeb ? await searchWeb(plan.webQuery || cleanQuestion || cleanSelection, 4) : [];
 
@@ -1532,10 +1605,14 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
       modelStrategy: "large"
     });
 
+    // Display contextSnippets only when the selection-anchored bookContext
+    // is actually relevant to the question. Otherwise the UI would show
+    // "依据" cards that have nothing to do with the user's query.
+    const displaySnippets = plan.selectionRelevant ? bookContext : [];
     return {
       answer: result.text,
       model: result.model,
-      contextSnippets: bookContext
+      contextSnippets: displaySnippets
     };
   } catch {
     const fallback = [];

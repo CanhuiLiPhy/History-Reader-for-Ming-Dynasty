@@ -1,18 +1,18 @@
 :root {
-  color: #261912;
-  background:
-    radial-gradient(circle at top left, rgba(255, 239, 202, 0.85), transparent 32%),
-    radial-gradient(circle at top right, rgba(204, 162, 104, 0.14), transparent 28%),
-    linear-gradient(180deg, #f6efe1, #e9d9bc 55%, #efe4ce);
-  font-family: "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif;
+  /* Theme-aware: page background and base text color come from CSS vars
+     defined in App.css, overridden per [data-reader-theme="..."]. */
+  color: var(--ui-text-strong, #261912);
+  background: var(--ui-page-bg);
+  font-family: var(--reader-font-family, "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif);
   line-height: 1.5;
   font-weight: 400;
-  color-scheme: light;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+:root[data-reader-theme="dark"] { color-scheme: dark; }
+:root:not([data-reader-theme="dark"]) { color-scheme: light; }
 
 * {
   box-sizing: border-box;

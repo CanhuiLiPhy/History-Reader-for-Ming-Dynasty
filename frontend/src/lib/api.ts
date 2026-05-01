@@ -116,6 +116,8 @@ export async function fetchPersonChronology(person: string): Promise<ChronologyR
 }
 
 export async function fetchAiChronology(person: string, aiSettings: AiSettings): Promise<ChronologyResponse> {
+  // Server-side flow: FTS search 32 snippets → format context → single AI call
+  // (often 30–60 s on slow models). 35 s default is too tight; match runAiAction.
   const response = await fetchWithTimeout("/api/ai/person-chronology", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -123,7 +125,7 @@ export async function fetchAiChronology(person: string, aiSettings: AiSettings):
       person,
       aiSettings,
     }),
-  });
+  }, 180000);
   return parseJsonResponse<ChronologyResponse>(response);
 }
 
@@ -204,10 +206,19 @@ export async function fetchGeography(): Promise<GeographyPayload> {
   return parseJsonResponse<GeographyPayload>(response);
 }
 
-export async function geocodePlaces(query: string): Promise<GeocodeResponse> {
+export async function geocodePlaces(query: string, aiSettings?: AiSettings): Promise<GeocodeResponse> {
+  // Geocoding falls back to AI when local DB doesn't match — pass user-entered
+  // API key + base URL so packaged apps without a server-side .env still work.
   const url = new URL("/api/reference/geocode", window.location.origin);
   url.searchParams.set("q", query);
-  const response = await fetchWithTimeout(url);
+  if (aiSettings) {
+    if (aiSettings.baseURL) url.searchParams.set("baseURL", aiSettings.baseURL);
+    if (aiSettings.apiKey) url.searchParams.set("apiKey", aiSettings.apiKey);
+    if (aiSettings.smallModel) url.searchParams.set("smallModel", aiSettings.smallModel);
+    if (aiSettings.model) url.searchParams.set("model", aiSettings.model);
+  }
+  // 60s timeout: AI lookup can be slow for unfamiliar place names.
+  const response = await fetchWithTimeout(url, undefined, 60000);
   return parseJsonResponse<GeocodeResponse>(response);
 }
 

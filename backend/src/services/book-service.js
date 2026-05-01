@@ -6,11 +6,10 @@ import unzipper from "unzipper";
 import Fuse from "fuse.js";
 import { XMLParser } from "fast-xml-parser";
 import { parse } from "node-html-parser";
-import { BACKEND_ROOT, BOOK_PATH, CACHE_ROOT } from "../config/defaults.js";
+import { BOOK_PATH, BOOKS_DIR, CACHE_ROOT } from "../config/defaults.js";
 import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
 
-const BOOKS_DIR = path.join(BACKEND_ROOT, "books");
 export const DEFAULT_BOOK_SLUG = "ming-shi";
 
 export function resolveBookEpubPath(slug) {

@@ -6,38 +6,33 @@ const execFileAsync = promisify(execFile);
 const DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/";
 
 async function fetchHtml(url, body = "") {
+  // Try Node fetch first (5s timeout — be quick to fail; web search is a
+  // best-effort augmentation, not load-bearing).
   try {
     const response = await fetch(url, {
       method: body ? "POST" : "GET",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "MingshiReaderAI/1.0 (+https://localhost)"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
       },
       body: body || undefined,
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(5000)
     });
-
-    if (!response.ok) {
-      throw new Error(`网页检索失败：${response.status}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.text();
+  } catch (fetchError) {
+    // Fallback to curl if available; ignore curl-not-found etc.
+    try {
+      const curlArgs = ["-sL", "--max-time", "5", "-A", "Mozilla/5.0"];
+      if (body) curlArgs.push("-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "--data", body);
+      curlArgs.push(url);
+      const result = await execFileAsync("curl", curlArgs, { maxBuffer: 8 * 1024 * 1024 });
+      if (!result.stdout.trim()) throw fetchError;
+      return result.stdout;
+    } catch {
+      // give up — caller treats web results as optional
+      throw fetchError;
     }
-
-    return response.text();
-  } catch (error) {
-    const curlArgs = ["-L", "--max-time", "15", "-A", "MingshiReaderAI/1.0 (+https://localhost)"];
-    if (body) {
-      curlArgs.push("-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "--data", body);
-    }
-    curlArgs.push(url);
-
-    const result = await execFileAsync("curl", curlArgs, {
-      maxBuffer: 8 * 1024 * 1024
-    });
-
-    if (!result.stdout.trim()) {
-      throw error;
-    }
-
-    return result.stdout;
   }
 }
 
@@ -77,6 +72,12 @@ export async function searchWeb(query, limit = 4) {
   if (!cleanQuery) return [];
 
   const payload = `q=${encodeURIComponent(cleanQuery)}&kl=cn-zh&kp=-2`;
-  const html = await fetchHtml(DDG_HTML_ENDPOINT, payload);
-  return parseDuckDuckGoResults(html, limit);
+  // Best-effort: never throw. QA chain treats empty results as "no web hits".
+  try {
+    const html = await fetchHtml(DDG_HTML_ENDPOINT, payload);
+    return parseDuckDuckGoResults(html, limit);
+  } catch (err) {
+    console.warn("[web-search] failed (network/DDG block?):", err?.message || err);
+    return [];
+  }
 }

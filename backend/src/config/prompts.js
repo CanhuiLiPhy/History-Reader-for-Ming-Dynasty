@@ -150,6 +150,7 @@ export const ACTION_PROMPTS = {
 
 输出 JSON：
 {
+  "needsLibraryLookup": true,
   "selectionRelevant": true,
   "needWebSearch": true,
   "people": ["从上下文和问题中提取的人名，优先级最高"],
@@ -166,8 +167,9 @@ export const ACTION_PROMPTS = {
 1. 必须先从【选段附近上下文】归纳出现的具体人名，再结合问题补充。
 2. people 数组优先，timeHints 只在人物/事件信息不足时才补充。
 3. 如果问题与选段关系弱（如问题是通用历史知识），selectionRelevant 设为 false，needWebSearch 设为 true。
-4. 每个数组最多 5 项，people 最多 3 项（取最核心的）。
-5. 不要输出 markdown。
+4. **needsLibraryLookup 判断（关键）**：仅当问题真的关于明代具体人物 / 事件 / 制度 / 地名 / 年号时设为 true。如果是寒暄、闲聊、与明代无关的常识 / 编程 / 数学 / 现代时事等，设为 false 且各检索字段全留空数组。
+5. 每个数组最多 5 项，people 最多 3 项（取最核心的）。
+6. 不要输出 markdown。
 `
   },
   extractKeywords: {

@@ -10,6 +10,14 @@ const __dirname = path.dirname(__filename);
 const backendRoot = path.resolve(__dirname, "../..");
 const projectRoot = path.resolve(backendRoot, "..");
 
+// In packaged Electron builds the backend code lives inside the read-only
+// app.asar, but writable data (library.sqlite, books/, mingshi.epub) ships in
+// extraResources. MINGSHI_DATA_ROOT lets the host point at that writable dir;
+// when unset we keep the dev-mode layout under backend/.
+const dataRoot = process.env.MINGSHI_DATA_ROOT
+  ? path.resolve(process.env.MINGSHI_DATA_ROOT)
+  : backendRoot;
+
 const modelOptions = (process.env.AI_MODEL_OPTIONS || "deepseek-v4-pro,kimi-k2.6,qwen3.6-max-preview,MiniMax-M2.5,qwen3.5-plus-2026-04-20")
   .split(",")
   .map((item) => item.trim())
@@ -22,11 +30,15 @@ const smallModelOptions = (process.env.AI_SMALL_MODEL_OPTIONS || "deepseek-v4-fl
 
 export const PROJECT_ROOT = projectRoot;
 export const BACKEND_ROOT = backendRoot;
-export const CACHE_ROOT = path.join(backendRoot, ".cache");
-export const FRONTEND_DIST = path.join(projectRoot, "frontend", "dist");
+export const DATA_ROOT = dataRoot;
+export const CACHE_ROOT = path.join(dataRoot, ".cache");
+export const BOOKS_DIR = path.join(dataRoot, "books");
+export const FRONTEND_DIST = process.env.MINGSHI_FRONTEND_DIST
+  ? path.resolve(process.env.MINGSHI_FRONTEND_DIST)
+  : path.join(projectRoot, "frontend", "dist");
 export const BOOK_PATH = process.env.BOOK_PATH
-  ? (path.isAbsolute(process.env.BOOK_PATH) ? process.env.BOOK_PATH : path.join(backendRoot, process.env.BOOK_PATH.replace(/^\.\//, "")))
-  : path.join(backendRoot, "mingshi.epub");
+  ? (path.isAbsolute(process.env.BOOK_PATH) ? process.env.BOOK_PATH : path.join(dataRoot, process.env.BOOK_PATH.replace(/^\.\//, "")))
+  : path.join(dataRoot, "mingshi.epub");
 export const PORT = Number.parseInt(process.env.PORT || "3100", 10);
 
 export const DEFAULT_AI_SETTINGS = {

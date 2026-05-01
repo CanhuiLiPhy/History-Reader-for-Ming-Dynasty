@@ -1,3 +1,45 @@
+/* Theme tokens. Default (米白) is set on :root (see also index.css for the
+   page background); other themes override via [data-reader-theme="..."].
+   Surfaces (sidebar / reader card / assistant / modal / toolbar) read these
+   so the whole UI flips together with the reader theme. */
+:root {
+  --ui-panel-bg: linear-gradient(180deg, rgba(255, 252, 246, 0.95), rgba(245, 235, 216, 0.95)),
+                 linear-gradient(135deg, rgba(146, 92, 41, 0.06), transparent 40%);
+  --ui-panel-border: rgba(109, 71, 29, 0.14);
+  --ui-panel-shadow: 0 20px 50px rgba(79, 48, 18, 0.08);
+  --ui-text-strong: #261912;
+  --ui-text: #4a3829;
+  --ui-text-muted: #6e5940;
+  --ui-page-bg: radial-gradient(circle at top left, rgba(255, 239, 202, 0.85), transparent 32%),
+                radial-gradient(circle at top right, rgba(204, 162, 104, 0.14), transparent 28%),
+                linear-gradient(180deg, #f6efe1, #e9d9bc 55%, #efe4ce);
+}
+:root[data-reader-theme="sepia"] {
+  --ui-panel-bg: linear-gradient(180deg, rgba(245, 232, 205, 0.96), rgba(235, 218, 180, 0.96));
+  --ui-panel-border: rgba(155, 105, 50, 0.18);
+  --ui-text-strong: #3a2810;
+  --ui-text: #5a432a;
+  --ui-text-muted: #876442;
+  --ui-page-bg: linear-gradient(180deg, #efe2c7, #e2cfa8);
+}
+:root[data-reader-theme="dark"] {
+  --ui-panel-bg: linear-gradient(180deg, rgba(38, 33, 26, 0.95), rgba(28, 24, 20, 0.95));
+  --ui-panel-border: rgba(220, 200, 154, 0.18);
+  --ui-panel-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  --ui-text-strong: #f0dfa9;
+  --ui-text: #dcc89a;
+  --ui-text-muted: #9a8466;
+  --ui-page-bg: linear-gradient(180deg, #1a1814, #14110d);
+}
+:root[data-reader-theme="green"] {
+  --ui-panel-bg: linear-gradient(180deg, rgba(228, 236, 218, 0.96), rgba(210, 224, 196, 0.96));
+  --ui-panel-border: rgba(54, 86, 32, 0.2);
+  --ui-text-strong: #23371b;
+  --ui-text: #36502a;
+  --ui-text-muted: #5a6f4d;
+  --ui-page-bg: linear-gradient(180deg, #dde9d4, #c5d6b6);
+}
+
 .app-shell {
   height: 100vh;
   max-height: 100vh;
@@ -7,6 +49,8 @@
   padding: 1rem;
   overflow: hidden;
   transition: grid-template-columns 0.15s ease;
+  background: var(--ui-page-bg);
+  color: var(--ui-text-strong);
 }
 
 .app-shell.sidebar-collapsed {
@@ -111,12 +155,11 @@
 .reader-toolbar,
 .reader-footer,
 .modal-card {
-  background:
-    linear-gradient(180deg, rgba(255, 252, 246, 0.95), rgba(245, 235, 216, 0.95)),
-    linear-gradient(135deg, rgba(146, 92, 41, 0.06), transparent 40%);
-  border: 1px solid rgba(109, 71, 29, 0.14);
-  box-shadow: 0 20px 50px rgba(79, 48, 18, 0.08);
+  background: var(--ui-panel-bg);
+  border: 1px solid var(--ui-panel-border);
+  box-shadow: var(--ui-panel-shadow);
   border-radius: 1.5rem;
+  color: var(--ui-text);
 }
 
 .sidebar,
@@ -316,13 +359,17 @@
   position: absolute;
   inset: 0;
   padding: 2rem 0;
-  overflow-x: auto;
+  /* hidden (not auto): blocks 2-finger / wheel horizontal swipe from
+     turning pages. JS still flips via element.scrollLeft = N. */
+  overflow-x: hidden;
   overflow-y: hidden;
   scroll-behavior: smooth;
   user-select: text;
   background: var(--reader-bg, #fcf8ee);
   color: var(--reader-color, #1f160f);
   border-radius: inherit;
+  /* Suppress overscroll/elastic bounce so wheel can't queue scrollLeft jumps. */
+  overscroll-behavior-x: contain;
 }
 
 .db-reader-host::-webkit-scrollbar {
@@ -363,21 +410,84 @@
      leave huge gaps); short ones still naturally stay together. */
 }
 
-/* Theme presets — also tint the EPUB reader card background so the area
-   around the iframe matches the in-iframe theme */
-:root[data-reader-theme="dark"] .reader-card,
-:root[data-reader-theme="dark"] .reader-host {
-  background: #1a1814;
-}
+/* Reader card now uses --ui-panel-bg (theme-aware); reader-host uses
+   --reader-bg (matches iframe content). No theme-specific overrides
+   needed here anymore — see top-of-file :root[data-reader-theme] tokens. */
 
-:root[data-reader-theme="sepia"] .reader-card,
-:root[data-reader-theme="sepia"] .reader-host {
-  background: #f1e4c8;
-}
-
-:root[data-reader-theme="green"] .reader-card,
-:root[data-reader-theme="green"] .reader-host {
-  background: #dde9d4;
+/* Dark theme: lift the hardcoded warm-brown text colors used throughout
+   the UI to readable warm-tan tones. We touch only the high-traffic UI
+   classes; primary buttons keep their own gradient + bright foreground. */
+:root[data-reader-theme="dark"] {
+  /* Headings, brand text, panel headlines */
+  & .brand-card h1,
+  & .brand-card p,
+  & .panel-headline,
+  & .modal-title,
+  & .field-label,
+  & .ghost-button,
+  & .secondary-button,
+  & .text-input,
+  & .select-input,
+  & textarea.text-input,
+  & .muted-text,
+  & .answer-card,
+  & .result-title,
+  & .result-snippet,
+  & .source-row,
+  & .office-row-name,
+  & .office-row-rank,
+  & .stack-gap,
+  & .detail-grid,
+  & .detail-item,
+  & .modal-card,
+  & .sidebar-panel,
+  & .assistant-panel,
+  & .reader-toolbar,
+  & .reader-footer {
+    color: var(--ui-text);
+  }
+  & .brand-card h1,
+  & .panel-headline span,
+  & .modal-title,
+  & .answer-card strong,
+  & .result-title,
+  & .field-label > strong,
+  & .detail-item strong {
+    color: var(--ui-text-strong);
+  }
+  & .muted-text,
+  & .result-snippet,
+  & .field-label small {
+    color: var(--ui-text-muted);
+  }
+  /* Subtle interactive surfaces (chips, inputs, hover backgrounds) */
+  & .text-input,
+  & .select-input,
+  & textarea.text-input,
+  & .ghost-button,
+  & .compact-button {
+    background: rgba(220, 200, 154, 0.08);
+    border-color: rgba(220, 200, 154, 0.2);
+  }
+  & .ghost-button:hover,
+  & .compact-button:hover {
+    background: rgba(220, 200, 154, 0.16);
+  }
+  & .secondary-button {
+    background: rgba(220, 200, 154, 0.12);
+    color: var(--ui-text-strong);
+    border-color: rgba(220, 200, 154, 0.22);
+  }
+  & .secondary-button:hover {
+    background: rgba(220, 200, 154, 0.22);
+  }
+  & .answer-card {
+    background: rgba(220, 200, 154, 0.06);
+    border-color: rgba(220, 200, 154, 0.14);
+  }
+  & .modal-backdrop {
+    background: rgba(0, 0, 0, 0.6);
+  }
 }
 
 .circle-icon {
@@ -953,6 +1063,19 @@ g.reader-circle line {
   justify-content: space-between;
   gap: 1rem;
   padding: 0.9rem 1.1rem;
+  transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.15s ease;
+  overflow: hidden;
+}
+
+/* Footer follows the left sidebar's open/collapsed state — when sidebar is
+   tucked away, the bottom progress bar collapses too, giving the reader a
+   clean full-bleed view. Hide via max-height/padding so layout reflows. */
+.app-shell.sidebar-collapsed .reader-footer {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .current-label {
@@ -977,6 +1100,8 @@ g.reader-circle line {
   z-index: 5;
   opacity: 0;
   transition: opacity 0.15s;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .page-turn-zone:hover {
@@ -996,9 +1121,9 @@ g.reader-circle line {
   height: 100%;
   min-height: 0;
   border-radius: 1rem;
-  background:
-    radial-gradient(circle at top, rgba(255, 252, 246, 0.7), rgba(244, 232, 208, 0.94)),
-    linear-gradient(180deg, #fef9f0, #f2e3c4);
+  /* Reader card content area uses the same iframe bg as the EPUB inside, so
+     the bezel matches text background regardless of theme. */
+  background: var(--reader-bg, #fcf8ee);
   overflow: hidden;
 }
 

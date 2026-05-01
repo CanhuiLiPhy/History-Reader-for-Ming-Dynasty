@@ -52,7 +52,8 @@ import {
 } from "./lib/api";
 import { renderMarkdown } from "./lib/markdown";
 import { readPersistedState, writePersistedState } from "./lib/storage";
-import { annotateYearMentions, injectReaderDocumentStyles } from "./lib/yearAnnotator";
+import { annotateYearMentions, injectReaderDocumentStyles, refreshAnnotationDates } from "./lib/yearAnnotator";
+import { resolveSelectionDate, type ResolvedSelectionDate } from "./lib/reign";
 import type {
   AiActionResponse,
   AiSettings,
@@ -87,14 +88,18 @@ const defaultAiSettings: AiSettings = {
   apiKey: "",
   defaultModel: "deepseek-v4-pro",
   model: "deepseek-v4-pro",
-  modelOptions: ["deepseek-v4-pro"],
+  // Match backend/src/config/defaults.js — keep the full DashScope list so
+  // a fresh install (no persisted state, no /api/settings/defaults reachable)
+  // still shows a useful set of models.
+  modelOptions: ["deepseek-v4-pro", "kimi-k2.6", "qwen3.6-max-preview", "MiniMax-M2.5", "qwen3.5-plus-2026-04-20"],
   smallModel: "deepseek-v4-flash",
   smallModelOptions: ["deepseek-v4-flash", "qwen3.6-flash", "qwen3.6-27b"],
   ttsBaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  ttsModel: "gpt-4o-mini-tts",
-  ttsVoice: "alloy",
+  ttsModel: "qwen3-tts-flash",
+  ttsVoice: "Cherry",
   systemPrompt: "",
   customActions: [],
+  modelProviders: [],
 };
 
 const highlightPalette = [
@@ -177,6 +182,7 @@ type EpubRenditionLike = {
     font?: (family: string) => void;
     override?: (key: string, value: string, priority?: boolean) => void;
   };
+  getContents?: () => EpubContentsLike[];
   annotations: {
     add: (type: string, cfiRange: string, data?: object, callback?: unknown, className?: string, styles?: object) => void;
     remove: (cfiRange: string, type: string) => void;
@@ -328,6 +334,7 @@ function mergeAiSettings(defaults: DefaultsPayload | null, persisted: AiSettings
     smallModel: persisted?.smallModel || base.smallModel || "deepseek-v4-flash",
     smallModelOptions: persisted?.smallModelOptions?.length ? persisted.smallModelOptions : base.smallModelOptions,
     customActions: customActions.length ? customActions : persisted?.customActions?.length ? persisted.customActions : base.customActions,
+    modelProviders: persisted?.modelProviders ?? base.modelProviders ?? [],
   };
 }
 
@@ -342,6 +349,10 @@ function App() {
   const bookRef = useRef<EpubBookLike | null>(null);
   const renditionRef = useRef<EpubRenditionLike | null>(null);
   const selectionContentsRef = useRef<EpubContentsLike | null>(null);
+  // Cached CSS string for the current reader theme, written by the theme
+  // useEffect and read by the contents.register hook so newly-rendered
+  // sections immediately get the right colors (instead of flashing default).
+  const themeCssRef = useRef<string>("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const noteInputRef = useRef<HTMLTextAreaElement | null>(null);
   const audioUrlRef = useRef("");
@@ -454,17 +465,29 @@ function App() {
   const [chronologyFilter, setChronologyFilter] = useState("");
   const [openResourcePanel, setOpenResourcePanel] = useState<string | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Default collapsed — main reading area gets full width on launch.
+  // The footer (page slider + status) follows this same flag.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
   const [selectedTreeEmperor, setSelectedTreeEmperor] = useState<FamilyTreeNode | null>(null);
   const [readerLayout, setReaderLayout] = useState<"horizontal" | "vertical">("horizontal");
   const [scriptVariant, setScriptVariant] = useState<"simplified" | "traditional">("traditional");
+  // Independent UI 简繁 toggle. The 正文字体转换 above only affects body
+  // content (EPUB iframe / DB-reader paragraphs); this one drives all the
+  // chrome (sidebar / settings / modals / buttons). Default: 繁体 — matches
+  // the body content default (also 繁体) so the whole app reads consistently.
+  const [uiScriptVariant, setUiScriptVariant] = useState<"simplified" | "traditional">("traditional");
   const [pageSpread, setPageSpread] = useState<"single" | "double">("single");
   // v0.3 reading theme + font controls
   const [readerTheme, setReaderTheme] = useState<"default" | "sepia" | "dark" | "green">("default");
   const [readerFontFamily, setReaderFontFamily] = useState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">("fangsong");
   const [readerFontSize, setReaderFontSize] = useState<number>(20);
   const [readerFontColor, setReaderFontColor] = useState<string>("");
+  const [dateDisplay, setDateDisplay] = useState<"gregorian" | "lunar" | "both">("lunar");
+  const dateDisplayRef = useRef<"gregorian" | "lunar" | "both">("lunar");
+  const [showEmperor, setShowEmperor] = useState<boolean>(false);
+  const showEmperorRef = useRef<boolean>(false);
+  const [dateResult, setDateResult] = useState<ResolvedSelectionDate | { error: string } | null>(null);
   const [mapQuery, setMapQuery] = useState("");
   const [mapLoading, setMapLoading] = useState(false);
   const [mapResult, setMapResult] = useState<GeocodeResponse | null>(null);
@@ -496,6 +519,9 @@ function App() {
           savedReaderFontFamily,
           savedReaderFontSize,
           savedReaderFontColor,
+          savedDateDisplay,
+          savedShowEmperor,
+          savedUiScriptVariant,
         ] =
           await Promise.all([
             fetchDefaults(),
@@ -515,6 +541,9 @@ function App() {
             readPersistedState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">(storageKey("reader-font-family"), "fangsong"),
             readPersistedState<number>(storageKey("reader-font-size"), 20),
             readPersistedState<string>(storageKey("reader-font-color"), ""),
+            readPersistedState<"gregorian" | "lunar" | "both">(storageKey("date-display"), "lunar"),
+            readPersistedState<boolean>(storageKey("show-emperor"), false),
+            readPersistedState<"simplified" | "traditional">(storageKey("ui-script-variant"), "traditional"),
           ]);
 
         if (cancelled) return;
@@ -563,7 +592,12 @@ function App() {
         setDbReaderIndex(0);
         setCustomActions(nextCustomActions);
         setAiSettings(mergeAiSettings(defaultsData, savedAiSettings, nextCustomActions));
-        setHighlights(savedHighlights);
+        // Drop legacy unanchored db-cfis (just `db:slug:idx` — 3 parts) that
+        // were saved before paragraph-anchored cfis (5 parts) existed. Those
+        // can't be rendered and would pollute the highlight effect.
+        setHighlights(
+          savedHighlights.filter((h) => !h.cfiRange.startsWith("db:") || h.cfiRange.split(":").length >= 5)
+        );
         setNotes(savedNotes);
         setBookmarks(savedBookmarks);
         setAutoAnnotate(savedAutoAnnotate);
@@ -575,6 +609,11 @@ function App() {
         setReaderFontFamily(savedReaderFontFamily);
         setReaderFontSize(savedReaderFontSize);
         setReaderFontColor(savedReaderFontColor);
+        setDateDisplay(savedDateDisplay);
+        dateDisplayRef.current = savedDateDisplay;
+        setShowEmperor(savedShowEmperor);
+        showEmperorRef.current = savedShowEmperor;
+        setUiScriptVariant(savedUiScriptVariant);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -668,9 +707,30 @@ function App() {
     root.style.setProperty("--reader-font-size", sizePx);
     root.dataset.readerTheme = readerTheme;
 
+    // Build the theme override CSS injected into each EPUB iframe. EPUBs ship
+    // stylesheets that target specific elements (e.g. `p { color: #000; }`)
+    // which beat `body { color !important }` from epub.js themes. The wide
+    // `body *` selector with !important is what actually flips dark mode.
+    // We only override color + background + font — never layout/positioning,
+    // since the EPUB's own CSS handles those.
+    const themeCss = `
+      html, body {
+        color: ${color} !important;
+        background-color: ${preset.bg} !important;
+        font-family: ${family} !important;
+        font-size: ${sizePx} !important;
+      }
+      body, body p, body div, body span, body h1, body h2, body h3, body h4,
+      body h5, body h6, body li, body td, body th, body blockquote, body em,
+      body strong, body a, body font, body section, body article {
+        color: ${color} !important;
+        background-color: transparent !important;
+      }
+      body a { text-decoration: none; }
+    `;
+    themeCssRef.current = themeCss;
+
     // Apply to live epub.js rendition if present.
-    // !important is required because EPUBs ship their own stylesheets that
-    // would otherwise win the cascade over rendition.themes.
     const rendition = renditionRef.current;
     if (rendition?.themes) {
       try {
@@ -690,6 +750,25 @@ function App() {
         rendition.themes.font?.(family);
       } catch {
         // some epub.js APIs unavailable; CSS-vars fallback covers the host
+      }
+
+      // Push theme CSS into already-rendered iframes (theme change while
+      // reading should take effect immediately, not just on next page).
+      try {
+        const allContents = rendition.getContents?.() || [];
+        for (const contents of allContents) {
+          const doc = contents.document;
+          let style = doc.getElementById("mingshi-injected-theme") as HTMLStyleElement | null;
+          if (!style) {
+            style = doc.createElement("style");
+            style.id = "mingshi-injected-theme";
+            doc.head.appendChild(style);
+          }
+          style.textContent = themeCss;
+        }
+      } catch {
+        // contents not yet available; the contents.register hook will inject
+        // themeCssRef.current when each section first renders
       }
     }
   }, [readerTheme, readerFontFamily, readerFontSize, readerFontColor, readerReady]);
@@ -713,6 +792,117 @@ function App() {
     if (!hasLoadedLocalState) return;
     void writePersistedState(storageKey("reader-font-color"), readerFontColor);
   }, [readerFontColor, hasLoadedLocalState]);
+
+  // dateDisplay / showEmperor change: refresh notes on already-rendered
+  // iframes (ingredient data attrs are stamped during initial annotation
+  // run, so refresh is O(annotated spans), no DOM walk needed).
+  useEffect(() => {
+    dateDisplayRef.current = dateDisplay;
+    showEmperorRef.current = showEmperor;
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("date-display"), dateDisplay);
+    void writePersistedState(storageKey("show-emperor"), showEmperor);
+    const rendition = renditionRef.current;
+    try {
+      const allContents = rendition?.getContents?.() || [];
+      for (const contents of allContents) {
+        refreshAnnotationDates(contents.document, dateDisplay, showEmperor);
+      }
+    } catch {
+      // contents not yet available; next annotateYearMentions call will
+      // pick up the new mode via dateDisplayRef
+    }
+  }, [dateDisplay, showEmperor, hasLoadedLocalState]);
+
+  // UI 简繁转换: walk the React-rendered chrome (sidebar / settings / modals
+  // / buttons / labels), convert any text node to the requested variant,
+  // and re-apply on every DOM mutation so React re-renders don't undo us.
+  // Skips: <input>/<textarea> values (carry user data we mustn't munge), the
+  // EPUB iframe and the DB-reader host (have their own conversion paths),
+  // and the year-annotation tooltips (data-note attribute already cooked).
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("ui-script-variant"), uiScriptVariant);
+
+    if (uiScriptVariant !== "traditional") {
+      // Reverting to simplified: easiest is just a soft reload — undoing
+      // every prior conversion in-place is fragile. The toggle is rare, so
+      // a reload is acceptable.
+      // Skip reload on first apply (when state matches initial render).
+      // Caller toggling will reload manually via the existing 「保存设置并刷新」 button.
+      return;
+    }
+
+    const root = document.querySelector(".app-shell");
+    if (!root) return;
+
+    const SKIP_TAGS = new Set(["INPUT", "TEXTAREA", "IFRAME", "SCRIPT", "STYLE"]);
+    const SKIP_SELECTOR = ".db-reader-host, .reader-host, [data-no-convert]";
+    const isSkipped = (el: Element | null): boolean => {
+      let cur = el;
+      while (cur) {
+        if (SKIP_TAGS.has(cur.tagName)) return true;
+        if (cur.matches?.(SKIP_SELECTOR)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+
+    // Mark a converted text node so we don't keep re-converting in a feedback
+    // loop with the MutationObserver.
+    const CONVERTED = new WeakSet<Text>();
+
+    const convert = (node: Node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const tn = node as Text;
+        if (CONVERTED.has(tn)) return;
+        const parent = tn.parentElement;
+        if (parent && isSkipped(parent)) return;
+        const original = tn.nodeValue || "";
+        if (!original.trim()) return;
+        const converted = toTraditional(original);
+        if (converted !== original) tn.nodeValue = converted;
+        CONVERTED.add(tn);
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element;
+        if (isSkipped(el)) return;
+        // Convert select <option> + button title attributes too — they show
+        // user-facing text but aren't text nodes.
+        if (el instanceof HTMLOptionElement) {
+          const t = el.text;
+          const c = toTraditional(t);
+          if (c !== t) el.text = c;
+        }
+        const title = el.getAttribute("title");
+        if (title) {
+          const c = toTraditional(title);
+          if (c !== title) el.setAttribute("title", c);
+        }
+        const placeholder = el.getAttribute("placeholder");
+        if (placeholder) {
+          const c = toTraditional(placeholder);
+          if (c !== placeholder) el.setAttribute("placeholder", c);
+        }
+        for (const child of Array.from(el.childNodes)) convert(child);
+      }
+    };
+
+    convert(root);
+
+    const mo = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const n of m.addedNodes) convert(n);
+        if (m.type === "characterData" && m.target.nodeType === Node.TEXT_NODE) {
+          const tn = m.target as Text;
+          // Re-converting requires forgetting our prior conversion.
+          CONVERTED.delete(tn);
+          convert(tn);
+        }
+      }
+    });
+    mo.observe(root, { childList: true, subtree: true, characterData: true });
+    return () => mo.disconnect();
+  }, [uiScriptVariant, hasLoadedLocalState]);
 
   useEffect(() => {
     readerLayoutRef.current = readerLayout;
@@ -773,7 +963,11 @@ function App() {
     injectReaderDocumentStyles(doc, { layoutMode: readerLayoutRef.current });
     convertDocumentToTraditional(doc);
     if (autoAnnotateRef.current) {
-      annotateYearMentions(doc, { layoutMode: readerLayoutRef.current });
+      annotateYearMentions(doc, {
+        layoutMode: readerLayoutRef.current,
+        dateDisplay: dateDisplayRef.current,
+        showEmperor: showEmperorRef.current,
+      });
     }
   }
 
@@ -1010,7 +1204,43 @@ function App() {
     const top = (belowY + popupHeight < window.innerHeight + window.scrollY) ? belowY : Math.max(8, aboveY);
     const left = rect ? rect.left + window.scrollX + (rect.width / 2) : event.clientX;
     setSelectionText(text);
-    setSelectionCfi(`db:${currentBookSlug}:${dbReaderIndex}`);
+    // Build a paragraph-anchored cfi when possible:
+    //   db:<slug>:<chapter_idx>:<paragraph_id>:<start>-<end>
+    // so we can re-render highlights on the right span on chapter load.
+    let pid = "";
+    let charStart = -1;
+    let charEnd = -1;
+    if (range) {
+      const findPara = (node: Node | null): HTMLElement | null => {
+        let n: Node | null = node;
+        while (n && n.nodeType !== 1) n = n.parentNode;
+        let el = n as HTMLElement | null;
+        while (el && !el.dataset?.paragraphId) el = el.parentElement;
+        return el;
+      };
+      const startPara = findPara(range.startContainer);
+      const endPara = findPara(range.endContainer);
+      if (startPara && startPara === endPara) {
+        pid = startPara.dataset.paragraphId || "";
+        // Compute character offset from para start to range start/end.
+        const offsetIn = (target: Node, off: number) => {
+          const walker = document.createTreeWalker(startPara, NodeFilter.SHOW_TEXT);
+          let pos = 0;
+          while (walker.nextNode()) {
+            const tn = walker.currentNode;
+            if (tn === target) return pos + off;
+            pos += (tn.nodeValue || "").length;
+          }
+          return pos;
+        };
+        charStart = offsetIn(range.startContainer, range.startOffset);
+        charEnd = offsetIn(range.endContainer, range.endOffset);
+      }
+    }
+    const cfi = pid && charStart >= 0 && charEnd > charStart
+      ? `db:${currentBookSlug}:${dbReaderIndex}:${pid}:${charStart}-${charEnd}`
+      : `db:${currentBookSlug}:${dbReaderIndex}`;
+    setSelectionCfi(cfi);
     setSelectionOverlay({ visible: true, top, left });
   }
 
@@ -1077,6 +1307,8 @@ function App() {
       // Force scroll back to start; effect below recomputes page totals
       requestAnimationFrame(() => {
         if (dbReaderHostRef.current) dbReaderHostRef.current.scrollLeft = 0;
+        dbTargetPageRef.current = 0;
+        dbAnchorParaRef.current = null;
       });
     } catch (error) {
       setBootError(error instanceof Error ? error.message : "加载章节失败。");
@@ -1085,17 +1317,56 @@ function App() {
     }
   }
 
+  // Maintains a "logical target page" so rapid clicks accumulate cleanly
+  // (each click bumps the target and we scroll to that absolute position),
+  // instead of stacking smooth scrollBy calls that drift mid-animation and
+  // leave the reader half-page off.
+  //
+  // For layout-change reflow we use a stronger anchor: the paragraph element
+  // that's currently at (or just past) the left edge of the visible area.
+  // After clientWidth changes we look that element up and snap scrollLeft so
+  // its column starts at the viewport's left edge. This is fully reversible:
+  // expand → collapse returns to the *exact* original page, not a proportional
+  // approximation that drifts due to rounding.
+  const dbTargetPageRef = useRef<number | null>(null);
+  const dbAnchorParaRef = useRef<string | null>(null);
+
+  function captureDbAnchor() {
+    const host = dbReaderHostRef.current;
+    if (!host) return;
+    // Find the first paragraph whose left edge is at or past the current
+    // scrollLeft — that's the leftmost visible paragraph, our anchor.
+    const left = host.scrollLeft;
+    const paras = host.querySelectorAll<HTMLElement>("[data-paragraph-id]");
+    let anchor: HTMLElement | null = null;
+    for (const p of Array.from(paras)) {
+      if (p.offsetLeft >= left - 2) { anchor = p; break; }
+    }
+    if (!anchor && paras.length) anchor = paras[paras.length - 1];
+    dbAnchorParaRef.current = anchor?.dataset.paragraphId ?? null;
+  }
+
   function flipDbPage(direction: -1 | 1) {
     const host = dbReaderHostRef.current;
     if (!host) return;
-    host.scrollBy({ left: direction * host.clientWidth, behavior: "smooth" });
+    const cw = host.clientWidth;
+    if (!cw) return;
+    const currentTarget = dbTargetPageRef.current ?? Math.round(host.scrollLeft / cw);
+    const next = Math.max(0, Math.min(dbPageTotal - 1, currentTarget + direction));
+    dbTargetPageRef.current = next;
+    host.scrollTo({ left: next * cw, behavior: "smooth" });
+    // Capture anchor after the smooth scroll finishes (not before — pre-flip
+    // captures the OLD page's anchor and we'd never advance after layout).
+    setTimeout(captureDbAnchor, 280);
   }
 
   function jumpDbPage(target: number) {
     const host = dbReaderHostRef.current;
     if (!host) return;
     const clamped = Math.max(0, Math.min(dbPageTotal - 1, target));
+    dbTargetPageRef.current = clamped;
     host.scrollTo({ left: clamped * host.clientWidth, behavior: "smooth" });
+    setTimeout(captureDbAnchor, 280);
   }
 
   // Recompute total pages whenever the chapter content or theme/font changes.
@@ -1105,28 +1376,75 @@ function App() {
     const host = dbReaderHostRef.current;
     if (!host) return;
     const recompute = () => {
+      const cw = host.clientWidth;
       const article = host.querySelector<HTMLElement>(".db-reader-article");
       if (article) {
-        // Each column = exactly one viewport width so scrollBy(clientWidth)
-        // flips one full page.
-        article.style.columnWidth = host.clientWidth + "px";
+        article.style.columnWidth = cw + "px";
       }
-      const total = Math.max(1, Math.ceil(host.scrollWidth / Math.max(1, host.clientWidth)));
+      const total = Math.max(1, Math.ceil(host.scrollWidth / Math.max(1, cw)));
       setDbPageTotal(total);
-      setDbPageIndex(Math.round(host.scrollLeft / Math.max(1, host.clientWidth)));
+      // Anchor-based reflow: find the paragraph element we recorded as the
+      // leftmost visible before the layout change, look up its NEW column
+      // offset, and align the viewport to that column. This is exactly
+      // reversible — expand → collapse returns to the same paragraph,
+      // hence the same page, with no rounding drift.
+      let targetPage = dbTargetPageRef.current ?? Math.round(host.scrollLeft / Math.max(1, cw));
+      const anchorId = dbAnchorParaRef.current;
+      if (anchorId) {
+        const anchorEl = host.querySelector<HTMLElement>(`[data-paragraph-id="${anchorId}"]`);
+        if (anchorEl) {
+          // The paragraph's offsetLeft tells us where the browser laid it
+          // out in the multi-column flow. Floor-divide by clientWidth to
+          // get the column (= page) it sits in.
+          targetPage = Math.floor(anchorEl.offsetLeft / Math.max(1, cw));
+        }
+      }
+      const clamped = Math.max(0, Math.min(total - 1, targetPage));
+      const desired = clamped * cw;
+      if (Math.abs(host.scrollLeft - desired) > 1) {
+        host.scrollLeft = desired;
+      }
+      dbTargetPageRef.current = clamped;
+      setDbPageIndex(clamped);
     };
     // Wait one frame so CSS columns have finished laying out
     const id = requestAnimationFrame(recompute);
     const onResize = () => recompute();
     window.addEventListener("resize", onResize);
+    // Watch the host itself — sidebar / assistant collapse triggers a
+    // grid-template-columns transition (150ms). The deps-driven recompute
+    // fires when state changes but the host's clientWidth is still mid-
+    // transition; ResizeObserver fires throughout, so the final snap to a
+    // valid page boundary actually lands on the new viewport size.
+    const ro = new ResizeObserver(() => recompute());
+    ro.observe(host);
+    // Stabilizer: after smooth-scroll bursts settle (220 ms of no scroll
+    // events), snap scrollLeft to the nearest column boundary. Catches any
+    // sub-pixel drift from rapid flipDbPage() calls and forces a clean
+    // integer-page resting state.
+    let settleTimer: number | null = null;
     const onScroll = () => {
-      setDbPageIndex(Math.round(host.scrollLeft / Math.max(1, host.clientWidth)));
+      const cw = host.clientWidth;
+      setDbPageIndex(Math.round(host.scrollLeft / Math.max(1, cw)));
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(() => {
+        const nearest = Math.round(host.scrollLeft / Math.max(1, cw)) * cw;
+        if (Math.abs(host.scrollLeft - nearest) > 1) {
+          host.scrollTo({ left: nearest, behavior: "smooth" });
+        }
+        // Sync target page index + paragraph anchor so subsequent flips and
+        // layout-change recomputes start from a clean state.
+        dbTargetPageRef.current = Math.round(nearest / Math.max(1, cw));
+        captureDbAnchor();
+      }, 220);
     };
     host.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       cancelAnimationFrame(id);
       window.removeEventListener("resize", onResize);
       host.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarCollapsed, assistantCollapsed, currentBookSlug, readableBooks]);
@@ -1317,6 +1635,15 @@ function App() {
         const style = doc.createElement("style");
         style.id = "mingshi-injected-layout";
         style.textContent = LAYOUT_OVERRIDE_CSS;
+        doc.head.appendChild(style);
+      }
+      // Theme/font/color overrides — re-applied by the theme useEffect when
+      // the user changes settings; here we seed the initial value so a fresh
+      // section doesn't flash with default theme before the effect catches up.
+      if (!doc.querySelector("#mingshi-injected-theme")) {
+        const style = doc.createElement("style");
+        style.id = "mingshi-injected-theme";
+        style.textContent = themeCssRef.current;
         doc.head.appendChild(style);
       }
     });
@@ -1536,11 +1863,17 @@ function App() {
     const epubType = (kind: ReaderHighlight["kind"]) =>
       kind === "underline" ? "underline" : kind === "circle" ? "underline" : "highlight";
 
-    for (const item of highlights) {
+    // DB-reader highlights have cfi like "db:<slug>:<idx>" — they can't be
+    // applied to the EPUB rendition (epub.js would throw or silently break
+    // its internal location state, which can crash the next page render).
+    // Filter them out here.
+    const epubHighlights = highlights.filter((h) => !h.cfiRange.startsWith("db:"));
+
+    for (const item of epubHighlights) {
       rendition.annotations.remove(item.cfiRange, epubType(item.kind));
     }
 
-    for (const item of highlights) {
+    for (const item of epubHighlights) {
       const type = epubType(item.kind);
       let styles: Record<string, string>;
       if (item.kind === "circle" || item.kind === "underline") {
@@ -1559,6 +1892,108 @@ function App() {
       rendition.annotations.add(type, item.cfiRange, {}, undefined, `reader-${item.kind}`, styles);
     }
   }, [highlights, readerReady, highlightRedrawTick]);
+
+  // DB-reader highlight rendering: walks every <p data-paragraph-id="N">
+  // currently visible, finds saved highlights for that paragraph, and wraps
+  // the (start, end) character range in a styled <span>.
+  // Re-runs whenever highlights change, the chapter changes, or any setting
+  // that triggers DOM re-render of paragraphs.
+  useEffect(() => {
+    const isDbBook = readableBooks.find((b) => b.slug === currentBookSlug)?.hasEpub === false;
+    if (!isDbBook) return;
+    const host = dbReaderHostRef.current;
+    if (!host) return;
+
+    // Tear down previous wrappers (idempotent re-render). The wrappers carry
+    // a marker class so we don't accidentally unwrap something else.
+    host.querySelectorAll(".db-mark-wrap").forEach((el) => {
+      const parent = el.parentNode;
+      if (!parent) return;
+      while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      parent.removeChild(el);
+      parent.normalize?.();
+    });
+
+    const dbHighlights = highlights.filter((h) => {
+      if (!h.cfiRange.startsWith("db:")) return false;
+      const parts = h.cfiRange.split(":");
+      if (parts.length < 5) return false;
+      // db : slug : chapterIdx : pid : start-end
+      return parts[1] === currentBookSlug && Number(parts[2]) === dbReaderIndex;
+    });
+    if (!dbHighlights.length) return;
+
+    // Defer one frame so the fresh paragraphs from `dbReaderChapter` are in
+    // the DOM before we try to walk them.
+    const id = requestAnimationFrame(() => {
+      for (const item of dbHighlights) {
+        const parts = item.cfiRange.split(":");
+        const pid = parts[3];
+        const offsets = parts[4] || "";
+        const [a, b] = offsets.split("-").map(Number);
+        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) continue;
+        const para = host.querySelector(`[data-paragraph-id="${pid}"]`) as HTMLElement | null;
+        if (!para) continue;
+
+        // Walk text nodes to translate (charStart, charEnd) → (textNode, offset).
+        const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
+        let pos = 0;
+        let startNode: Text | null = null;
+        let startOff = 0;
+        let endNode: Text | null = null;
+        let endOff = 0;
+        while (walker.nextNode()) {
+          const node = walker.currentNode as Text;
+          const len = (node.nodeValue || "").length;
+          if (!startNode && pos + len >= a) {
+            startNode = node;
+            startOff = a - pos;
+          }
+          if (pos + len >= b) {
+            endNode = node;
+            endOff = b - pos;
+            break;
+          }
+          pos += len;
+        }
+        if (!startNode || !endNode) continue;
+
+        const range = document.createRange();
+        try {
+          range.setStart(startNode, startOff);
+          range.setEnd(endNode, endOff);
+        } catch {
+          continue;
+        }
+
+        const span = document.createElement("span");
+        span.className = `db-mark-wrap db-mark-${item.kind}`;
+        span.dataset.highlightId = item.id;
+        if (item.kind === "highlight") {
+          span.style.backgroundColor = item.color || "#efc24f";
+          span.style.opacity = "1";
+          // Match epub.js highlight feel: semi-transparent rect over text.
+          span.style.background = `${item.color || "#efc24f"}66`; // 66 = ~40% alpha
+          span.style.padding = "0 0.05em";
+        } else if (item.kind === "underline") {
+          span.style.borderBottom = `2px solid ${item.color || "#d4231b"}`;
+          span.style.paddingBottom = "0.05em";
+        } else if (item.kind === "circle") {
+          // 古文圈点 — dotted underline (matches the EPUB-side style)
+          span.style.borderBottom = `2px dotted ${item.color || "#d4231b"}`;
+          span.style.paddingBottom = "0.05em";
+        }
+        try {
+          range.surroundContents(span);
+        } catch {
+          // Range crosses element boundaries inside the paragraph (rare; we
+          // already filter for same-paragraph at save time). Skip silently.
+        }
+      }
+    });
+
+    return () => cancelAnimationFrame(id);
+  }, [highlights, dbReaderChapter, dbReaderIndex, currentBookSlug, readableBooks]);
 
   useEffect(() => {
     if (!readerReady || !renditionRef.current || !currentCfiRef.current) return;
@@ -1607,7 +2042,15 @@ function App() {
   }, [sidebarCollapsed, assistantCollapsed, readerReady]);
 
   function clearSelection() {
+    // EPUB iframe selection
     selectionContentsRef.current?.window?.getSelection()?.removeAllRanges();
+    // Main-window selection (DB-reader uses this, not the iframe). Without
+    // this clear, the live text selection persists; subsequent mouseup
+    // events on the host re-fire handleDbReaderSelection, which re-shows
+    // the overlay's backdrop, and the backdrop intercepts every click on
+    // the page-turn-zone — page flipping appears broken until the user
+    // clicks somewhere that clears the OS-level selection.
+    window.getSelection()?.removeAllRanges();
     setSelectionOverlay((prev) => ({ ...prev, visible: false }));
   }
 
@@ -1641,6 +2084,14 @@ function App() {
 
   function addSelectionHighlight(kind: "highlight" | "underline" | "circle", color: string) {
     if (!selectionCfi || !selectionText.trim()) return;
+    // DB-reader cfi without paragraph anchor (just `db:slug:idx`) means the
+    // selection spanned multiple paragraphs — can't reliably re-render. Warn
+    // and bail. Properly-anchored cfis (`db:slug:idx:pid:start-end`) save fine.
+    if (selectionCfi.startsWith("db:") && selectionCfi.split(":").length < 5) {
+      setAiError("跨段勾画暂不支持，请在单个段落内选段后再标记。");
+      clearSelection();
+      return;
+    }
     const item: ReaderHighlight = {
       id: crypto.randomUUID(),
       cfiRange: selectionCfi,
@@ -1753,13 +2204,60 @@ function App() {
     try {
       setMapLoading(true);
       setReferenceError("");
-      const result = await geocodePlaces(mapQuery.trim());
+      const result = await geocodePlaces(mapQuery.trim(), aiSettings);
       setMapResult(result);
     } catch (error) {
       setReferenceError(error instanceof Error ? error.message : "地名定位失败。");
     } finally {
       setMapLoading(false);
     }
+  }
+
+  // Resolve the first date-token in the user's selection. Reaches outward
+  // into the surrounding document text to fill in missing reign+year and
+  // month context — mirrors how a reader naturally tracks context.
+  function handleResolveSelectionDate() {
+    if (!selectionText.trim()) {
+      setDateResult({ error: "请先选中含日期或月份的一段文字。" });
+      return;
+    }
+    // Pull text from the start of the body up to the selection start so the
+    // resolver can search backward for the most recent reign+year and month.
+    let contextBefore = "";
+    try {
+      const contents = selectionContentsRef.current;
+      if (contents) {
+        // EPUB iframe path
+        const sel = contents.window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        if (range) {
+          const before = contents.document.createRange();
+          before.setStart(contents.document.body, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      } else {
+        // DB-reader path: selection lives in main window
+        const sel = window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        const host = document.querySelector(".db-reader-host");
+        if (range && host) {
+          const before = document.createRange();
+          before.setStart(host, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      }
+    } catch {
+      // fall through with empty context
+    }
+
+    const resolved = resolveSelectionDate(selectionText, contextBefore, dateDisplay, showEmperor);
+    if (!resolved) {
+      setDateResult({ error: "选段及其前文中未找到可识别的明代年号 / 月份 / 干支日。" });
+      return;
+    }
+    setDateResult(resolved);
   }
 
   async function handleReferenceLookup(targetText = selectionText) {
@@ -2153,7 +2651,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v0.3</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v0.4.1</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -2477,6 +2975,13 @@ function App() {
                   </select>
                 </label>
                 <label className="field-label">
+                  界面字体转换
+                  <select className="select-input" value={uiScriptVariant} onChange={(event) => setUiScriptVariant(event.target.value as "simplified" | "traditional")}>
+                    <option value="simplified">简体</option>
+                    <option value="traditional">繁体</option>
+                  </select>
+                </label>
+                <label className="field-label">
                   虚拟翻页分栏
                   <select className="select-input" value={pageSpread} onChange={(event) => setPageSpread(event.target.value as "single" | "double")}>
                     <option value="single">单栏分页</option>
@@ -2517,6 +3022,18 @@ function App() {
                     value={readerFontSize}
                     onChange={(e) => setReaderFontSize(Number(e.target.value))}
                   />
+                </label>
+                <label className="field-label">
+                  日期显示
+                  <select className="select-input" value={dateDisplay} onChange={(e) => setDateDisplay(e.target.value as "gregorian" | "lunar" | "both")}>
+                    <option value="lunar">仅农历</option>
+                    <option value="gregorian">仅公历</option>
+                    <option value="both">公历 + 农历</option>
+                  </select>
+                </label>
+                <label className="toggle-row">
+                  <input type="checkbox" checked={showEmperor} onChange={(e) => setShowEmperor(e.target.checked)} />
+                  <span>气泡 / 模态显示在位皇帝（如 明英宗朱祁镇）</span>
                 </label>
                 <label className="field-label">
                   字色（留空则跟随主题）
@@ -2609,19 +3126,25 @@ function App() {
           {bootError && <div className="overlay-message error-box">{bootError}</div>}
           {bookSwitching && <div className="overlay-message">切换书目中…</div>}
           {currentBook?.hasEpub === false ? (
-            <div className="db-reader-host" ref={dbReaderHostRef} onMouseUp={handleDbReaderSelection}>
-              {dbReaderLoading && <div className="overlay-message">载入章节…</div>}
-              {dbReaderChapter ? (
-                <article className="db-reader-article">
-                  <h2 className="db-reader-chapter-title">{normalizeChapterLabel(dbReaderChapter.chapter)}</h2>
-                  {dbReaderChapter.paragraphs.map((p) => (
-                    <p key={p.id} className="db-reader-paragraph" data-paragraph-id={p.id}>{p.content}</p>
-                  ))}
-                </article>
-              ) : (!dbReaderLoading && <div className="overlay-message muted-text">无内容</div>)}
+            <>
+              <div className="db-reader-host" ref={dbReaderHostRef} onMouseUp={handleDbReaderSelection}>
+                {dbReaderLoading && <div className="overlay-message">载入章节…</div>}
+                {dbReaderChapter ? (
+                  <article className="db-reader-article">
+                    <h2 className="db-reader-chapter-title">{normalizeChapterLabel(dbReaderChapter.chapter)}</h2>
+                    {dbReaderChapter.paragraphs.map((p) => (
+                      <p key={p.id} className="db-reader-paragraph" data-paragraph-id={p.id}>{p.content}</p>
+                    ))}
+                  </article>
+                ) : (!dbReaderLoading && <div className="overlay-message muted-text">无内容</div>)}
+              </div>
+              {/* page-turn-zone must be a SIBLING of the scroll host (not a
+                  child), otherwise on pages with scrollLeft>0 they ride along
+                  with the scrolled content and slide out of the viewport,
+                  which makes edge-click flip break after page 1. */}
               <div className="page-turn-zone page-turn-left" onClick={() => flipDbPage(-1)} />
               <div className="page-turn-zone page-turn-right" onClick={() => flipDbPage(1)} />
-            </div>
+            </>
           ) : (
             <>
               <div ref={readerHostRef} className="reader-host" />
@@ -2940,6 +3463,7 @@ function App() {
           )}
           <button type="button" className="toolbar-mini" onClick={() => { setAssistantCollapsed(false); noteInputRef.current?.focus(); }}>笔记</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("pronounce")} disabled={aiLoading}>读音</button>
+          <button type="button" className="toolbar-mini" onClick={handleResolveSelectionDate}>识别日期</button>
           <button type="button" className="toolbar-mini" onClick={() => void handleReferenceLookup()} disabled={lookupLoading}>百科</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestCrossCompare()} disabled={compareLoading}>史料比对</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("translate")} disabled={aiLoading}>现代文</button>
@@ -2983,9 +3507,11 @@ function App() {
                     本地整理
                   </button>
                   <button type="button" className="secondary-button" onClick={() => void loadPersonChronology(true)} disabled={personLoading}>
-                    AI 编年
+                    {personLoading ? "AI 编年中…" : "AI 编年"}
                   </button>
                 </div>
+                {aiError && <div className="error-box">{aiError}</div>}
+                {personLoading && <div className="muted-text">检索《明史》并请 AI 整理中，通常 30–60 秒…</div>}
                 {personChronology?.summary && <div className="answer-card">{personChronology.summary}</div>}
                 <div className="result-list compact">
                   {personChronology?.items.slice(0, 8).map((item) => (
@@ -3276,12 +3802,25 @@ function App() {
                   </div>
                 )}
                 <div className="divider" />
-                <div className="muted-text">中央研究院历史地名检索（可直接在下方搜索古地名）：</div>
+                <div className="inline-actions" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: "0.4rem" }}>
+                  <span className="muted-text">中央研究院历史地名检索 — 嵌入版（仅供预览）</span>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => window.open("https://newarchive.ihp.sinica.edu.tw/hplname/placename/basic", "_blank", "noopener,noreferrer")}
+                  >
+                    新窗口打开
+                  </button>
+                </div>
+                <div className="muted-text" style={{ fontSize: "0.74rem", marginTop: "-0.4rem" }}>
+                  若下方嵌入页查询后跳回首页（中研院反 iframe 第三方 cookie），请用「新窗口打开」按钮在浏览器外部访问。
+                </div>
                 <iframe
                   src="https://newarchive.ihp.sinica.edu.tw/hplname/placename/basic"
                   className="hgis-iframe"
                   title="中研院歷史地名查詢"
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
+                  referrerPolicy="no-referrer-when-downgrade"
                 />
               </div>
             )}
@@ -3325,6 +3864,110 @@ function App() {
             </div>
             <div className="stack-gap">
               <label className="field-label">
+                预设供应商（选择后自动填 Base URL + 常用模型名；不会覆盖已填的 API Key）
+                <select
+                  className="select-input"
+                  value=""
+                  onChange={(e) => {
+                    const key = e.target.value;
+                    if (!key) return;
+                    const presets: Record<string, Partial<typeof aiSettings>> = {
+                      dashscope: {
+                        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                        modelOptions: ["deepseek-v4-pro", "kimi-k2.6", "qwen3.6-max-preview", "MiniMax-M2.5", "qwen3.5-plus-2026-04-20"],
+                        model: "deepseek-v4-pro",
+                        smallModelOptions: ["deepseek-v4-flash", "qwen3.6-flash", "qwen3.6-27b"],
+                        smallModel: "deepseek-v4-flash",
+                        ttsBaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                        ttsModel: "qwen3-tts-flash",
+                      },
+                      ark: {
+                        baseURL: "https://ark.cn-beijing.volces.com/api/v3",
+                        modelOptions: ["doubao-1-5-pro-32k-250115", "doubao-1-5-pro-256k-250115"],
+                        model: "doubao-1-5-pro-32k-250115",
+                        smallModelOptions: ["doubao-1-5-lite-32k-250115"],
+                        smallModel: "doubao-1-5-lite-32k-250115",
+                      },
+                      deepseek: {
+                        baseURL: "https://api.deepseek.com/v1",
+                        modelOptions: ["deepseek-chat", "deepseek-reasoner"],
+                        model: "deepseek-chat",
+                        smallModelOptions: ["deepseek-chat"],
+                        smallModel: "deepseek-chat",
+                      },
+                      moonshot: {
+                        baseURL: "https://api.moonshot.cn/v1",
+                        modelOptions: ["kimi-k2-0905-preview", "moonshot-v1-32k"],
+                        model: "kimi-k2-0905-preview",
+                        smallModelOptions: ["moonshot-v1-8k"],
+                        smallModel: "moonshot-v1-8k",
+                      },
+                      anthropic: {
+                        // Native /v1/messages endpoint. Anthropic provides an
+                        // OpenAI-compat shim at /v1 for the chat-completions
+                        // shape; works for most clients.
+                        baseURL: "https://api.anthropic.com/v1",
+                        modelOptions: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
+                        model: "claude-sonnet-4-5",
+                        smallModelOptions: ["claude-haiku-4-5"],
+                        smallModel: "claude-haiku-4-5",
+                      },
+                      google: {
+                        // Gemini's OpenAI-compatible endpoint
+                        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+                        modelOptions: ["gemini-2.5-pro", "gemini-2.5-flash"],
+                        model: "gemini-2.5-pro",
+                        smallModelOptions: ["gemini-2.5-flash-lite", "gemini-2.5-flash"],
+                        smallModel: "gemini-2.5-flash",
+                      },
+                      openai: {
+                        baseURL: "https://api.openai.com/v1",
+                        modelOptions: ["gpt-5", "gpt-5-mini", "gpt-4.1"],
+                        model: "gpt-5",
+                        smallModelOptions: ["gpt-5-mini", "gpt-4.1-mini"],
+                        smallModel: "gpt-5-mini",
+                      },
+                      openrouter: {
+                        baseURL: "https://openrouter.ai/api/v1",
+                        // OpenRouter routes use `provider/model-name` slugs.
+                        modelOptions: [
+                          "anthropic/claude-sonnet-4.5",
+                          "openai/gpt-5",
+                          "google/gemini-2.5-pro",
+                          "deepseek/deepseek-v3.2-exp",
+                        ],
+                        model: "anthropic/claude-sonnet-4.5",
+                        smallModelOptions: ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"],
+                        smallModel: "anthropic/claude-haiku-4.5",
+                      },
+                      minimax: {
+                        baseURL: "https://api.minimax.io/v1",
+                        modelOptions: ["MiniMax-M2", "MiniMax-Text-01", "abab6.5s-chat"],
+                        model: "MiniMax-M2",
+                        smallModelOptions: ["abab6.5s-chat"],
+                        smallModel: "abab6.5s-chat",
+                      },
+                    };
+                    const next = presets[key];
+                    if (next) setAiSettings((c) => ({ ...c, ...next }));
+                  }}
+                >
+                  <option value="">— 选择预设 —</option>
+                  <option value="dashscope">百炼 (阿里云 DashScope)</option>
+                  <option value="ark">火山引擎 (Volcengine Ark)</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="moonshot">Kimi (Moonshot)</option>
+                  <option value="anthropic">Anthropic Claude</option>
+                  <option value="google">Google Gemini</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="openrouter">OpenRouter（聚合）</option>
+                  <option value="minimax">MiniMax</option>
+                </select>
+              </label>
+              <div className="muted-text" style={{ fontSize: "0.72rem" }}>
+                填好后还要在下方填入对应平台的 API Key（部分海外平台国内访问需自备网络）。火山引擎自定义模型须用 endpoint ID（ep-xxx）。
+              </div>
+              <label className="field-label">
                 OpenAI 兼容 Base URL
                 <input className="text-input" value={aiSettings.baseURL} onChange={(e) => setAiSettings((c) => ({ ...c, baseURL: e.target.value }))} />
               </label>
@@ -3332,14 +3975,23 @@ function App() {
                 API Key
                 <input className="text-input" type="password" value={aiSettings.apiKey} onChange={(e) => setAiSettings((c) => ({ ...c, apiKey: e.target.value }))} />
               </label>
+              <div className="divider" />
+              <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+                TTS（朗读）单独配置 — 多数平台不提供 TTS，常用百炼 qwen3-tts。如果与上面同账号同平台，TTS Base URL / Key 留空即可继承。
+              </div>
               <label className="field-label">
                 TTS Base URL（留空则同主 URL）
                 <input className="text-input" value={aiSettings.ttsBaseURL} onChange={(e) => setAiSettings((c) => ({ ...c, ttsBaseURL: e.target.value }))} placeholder={aiSettings.baseURL} />
               </label>
               <label className="field-label">
-                TTS 模型
-                <input className="text-input" value={aiSettings.ttsModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsModel: e.target.value }))} placeholder="gpt-4o-mini-tts" />
+                TTS API Key（留空则同主 API Key）
+                <input className="text-input" type="password" value={aiSettings.ttsApiKey || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsApiKey: e.target.value }))} placeholder="留空继承主 API Key" />
               </label>
+              <label className="field-label">
+                TTS 模型
+                <input className="text-input" value={aiSettings.ttsModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsModel: e.target.value }))} placeholder="qwen3-tts-flash / gpt-4o-mini-tts 等" />
+              </label>
+              <div className="divider" />
               <ModelListEditor
                 label="主模型列表（勾选的模型将出现在设置页下拉框中）"
                 selected={aiSettings.modelOptions}
@@ -3349,6 +4001,19 @@ function App() {
                 label="小模型列表"
                 selected={aiSettings.smallModelOptions || []}
                 onChange={(opts) => setAiSettings((c) => ({ ...c, smallModelOptions: opts, smallModel: opts.includes(c.smallModel || "") ? c.smallModel : (opts[0] || c.smallModel) }))}
+              />
+              <ModelProviderEditor
+                providers={aiSettings.modelProviders || []}
+                onChange={(next) => setAiSettings((c) => ({ ...c, modelProviders: next }))}
+                onAddModelToPool={(modelName, pool) => setAiSettings((c) => {
+                  if (pool === "large") {
+                    if (c.modelOptions.includes(modelName)) return c;
+                    return { ...c, modelOptions: [...c.modelOptions, modelName] };
+                  }
+                  const small = c.smallModelOptions || [];
+                  if (small.includes(modelName)) return c;
+                  return { ...c, smallModelOptions: [...small, modelName] };
+                })}
               />
               <div className="muted-text" style={{ fontSize: "0.75rem" }}>
                 勾选的模型会出现在设置页的主模型/小模型下拉框中。点"保存设置并刷新页面"后生效。
@@ -3455,23 +4120,22 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v0.3（内测版）</p>
-              <p>以《明史》为底本，整合 22 部明代史籍的交互式本地阅读 + AI 研读工具。</p>
-              <p><strong>v0.3 更新内容：</strong></p>
+              <p><strong>版本：</strong>v0.4.1</p>
+              <p><strong>使用说明：</strong></p>
               <ul>
-                <li>多书阅读：左上角下拉切换 22 部史籍，含明史、国榷、明通鉴、罪惟录、明实录、明史纪事本末、大明会典等</li>
-                <li>带 EPUB 的书走原典渲染（明史/国榷/明通鉴/崇祯长编/罪惟录/三朝辽事实录/大明律），其余书走数据库章节阅读</li>
-                <li>史料交叉比对自动排除当前阅读的本书（避免与正在读的书自比）</li>
-                <li>章节名清洗：去除「(四部叢刊本)/」一类 wikisource 前缀</li>
-                <li>字体/字号/字色/主题预设可在设置面板中切换</li>
-                <li>新增「圈点」批注（古文圈点法）与现有三色高亮并存</li>
+                <li>首次进入软件请打开右上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
+                <li>纯阅读 / 检索 / 字体 / 主题 / 圈点 / 笔记 / 地图本地数据 不需要 API；翻译 / 解释 / 提问 / 史料比对 / AI 编年 / AI 朗读 / AI 地名推断 需要联网调 API。</li>
+                <li>选段后会弹出操作工具栏（翻译 / 解释 / 圈点 / 高亮 / 笔记等）。左右侧栏可折叠。</li>
               </ul>
-              <p><strong>数据来源声明：</strong></p>
+              <p><strong>主要功能：</strong></p>
               <ul>
-                <li>古籍文本数据均来自互联网公开资源（Wikisource、CText 等公共数字图书馆及公开电子书），版权归原始来源所有。</li>
-                <li>AI 辅助功能由第三方大语言模型 API 提供，回答仅供参考。</li>
-                <li>本软件仅供个人学习研究使用，不得用于商业用途。</li>
+                <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对</li>
+                <li>职官检索 / 人物编年 / 皇帝世系 / 年号公元换算 / 古今地名地图</li>
+                <li>农历⇄公历精确换算（含干支日）；选段「识别日期」按钮自动追溯前文上下文</li>
+                <li>4 套阅读主题、5 款字体、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
+                <li>自定义 AI 供应商（URL + Key + 模型组）— 不同模型用不同家的 key</li>
               </ul>
+              <p><strong>数据声明：</strong>古籍文本来自互联网公开资源，版权归原始来源所有。AI 回答仅供参考。本软件仅供个人学习研究使用。</p>
             </div>
             <div className="inline-actions">
               <button type="button" className="primary-button" onClick={() => setAboutOpen(false)}>关闭</button>
@@ -3479,6 +4143,159 @@ function App() {
           </div>
         </div>
       )}
+
+      {dateResult && (
+        <div className="modal-backdrop" onClick={() => setDateResult(null)}>
+          <div className="modal-card" style={{ maxWidth: "32rem" }} onClick={(e) => e.stopPropagation()}>
+            <div className="panel-headline">
+              <span>日期识别</span>
+            </div>
+            {"error" in dateResult ? (
+              <div className="muted-text">{dateResult.error}</div>
+            ) : (
+              <div className="stack-gap">
+                <div style={{ fontSize: "1.1rem", fontWeight: 600 }}>{dateResult.phrase}</div>
+                {dateResult.gregorian && (
+                  <div><strong>公历：</strong>{dateResult.gregorian}</div>
+                )}
+                {dateResult.lunar && (
+                  <div><strong>农历：</strong>{dateResult.lunar}</div>
+                )}
+                {showEmperor && dateResult.emperor && (
+                  <div><strong>在位：</strong>{dateResult.emperor}</div>
+                )}
+                {dateResult.rolledOver && (
+                  <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+                    （干支日不在所述月份，已尝试下个月匹配）
+                  </div>
+                )}
+                {dateResult.warning && (
+                  <div className="muted-text" style={{ fontSize: "0.78rem" }}>{dateResult.warning}</div>
+                )}
+              </div>
+            )}
+            <div className="inline-actions">
+              <button type="button" className="primary-button" onClick={() => setDateResult(null)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModelProviderEditor({ providers, onChange, onAddModelToPool }: {
+  providers: import("./types").ModelProvider[];
+  onChange: (next: import("./types").ModelProvider[]) => void;
+  onAddModelToPool: (modelName: string, pool: "large" | "small") => void;
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+
+  const newId = () => `prov-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  const addProvider = () => {
+    onChange([...providers, { id: newId(), baseURL: "", apiKey: "", models: [] }]);
+  };
+
+  const updateProvider = (id: string, patch: Partial<import("./types").ModelProvider>) => {
+    onChange(providers.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  };
+
+  const removeProvider = (id: string) => {
+    onChange(providers.filter((p) => p.id !== id));
+  };
+
+  // Add model M to provider P as either a large- or small-model. Per spec:
+  // (a) if M already lives in another provider, remove it from there
+  //     (newest add wins);
+  // (b) sync M to the corresponding top-level modelOptions / smallModelOptions
+  //     so it shows up in the settings dropdown automatically.
+  const addModelAs = (id: string, pool: "large" | "small") => {
+    const draft = (drafts[id] || "").trim();
+    if (!draft) return;
+    const next = providers.map((p) => {
+      if (p.id === id) {
+        return p.models.includes(draft) ? p : { ...p, models: [...p.models, draft] };
+      }
+      return p.models.includes(draft) ? { ...p, models: p.models.filter((m) => m !== draft) } : p;
+    });
+    onChange(next);
+    onAddModelToPool(draft, pool);
+    setDrafts((d) => ({ ...d, [id]: "" }));
+  };
+
+  const removeModel = (id: string, model: string) => {
+    onChange(providers.map((p) => (p.id === id ? { ...p, models: p.models.filter((m) => m !== model) } : p)));
+  };
+
+  return (
+    <div className="model-list-editor">
+      <div className="field-label">自定义供应商（可选 — 让特定模型使用不同的 Base URL / API Key）</div>
+      {providers.length === 0 && (
+        <div className="muted-text" style={{ fontSize: "0.78rem", marginBottom: "0.5rem" }}>
+          未配置。所有模型默认走顶部的「Base URL + API Key」。
+        </div>
+      )}
+      {providers.map((p) => (
+        <div key={p.id} className="provider-row" style={{
+          border: "1px solid var(--ui-panel-border)",
+          borderRadius: "0.6rem",
+          padding: "0.65rem 0.75rem",
+          marginBottom: "0.5rem",
+          display: "grid",
+          gap: "0.4rem",
+        }}>
+          <input
+            className="text-input"
+            value={p.baseURL}
+            placeholder="Base URL（如 https://ark.cn-beijing.volces.com/api/v3）"
+            onChange={(e) => updateProvider(p.id, { baseURL: e.target.value })}
+          />
+          <input
+            className="text-input"
+            type="password"
+            value={p.apiKey}
+            placeholder="API Key"
+            onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
+          />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem" }}>
+            {p.models.map((m) => (
+              <span key={m} style={{
+                background: "rgba(110, 66, 23, 0.1)",
+                color: "var(--ui-text)",
+                borderRadius: "0.4rem",
+                padding: "0.18rem 0.55rem",
+                fontSize: "0.78rem",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.35rem",
+              }}>
+                {m}
+                <button type="button" onClick={() => removeModel(p.id, m)} style={{
+                  background: "transparent", border: "none", cursor: "pointer",
+                  color: "inherit", fontSize: "0.9rem", lineHeight: 1, padding: 0,
+                }}>×</button>
+              </span>
+            ))}
+          </div>
+          <div className="custom-model-input" style={{ flexWrap: "wrap" }}>
+            <input
+              className="text-input"
+              value={drafts[p.id] || ""}
+              placeholder="模型名"
+              onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addModelAs(p.id, "large"); } }}
+            />
+            <button type="button" className="ghost-button compact-button" onClick={() => addModelAs(p.id, "large")}>+ 主模型</button>
+            <button type="button" className="ghost-button compact-button" onClick={() => addModelAs(p.id, "small")}>+ 小模型</button>
+            <button type="button" className="ghost-button compact-button" onClick={() => removeProvider(p.id)}>删除供应商</button>
+          </div>
+          <div className="muted-text" style={{ fontSize: "0.7rem" }}>
+            添加后会自动写入上面对应的「主模型/小模型列表」并勾选。
+          </div>
+        </div>
+      ))}
+      <button type="button" className="ghost-button compact-button" onClick={addProvider}>+ 添加供应商</button>
     </div>
   );
 }

@@ -1,8 +1,10 @@
 {
   "name": "mingshi-reader-ai",
+  "productName": "明史阅读器",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.4.1",
   "description": "Interactive Ming History AI reader built from EPUB with local persistence and OpenAI-compatible AI services.",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "npm --prefix backend run dev",
@@ -14,11 +16,106 @@
     "import:local-text": "npm --prefix backend run import:local-text",
     "electron:dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run electron:wait\"",
     "electron:wait": "wait-on tcp:3100 tcp:5173 && electron electron/main.cjs",
-    "electron:start": "wait-on tcp:3100 && electron electron/main.cjs"
+    "electron:start": "wait-on tcp:3100 && electron electron/main.cjs",
+    "electron:integrated": "electron electron/main.cjs",
+    "dist:mac": "npm --prefix frontend run build && electron-builder --mac --x64 --arm64",
+    "dist:win": "npm --prefix frontend run build && electron-builder --win --x64",
+    "dist": "npm --prefix frontend run build && electron-builder -mwl"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
     "electron": "^37.2.1",
+    "electron-builder": "^26.8.1",
     "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "com.canhuili.mingshireader",
+    "productName": "明史阅读器",
+    "asar": true,
+    "asarUnpack": [
+      "backend/**/*",
+      "frontend/dist/**/*"
+    ],
+    "files": [
+      "electron/**",
+      "frontend/dist/**",
+      "frontend/public/fonts/**",
+      "backend/src/**",
+      "backend/scripts/**",
+      "backend/package.json",
+      "backend/node_modules/**",
+      "package.json",
+      "!**/.DS_Store",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples,docs,doc}/**",
+      "!**/node_modules/*.d.ts"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/.cache",
+        "to": "backend-data/.cache",
+        "filter": [
+          "library.sqlite",
+          "split-*.epub"
+        ]
+      },
+      {
+        "from": "backend/books",
+        "to": "backend-data/books",
+        "filter": ["*.epub"]
+      },
+      {
+        "from": "backend/mingshi.epub",
+        "to": "backend-data/mingshi.epub"
+      }
+    ],
+    "afterPack": "./electron/build/afterPack.cjs",
+    "npmRebuild": false,
+    "directories": {
+      "buildResources": "electron/build",
+      "output": "donotpack/release/electron"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["arm64"] }
+      ],
+      "category": "public.app-category.education",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null,
+      "icon": "electron/build/icon.icns",
+      "extraResources": [
+        {
+          "from": "runtime/darwin-arm64",
+          "to": "runtime/darwin-arm64",
+          "filter": ["**/*"]
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        { "target": "zip", "arch": ["x64"] }
+      ],
+      "icon": "electron/build/icon.ico",
+      "extraResources": [
+        {
+          "from": "runtime/win",
+          "to": "runtime/win",
+          "filter": ["**/*"]
+        }
+      ]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Education"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "明史阅读器",
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "menuCategory": "明史阅读器"
+    }
   }
 }

@@ -133,6 +133,13 @@ export type CustomAction = {
   userTemplate: string;
 };
 
+export type ModelProvider = {
+  id: string;
+  baseURL: string;
+  apiKey: string;
+  models: string[];
+};
+
 export type AiSettings = {
   baseURL: string;
   apiKey: string;
@@ -142,10 +149,18 @@ export type AiSettings = {
   smallModel?: string;
   smallModelOptions?: string[];
   ttsBaseURL: string;
+  ttsApiKey?: string;
   ttsModel: string;
   ttsVoice: string;
   systemPrompt: string;
   customActions: CustomAction[];
+  // Optional per-model credential overrides. Each entry binds a (baseURL,
+  // apiKey) pair to a list of model names; when any of those models is
+  // dispatched, it uses this entry's credentials instead of the default.
+  // A model name appearing in any entry means: that entry wins. If the user
+  // adds a model that already lives in another entry, the older entry has
+  // it removed (newest add wins).
+  modelProviders?: ModelProvider[];
 };
 
 export type DefaultsPayload = {
