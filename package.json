@@ -2,7 +2,7 @@
   "name": "mingshi-reader-ai",
   "productName": "明史阅读器",
   "private": true,
-  "version": "0.4.1",
+  "version": "1.1.0",
   "description": "Interactive Ming History AI reader built from EPUB with local persistence and OpenAI-compatible AI services.",
   "main": "electron/main.cjs",
   "scripts": {
@@ -41,7 +41,7 @@
       "frontend/dist/**",
       "frontend/public/fonts/**",
       "backend/src/**",
-      "backend/scripts/**",
+      "!backend/src/data/明代大事年表-完整版.txt",
       "backend/package.json",
       "backend/node_modules/**",
       "package.json",

@@ -1,8 +1,21 @@
-# 明史阅读器 v0.4.1
+# 明史阅读器 v1.0
 
 以《明史》为底本、整合 22 部明代史籍的本地交互式阅读 + AI 研读工具。
 
-## v0.4.1 新增
+## v1.0 新增（2026-05-04）
+
+> 本次发版的核心是数据质量大修。详见 [docs/0504.md](docs/0504.md)。
+
+- **石匮书数据替换**：从 wikisource 抓取版（218 章 / 4299 段，OCR 噪音多）换为 ctext 净本（卷一~卷四）+ shiku-shu OCR Pass 3 手工重写（卷五~卷十七）的组合版（17 章 / 565 段）。
+  - 卷五 ~ 卷十七由 PaddleOCR-VL（Colab A100）+ MinerU 双路 OCR 后，Claude Sonnet 通读重写：删页面分隔符、修跨页接缝、对照 mineru 修订形近错字（千→子、戎→成/去/死、閶→閣 等）。
+  - 拼装脚本 [donotpack/database/shiku-shu-ocr/merged/_make_v3.py](donotpack/database/shiku-shu-ocr/merged/_make_v3.py) / [_make_import_txt.py](donotpack/database/shiku-shu-ocr/merged/_make_import_txt.py)。
+- **读通鉴论换源 + 预处理**：原 EPUB（Kindle 转出来的"套装 5 册"5.6 MB 版）spine 解析失败导致 reader 区一直空白；换为中华书局 1975 校点本（Calibre 转 843 KB），写一次性预处理脚本 [donotpack/database/preprocess-dutongjianlun.mjs](donotpack/database/preprocess-dutongjianlun.mjs) 把单 spine 段塞多章节（`<p id="fileposNNN">`）的格式拆成 122 个独立 spine 段，让 epub.js 通用逻辑直接 work。
+- **保留的小幅通用 bug 修复**：
+  - `last-location` localStorage key 改为 per-book（`last-location:${slug}`），避免一本书的 CFI 被另一本书拿来用导致静默 fallback 到封面
+  - `rendition.resize()` race fix：guard `manager` 存在 + try/catch 兜底，避免 ResizeObserver 早于 display() 触发时抛 `Cannot read properties of undefined (reading 'resize')`
+  - `scrollPendingAnchorIntoView` 改为 iframe-only 滚动（`defaultView.scrollTo`），避免点目录跳转后外层页面也跟着下滑
+
+## v0.4.1（2026-04-30）
 
 - **AI 问答更聪明**：闲聊 / 与明代无关问题不再硬扯检索结果
   - planner 阶段加 `needsLibraryLookup` 判断 — 寒暄、编程、现代时事直接简明回答，不查库不引材料
@@ -111,4 +124,32 @@ node backend/scripts/parse-officials-extended.mjs
 
 ## 数据声明
 
-古籍文本来自互联网公开资源（Wikisource、CText 等公共数字图书馆及电子书），版权归原始来源所有。AI 辅助功能由第三方大语言模型 API 提供，回答仅供参考。本软件仅供个人学习研究使用，不得用于商业用途。
+### 正文 / 古籍文本
+
+来自互联网公开资源（Wikisource、CText 等公共数字图书馆及电子书）+ 个人整理 +
+基于公开资源的 OCR 处理（PaddleOCR-VL / MinerU 双路 OCR + Claude Sonnet
+人工通读重写，详见 [docs/0504.md](docs/0504.md)）。版权归原始来源所有。
+
+### 历史时间线数据
+
+历史时间线（资料 → 历史时间线）的事件库来自《**中国历史大事年表 古代及中世
+纪史部分**》（吉林师范大学历史系，中国古代及中世纪史教研室 编）的 OCR 扫描
+版本。OCR 后做了结构化处理（按年/月/事件级别/事件类别切分）。本项目仅引用，
+原始版权归编者所有。
+
+### AI 辅助
+
+由第三方大语言模型 API 提供（DashScope / 火山 / DeepSeek / Anthropic / OpenAI 等），
+回答仅供参考。
+
+### 字体版权
+
+`frontend/public/fonts/` 下打包的 8 款中文字体来自不同发行方，许可不一。
+**绝大多数为开源字体**（如 霞鹜文楷、汇文 系列、京华老宋 等）；
+**方正系列**（方正永乐大典楷体、方正瘦金、方正礼器碑） 仅授权个人非商业使用，
+不得用于任何商业用途。各字体的具体许可请上网查询其发行方原始声明。
+
+### 总体
+
+本软件仅供个人学习研究使用，**不得用于商业用途**。如需商业使用，请自行处理
+原始数据 / 字体的授权。

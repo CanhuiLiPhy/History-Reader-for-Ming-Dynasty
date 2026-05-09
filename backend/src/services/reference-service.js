@@ -724,6 +724,21 @@ function mergeSearchTerms(...groups) {
   );
 }
 
+// Per-slug priority bonus. Higher slugs get search-result boost so the QA
+// chain prefers them when relevance is otherwise comparable. Tiers:
+//   60 - 明实录（最权威官修）
+//   40 - 明史纪事本末 / 国榷 / 石匮书 / 明史（同档高质量正史与编年）
+//   30 - 明史四库本 / 其它（默认值，最低）
+const SOURCE_PRIORITY_DEFAULT = 30;
+const SOURCE_PRIORITY = {
+  "ming-shi-lu": 60,
+  "mingshi-jishi-benmo": 40,
+  "guoque": 40,
+  "shiku-shu": 40,
+  "ming-shi": 40,
+  "siku-mingshi": 30,
+};
+
 function scoreReferenceContext(item, tokens = []) {
   const text = normalizeTerm(`${item.bookTitle} ${item.chapter} ${item.content}`);
   let score = 0;
@@ -732,7 +747,8 @@ function scoreReferenceContext(item, tokens = []) {
     if (!normalized) continue;
     if (text.includes(normalized)) score += Math.max(8, normalized.length * 2);
   }
-  return score + (item.score || 0);
+  const priority = SOURCE_PRIORITY[item.bookSlug] ?? SOURCE_PRIORITY_DEFAULT;
+  return score + (item.score || 0) + priority;
 }
 
 function buildReferenceSearchPlan(data = {}) {
@@ -743,14 +759,14 @@ function buildReferenceSearchPlan(data = {}) {
     needsLibraryLookup: data.needsLibraryLookup !== false,
     selectionRelevant: data.selectionRelevant !== false,
     needWebSearch: Boolean(data.needWebSearch),
-    people: unique(data.people || []).slice(0, 5),
-    events: unique(data.events || []).slice(0, 5),
-    institutions: unique(data.institutions || []).slice(0, 5),
-    places: unique(data.places || []).slice(0, 5),
-    keywords: unique(data.keywords || []).slice(0, 5),
-    timeHints: unique(data.timeHints || []).slice(0, 5),
+    people: unique([...(data.people || []), ...(data.personAliases || [])]).slice(0, 12),
+    events: unique([...(data.events || []), ...(data.eventAliases || [])]).slice(0, 10),
+    institutions: unique(data.institutions || []).slice(0, 8),
+    places: unique([...(data.places || []), ...(data.entities || [])]).slice(0, 10),
+    keywords: unique(data.keywords || []).slice(0, 10),
+    timeHints: unique(data.timeHints || []).slice(0, 6),
     webQuery: String(data.webQuery || "").trim(),
-    note: String(data.note || "").trim()
+    note: String(data.note || data.coreEventSummary || "").trim()
   };
 }
 
@@ -763,18 +779,18 @@ async function filterRelevantReferences({ question, selection, references, aiSet
   // would be larger than the benefit.
   if (references.length <= 1) return references;
   const promptList = references
-    .map((item, i) => `[${i + 1}] 《${item.bookTitle}》${item.chapter}：${String(item.content || "").slice(0, 120)}`)
+    .map((item, i) => `[${i + 1}] 《${item.bookTitle}》${item.chapter}：${String(item.content || "").slice(0, 200)}`)
     .join("\n");
   try {
     const { data } = await runStructuredJsonPrompt({
       prompt: {
-        system: "你是史料相关性评审助手。判断哪些片段与用户问题直接相关，剔除无关片段。只输出 JSON。",
-        userTemplate: `用户问题：{{question}}\n用户选段：{{selection}}\n\n候选片段（编号从 1 开始）：\n{{context}}\n\n输出 JSON：{"keep": [...编号]}\n\n判定标准：\n- 片段必须与问题中的人物 / 事件 / 制度 / 地名 / 时代有具体内容呼应才算相关\n- 仅含相同朝代 / 模糊背景信息不算相关\n- 宁可少留也不要把不相关的留下；如果都不相关，输出 {"keep": []}\n- 不要输出 markdown`
+        system: "你是史料相关性评审助手。判断哪些片段与用户问题或选段直接相关（指向同一人物、同一事件、或构成因果衔接），剔除无关片段。只输出 JSON。",
+        userTemplate: `用户问题：{{question}}\n用户选段：{{selection}}\n\n候选片段（编号从 1 开始）：\n{{context}}\n\n输出 JSON：{"keep": [...编号]}\n\n判定标准：\n- 片段必须与问题/选段中的人物（包括字号、谥号、庙号等异名）、事件、制度、地名、时代有具体内容呼应才算相关；\n- 仅含相同朝代 / 模糊背景信息不算相关；\n- 注意保留多书互证、多角度记载的相关片段，不要因为已有一条就舍弃后续；\n- 同名异人 / 时代错位 / 巧合用词必须剔除；\n- 如果都不相关，输出 {"keep": []}\n- 不要输出 markdown`
       },
       variables: { question, selection, context: promptList },
       aiSettings,
       temperature: 0,
-      maxTokens: 200,
+      maxTokens: 600,
       modelStrategy: "small",
     });
     const keep = Array.isArray(data?.keep)
@@ -831,12 +847,15 @@ async function buildQuestionPlan({ selection, question, bookContext, aiSettings 
  * @param {object} [aiSettings] - if provided, uses AI to narrow book scope first
  */
 async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tokenTracker = null, excludeSlug = "ming-shi") {
+  const T0 = Date.now();
+  const tlog = (label) => console.log(`[collectRefs] +${((Date.now()-T0)/1000).toFixed(1)}s ${label}`);
   const SEARCH_LIMIT = 200; // fetch many candidates per batch
 
   // Step 1: AI-guided book scoping
   let bookSlugs = [];
   if (aiReady(aiSettings)) {
     try {
+      tlog("STEP 2.1 AI book scoping (small model)...");
       const catalog = getBookCatalogForAI(excludeSlug);
       const searchHint = [
         plan.people.length ? `人物：${plan.people.join("、")}` : "",
@@ -858,9 +877,12 @@ async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tok
       });
       if (tokenTracker && scopeResult.usage) { tokenTracker.small.prompt += scopeResult.usage.prompt_tokens || 0; tokenTracker.small.completion += scopeResult.usage.completion_tokens || 0; tokenTracker.small.calls += 1; }
       bookSlugs = unique(scopeResult.data?.slugs || []).slice(0, 10);
-    } catch {
-      // AI scoping failed, search all books
+      tlog(`STEP 2.1 done model=${scopeResult.model} books=${bookSlugs.length} (${bookSlugs.join(',')})`);
+    } catch (err) {
+      tlog(`STEP 2.1 FAILED ${err?.name}: ${String(err?.message || '').slice(0,80)} — fallback to search all`);
     }
+  } else {
+    tlog("STEP 2.1 skipped (no AI)");
   }
 
   // Step 2: Wide search — fetch up to 100 candidates per batch
@@ -904,11 +926,21 @@ async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tok
     .map((item) => ({ ...item, relevance: scoreReferenceContext(item, strongTokens) }))
     .filter((item) => !hasPeopleOrEvents || item.relevance > 0)
     .sort((a, b) => b.relevance - a.relevance)
-    .slice(0, 100); // take top 100 for AI filtering
+    .slice(0, 200); // take top 200 for AI filtering — wide net, AI judges
 
-  // Step 4: AI relevance filtering — strict semantic check by small model
+  tlog(`STEP 2.2-2.3 FTS search done collected=${collected.length} scored=${scored.length}`);
+
+  // Step 4: AI relevance filtering — strict semantic check by small model.
+  // 大批量候选（>50）拆成若干 50 条小批，并行喂给小模型，最后合并保留 ID。
+  // 单批 50 条比单次 200 条快 ~3-4×；并行 4 路又能再砍一半墙钟时间。
   if (aiReady(aiSettings) && scored.length > 0) {
-    // Build a rich description of the original passage for the AI to compare against
+    const BATCH_SIZE = 50;
+    const batches = [];
+    for (let i = 0; i < scored.length; i += BATCH_SIZE) {
+      batches.push({ offset: i, items: scored.slice(i, i + BATCH_SIZE) });
+    }
+    tlog(`STEP 2.4 AI filter (small model, ${scored.length} candidates → ${batches.length} parallel batches of ${BATCH_SIZE})...`);
+
     const selectionContext = [
       `原文选段核心内容：`,
       plan.people.length ? `涉及人物：${plan.people.join("、")}` : "",
@@ -917,57 +949,83 @@ async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tok
       plan.keywords.length ? `其他关键词：${plan.keywords.join("、")}` : "",
     ].filter(Boolean).join("\n");
 
-    // Show more content per candidate for better semantic judgment
-    const candidateList = scored.map((item, i) =>
-      `[${i}] 《${item.bookTitle}》${item.chapter}：${item.content.slice(0, 120)}`
-    ).join("\n");
+    const filterPrompt = {
+      system: `你是史料相关性判断专家。你的任务是从候选片段中筛选出与《明史》原文选段**指向同一人物或同一事件**的材料。
 
-    try {
-      const filterResult = await runStructuredJsonPrompt({
-        prompt: {
-          system: `你是史料相关性判断专家。你的任务是从候选片段中严格筛选出与《明史》原文选段**直接相关**的材料。
-
-判断标准（必须同时满足以下至少两条才算"直接相关"）：
-1. 提到选段中的**同一人物**（姓名明确出现）
-2. 描述的是**同一事件或同一时期**的事情
-3. 与选段的叙事内容有**因果关系或时间衔接**
+判断"指向同一事件"的标准（同时满足至少两条即可保留）：
+1. 提到选段涉及的**同一人物**（注意人物可能以本名 / 字 / 号 / 庙号 / 谥号 / 官职代称出现，须主动识别同人异称）；
+2. 描述的是**同一事件、同一战役、同一上奏、同一处置、同一封赏、同一政变**或与选段构成因果链的前后续事件；
+3. 时间段相符或紧邻（同一年/同一年号年内，或前后几年构成因果衔接）；
+4. 地点 / 制度 / 机构与选段叙事单元呼应。
 
 以下情况判为**不相关**，必须排除：
-- 仅因出现相同朝代/年号就匹配，但人物和事件完全不同
-- 仅因出现同一个常见词（如"上""诏""兵"）就匹配
-- 人物同名但显然是不同时期的不同人
-- 描述的事件与选段无任何实质联系
+- 仅因出现相同朝代/年号就匹配，但人物和事件完全不同；
+- 仅因出现同一普通词（如"上""诏""兵"）就匹配；
+- 人物同名但显然是不同时期的不同人；
+- 描述的事件与选段无任何实质联系。
 
-宁缺毋滥：如果不确定是否相关，不要选入。只输出JSON。`,
-          userTemplate: `${selectionContext}
+注意：宁可多保留几条疑似相关的，让最终报告环节再行斟酌；但同名异人 / 时代错位 / 巧合用词必须剔除。只输出JSON。`,
+      userTemplate: `${selectionContext}
 
-候选史料片段（共${scored.length}条）：
+候选史料片段（共{{batchSize}}条）：
 {{context}}
 
-请严格判断哪些片段与原文选段直接相关，只输出确定相关的编号：
+请判断哪些片段与原文选段指向同一人物/同一事件，只输出本批中相关条目的编号 JSON：
 {"relevant":[编号1,编号2,...],"reason":"一句话说明筛选依据"}`
-        },
-        variables: { selection: selectionContext, context: candidateList },
-        aiSettings,
-        temperature: 0.05,
-        maxTokens: 400,
-        modelStrategy: "small"
-      });
+    };
 
-      if (tokenTracker && filterResult.usage) { tokenTracker.small.prompt += filterResult.usage.prompt_tokens || 0; tokenTracker.small.completion += filterResult.usage.completion_tokens || 0; tokenTracker.small.calls += 1; }
-      const relevantIds = new Set(filterResult.data?.relevant || []);
-      if (relevantIds.size > 0) {
-        scored = scored.filter((_, i) => relevantIds.has(i));
+    const runBatch = async (batch) => {
+      const { offset, items } = batch;
+      const candidateList = items
+        .map((item, i) => `[${i}] 《${item.bookTitle}》${item.chapter}：${item.content.slice(0, 200)}`)
+        .join("\n");
+      try {
+        const result = await runStructuredJsonPrompt({
+          prompt: filterPrompt,
+          variables: { batchSize: items.length, context: candidateList },
+          aiSettings,
+          temperature: 0.05,
+          maxTokens: 400,
+          modelStrategy: "small"
+        });
+        if (tokenTracker && result.usage) {
+          tokenTracker.small.prompt += result.usage.prompt_tokens || 0;
+          tokenTracker.small.completion += result.usage.completion_tokens || 0;
+          tokenTracker.small.calls += 1;
+        }
+        const localIds = result.data?.relevant || [];
+        // local id (within batch) → global id (within scored[])
+        return { ok: true, model: result.model, ids: localIds.map((id) => offset + id) };
+      } catch (err) {
+        tlog(`  batch[${offset}] FAILED ${err?.name}: ${String(err?.message || '').slice(0,80)}`);
+        return { ok: false, ids: [] };
+      }
+    };
+
+    const batchResults = await Promise.all(batches.map(runBatch));
+    const okCount = batchResults.filter((r) => r.ok).length;
+    const allRelevantIds = new Set();
+    for (const r of batchResults) {
+      for (const id of r.ids) allRelevantIds.add(id);
+    }
+
+    if (okCount === 0) {
+      tlog(`STEP 2.4 ALL BATCHES FAILED — keep keyword-scored top ${limit}`);
+      scored = scored.slice(0, limit);
+    } else {
+      const sampleModel = batchResults.find((r) => r.ok)?.model;
+      tlog(`STEP 2.4 done batches_ok=${okCount}/${batches.length} model=${sampleModel} relevant=${allRelevantIds.size}`);
+      if (allRelevantIds.size > 0) {
+        scored = scored.filter((_, i) => allRelevantIds.has(i));
       } else {
-        // AI found nothing relevant — return empty rather than garbage
         scored = [];
       }
-    } catch {
-      // AI filtering failed, keep keyword-scored results but limit strictly
-      scored = scored.slice(0, limit);
     }
+  } else if (scored.length === 0) {
+    tlog("STEP 2.4 skipped (no scored results)");
   }
 
+  tlog(`STEP 2 final return ${Math.min(scored.length, limit)} contexts`);
   return scored.slice(0, limit);
 }
 
@@ -1245,6 +1303,10 @@ export async function lookupReadingReference(query, aiSettings) {
 }
 
 export async function runCrossSourceComparison(selectedText, aiSettings, currentBookSlug = "ming-shi") {
+  const T0 = Date.now();
+  const tlog = (label) => console.log(`[crossCompare] +${((Date.now()-T0)/1000).toFixed(1)}s ${label}`);
+  tlog(`START selection.length=${selectedText.length} chars from=${currentBookSlug}`);
+
   await initializeLibrary();
   const excludeSlug = currentBookSlug || "ming-shi";
 
@@ -1261,31 +1323,46 @@ export async function runCrossSourceComparison(selectedText, aiSettings, current
   const keywordPrompt = getActionPrompt("extractKeywords");
   let keywords = [];
   let people = [];
+  let personAliases = [];
   let events = [];
+  let eventAliases = [];
+  let entities = [];
+  let places = [];
   let timeHints = [];
+  let coreEventSummary = "";
   let keywordModel = "";
 
   if (aiReady(aiSettings)) {
     try {
+      tlog("STEP 1/3 extractKeywords (small model)...");
       const extracted = await runStructuredJsonPrompt({
         prompt: keywordPrompt,
         variables: { selection: selectedText },
         aiSettings,
         temperature: 0.1,
-        maxTokens: 300,
+        maxTokens: 600,
         modelStrategy: "small"
       });
+      tlog(`STEP 1/3 done model=${extracted.model} keywords=${(extracted.data?.keywords || []).length}`);
       trackUsage(extracted, "small");
       people = unique(extracted.data?.people || []);
+      personAliases = unique(extracted.data?.personAliases || []);
       events = unique(extracted.data?.events || []);
+      eventAliases = unique(extracted.data?.eventAliases || []);
+      entities = unique(extracted.data?.entities || []);
+      places = unique(extracted.data?.places || []);
       timeHints = unique(extracted.data?.timeHints || []);
+      coreEventSummary = String(extracted.data?.coreEventSummary || "").trim();
       keywords = unique([
         ...people,
+        ...personAliases,
         ...events,
+        ...eventAliases,
         ...(extracted.data?.keywords || []),
-        ...(extracted.data?.entities || []),
+        ...entities,
+        ...places,
         ...timeHints
-      ]).slice(0, 6);
+      ]).slice(0, 18);
       keywordModel = extracted.model;
     } catch {
       keywords = deriveKeywordsFromText(selectedText);
@@ -1294,19 +1371,26 @@ export async function runCrossSourceComparison(selectedText, aiSettings, current
     keywords = deriveKeywordsFromText(selectedText);
   }
 
+  tlog("STEP 2/3 collectReferenceContexts (含 AI 选书 + 多次 FTS + AI 过滤)...");
   const contexts = await collectReferenceContexts(
     buildReferenceSearchPlan({
       selectionRelevant: true,
       people,
+      personAliases,
       events,
+      eventAliases,
+      entities,
+      places,
       keywords,
-      timeHints
+      timeHints,
+      note: coreEventSummary
     }),
-    10,
+    25,
     aiSettings,
     tokenUsage,
     excludeSlug
   );
+  tlog(`STEP 2/3 done contexts=${contexts.length}`);
 
   const payload = {
     selectedText,
@@ -1322,23 +1406,35 @@ export async function runCrossSourceComparison(selectedText, aiSettings, current
   }
 
   try {
+    tlog("STEP 3/3 crossCompare report (large model)...");
     const prompt = getActionPrompt("crossCompare");
+    const compareHints = [
+      coreEventSummary ? `核心事件：${coreEventSummary}` : "",
+      people.length ? `核心人物：${people.join("、")}` : "",
+      personAliases.length ? `人物异名：${personAliases.join("、")}` : "",
+      events.length ? `事件：${events.join("、")}` : "",
+      eventAliases.length ? `事件别名：${eventAliases.join("、")}` : "",
+      timeHints.length ? `时间线索：${timeHints.join("、")}` : "",
+      places.length ? `地点：${places.join("、")}` : "",
+    ].filter(Boolean).join("\n");
     const result = await runPromptTemplate({
       prompt,
       variables: {
         selection: selectedText,
-        question: keywords.join("、") || "未提取出稳定关键词",
+        question: compareHints || keywords.join("、") || "未提取出稳定关键词",
         context: formatReferenceContextRows(contexts)
       },
       aiSettings,
       temperature: 0.2,
-      maxTokens: 1000
+      maxTokens: 3000
     });
 
+    tlog(`STEP 3/3 done model=${result.model} text.length=${result.text.length}`);
     trackUsage(result, "large");
     payload.reportMarkdown = result.text;
     payload.model = result.model;
   } catch (err) {
+    tlog(`STEP 3/3 FAILED ${err?.name}: ${String(err?.message || '').slice(0, 120)}`);
     console.error("crossCompare report error:", err?.message?.slice?.(0, 80) || err);
     payload.reportMarkdown = buildLocalCompareFallback(selectedText, keywords, contexts);
     payload.model = "";
@@ -1504,7 +1600,7 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
 
   const cleanSelection = String(selection || "").trim();
   const cleanQuestion = String(question || "").trim();
-  const bookContext = cleanSelection ? await getContextSnippets(cleanSelection, 4) : cleanQuestion ? await getContextSnippets(cleanQuestion, 4) : [];
+  const bookContext = cleanSelection ? await getContextSnippets(cleanSelection, 8) : cleanQuestion ? await getContextSnippets(cleanQuestion, 8) : [];
   const plan = await buildQuestionPlan({
     selection: cleanSelection,
     question: cleanQuestion,
@@ -1521,13 +1617,13 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
     try {
       const result = await runPromptTemplate({
         prompt: {
-          system: "你是 AI 助手。用户的问题与明代史无关，直接简明回答即可，不要硬扯到史料。",
-          userTemplate: `用户问题：{{question}}\n${cleanSelection ? "（用户在阅读《明史》，但问题与选段无直接关联）\n选段：{{selection}}\n" : ""}\n直接回答（200 字以内）。`
+          system: "你是 AI 助手。用户的问题与明代史无关，直接清晰回答即可，不要硬扯到史料。",
+          userTemplate: `用户问题：{{question}}\n${cleanSelection ? "（用户在阅读《明史》，但问题与选段无直接关联）\n选段：{{selection}}\n" : ""}\n请充分回答，不必拘泥字数。`
         },
         variables: { question: cleanQuestion, selection: cleanSelection },
         aiSettings,
         temperature: 0.3,
-        maxTokens: 600,
+        maxTokens: 2000,
         modelStrategy: "large",
       });
       return { answer: result.text, model: result.model, contextSnippets: [] };
@@ -1536,7 +1632,7 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
     }
   }
 
-  const rawReferences = await collectReferenceContexts(plan, 10, aiSettings);
+  const rawReferences = await collectReferenceContexts(plan, 30, aiSettings);
   // Filter out references that turn out to be off-topic. The QA prompt is
   // told to "宁可不引用" but in practice models still pull in tangential
   // materials; an explicit relevance gate keeps the chain honest.
@@ -1547,7 +1643,7 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
     aiSettings,
   });
   const shouldSearchWeb = (!cleanSelection || !plan.selectionRelevant || plan.needWebSearch) && Boolean(plan.webQuery || cleanQuestion);
-  const webResults = shouldSearchWeb ? await searchWeb(plan.webQuery || cleanQuestion || cleanSelection, 4) : [];
+  const webResults = shouldSearchWeb ? await searchWeb(plan.webQuery || cleanQuestion || cleanSelection, 8) : [];
 
   if (!aiReady(aiSettings)) {
     const selectionEntity = pickEmperorFromText(cleanSelection);
@@ -1601,7 +1697,7 @@ export async function answerReadingQuestion({ selection = "", question = "", aiS
       },
       aiSettings,
       temperature: 0.2,
-      maxTokens: 900,
+      maxTokens: 3500,
       modelStrategy: "large"
     });
 

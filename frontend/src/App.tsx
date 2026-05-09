@@ -17,9 +17,7 @@ import {
   Highlighter,
   Landmark,
   LibraryBig,
-  Languages,
   MapPinned,
-  Mic,
   NotebookPen,
   Search,
   Settings2,
@@ -38,6 +36,11 @@ import {
   fetchEmperors,
   fetchLibraryBooks,
   fetchOfficials,
+  fetchHistoryTimeline,
+  fetchAllTimelineEvents,
+  patchTimelineEventApi,
+  HISTORY_CATEGORIES,
+  type HistoryTimelineEvent,
   fetchPersonChronology,
   fetchReaderChapters,
   fetchReaderChapter,
@@ -53,7 +56,7 @@ import {
 import { renderMarkdown } from "./lib/markdown";
 import { readPersistedState, writePersistedState } from "./lib/storage";
 import { annotateYearMentions, injectReaderDocumentStyles, refreshAnnotationDates } from "./lib/yearAnnotator";
-import { resolveSelectionDate, type ResolvedSelectionDate } from "./lib/reign";
+import { resolveSelectionDate, resolveShiluSelectionDate, shiluRangesForChapter, type ResolvedSelectionDate } from "./lib/reign";
 import type {
   AiActionResponse,
   AiSettings,
@@ -77,6 +80,7 @@ import type {
   ReferenceCompareResponse,
   ReferenceLookupResponse,
   SearchResponse,
+  SearchResult,
   TimelineResponse,
   TocItem,
 } from "./types";
@@ -358,6 +362,7 @@ function App() {
   const audioUrlRef = useRef("");
   const initialLocationRef = useRef("");
   const currentCfiRef = useRef("");
+  const currentHrefRef = useRef("");
   const pendingAnchorRef = useRef("");
   const pendingLocationLabelRef = useRef("");
   const pendingLocationTargetRef = useRef("");
@@ -383,6 +388,11 @@ function App() {
   const [dbReaderLoading, setDbReaderLoading] = useState(false);
   // DB-reader pagination (CSS columns flow horizontally; we scroll viewport-wise)
   const dbReaderHostRef = useRef<HTMLDivElement | null>(null);
+  // AI 句读 inline overlay — wraps each char of the selected text in <span>
+  // markers so the punctuated breaks show directly on the original text. The
+  // ref holds a cleanup function that unwraps everything; called on next
+  // selection / chapter change / next 句读 result.
+  const dudouCleanupRef = useRef<(() => void) | null>(null);
   const [dbPageIndex, setDbPageIndex] = useState(0);
   const [dbPageTotal, setDbPageTotal] = useState(1);
   const [activeTab, setActiveTab] = useState<SidebarTab>("toc");
@@ -410,11 +420,36 @@ function App() {
     top: 0,
     left: 0,
   });
+  // 「保留」累积模式：开启时新选段不清空旧选段，而是追加到 pinnedSegments；
+  // AI / 笔记 / 勾画 等动作把所有已 pin 的段 + 当前段 拼接 / 逐段处理，
+  // 用以解决跨页跨章选段无法被一次性 OS-level selection 覆盖的问题。
+  // pinnedSegments 不含当前 selectionText / selectionCfi —— 它们仍是
+  // 「最新一段」的独立状态，effectiveSelectionText 才是 join 后的总文本。
+  const [accumulateMode, setAccumulateMode] = useState(false);
+  const [pinnedSegments, setPinnedSegments] = useState<{ cfi: string; text: string }[]>([]);
+  // 拼好的总文本：所有 pin 段 + 当前段。供 AI / 检索 / 勾画 全部统一用。
+  const effectiveSelectionText = pinnedSegments.length
+    ? pinnedSegments.map((s) => s.text).join("") + selectionText
+    : selectionText;
+  // EPUB 的 selection handler 在 rendition init useEffect 内注册一次，
+  // 闭包里的 accumulateMode / selectionText / selectionCfi 会变成 stale。
+  // 用 ref 镜像，handler 始终读最新值。
+  const accumulateModeRef = useRef(false);
+  const selectionTextRef = useRef("");
+  const selectionCfiRef = useRef("");
+  useEffect(() => { accumulateModeRef.current = accumulateMode; }, [accumulateMode]);
+  useEffect(() => { selectionTextRef.current = selectionText; }, [selectionText]);
+  useEffect(() => { selectionCfiRef.current = selectionCfi; }, [selectionCfi]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchMode, setSearchMode] = useState<"hybrid" | "ai">("hybrid");
+  const [searchMode, setSearchMode] = useState<"local" | "fuzzy" | "ai">("local");
   const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
+  // 本地模糊检索的范围：空数组 = 全部书；否则为选中的 slug 列表。
+  const [searchSlugs, setSearchSlugs] = useState<string[]>([]);
+  const [searchScopeOpen, setSearchScopeOpen] = useState(false);
+  // 检索结果显示条数（前后端共享，覆盖默认）
+  const [searchLimit, setSearchLimit] = useState<number>(50);
   const [aiSettings, setAiSettings] = useState<AiSettings>(defaultAiSettings);
   const [customActions, setCustomActions] = useState<CustomAction[]>([]);
   const [highlights, setHighlights] = useState<ReaderHighlight[]>([]);
@@ -431,8 +466,24 @@ function App() {
   const [noteComposerOpen, setNoteComposerOpen] = useState(false);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const [expandedNoteId, setExpandedNoteId] = useState<string | null>(null);
+  // Notes view: sort + range filters (UI-only state, not persisted)
+  const [notesSort, setNotesSort] = useState<"created-desc" | "created-asc" | "historical-asc" | "historical-desc" | "book">("created-desc");
+  const [notesYearMin, setNotesYearMin] = useState("");
+  const [notesYearMax, setNotesYearMax] = useState("");
+  const [notesCreatedMin, setNotesCreatedMin] = useState("");
+  const [notesCreatedMax, setNotesCreatedMax] = useState("");
   const [bookmarkNameDraft, setBookmarkNameDraft] = useState("");
   const [noteDraft, setNoteDraft] = useState("");
+  // 笔记 → 历史时间线 集成。这些 draft 字段在打开 composer 时被
+  // populated（新建笔记时按 selection 自动检测时间填，编辑时从既有 note 字段拷贝），
+  // 保存时写回 note 对象。
+  const [tlDraftEnabled, setTlDraftEnabled] = useState(false);
+  const [tlDraftYear, setTlDraftYear] = useState<string>("");
+  const [tlDraftMonth, setTlDraftMonth] = useState<string>("");
+  const [tlDraftDay, setTlDraftDay] = useState<string>("");
+  const [tlDraftScale, setTlDraftScale] = useState<number>(1);
+  const [tlDraftCategory, setTlDraftCategory] = useState<string>("我的笔记");
+  const [tlDraftTitle, setTlDraftTitle] = useState<string>("");
   const [questionDraft, setQuestionDraft] = useState("");
   const [aiResponse, setAiResponse] = useState<AiActionResponse | null>(null);
   const [aiPanelTitle, setAiPanelTitle] = useState("选段助理");
@@ -441,6 +492,11 @@ function App() {
   const [personQuery, setPersonQuery] = useState("");
   const [personChronology, setPersonChronology] = useState<ChronologyResponse | null>(null);
   const [personLoading, setPersonLoading] = useState(false);
+  // Baidu Baike inline lookup: when set, the chronology panel renders an
+  // iframe pointing at https://baike.baidu.com/item/<name> below the result
+  // area. Stored separately from personQuery so the user can keep typing in
+  // the search box without resetting the embedded page.
+  const [baikeQuery, setBaikeQuery] = useState("");
   const [ttsStatus, setTtsStatus] = useState("");
   const [referenceLookup, setReferenceLookup] = useState<ReferenceLookupResponse | null>(null);
   const [referenceCompare, setReferenceCompare] = useState<ReferenceCompareResponse | null>(null);
@@ -480,7 +536,24 @@ function App() {
   const [pageSpread, setPageSpread] = useState<"single" | "double">("single");
   // v0.3 reading theme + font controls
   const [readerTheme, setReaderTheme] = useState<"default" | "sepia" | "dark" | "green">("default");
-  const [readerFontFamily, setReaderFontFamily] = useState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">("fangsong");
+  // Body text 与 UI font 用同一组 key（共享 FONT_OPTIONS / FONT_FAMILIES 表，
+  // 见下方 effect）。"system-songti" / "system-fangsong" 是两种系统字体回退栈
+  // （区别在第一个回退是宋体类还是仿宋类），其余 8 个是 frontend/public/fonts/
+  // 下的内置字体。
+  type FontKey =
+    | "system-songti"
+    | "system-fangsong"
+    | "mingchao"
+    | "fangsong"
+    | "songti"
+    | "kaiti"
+    | "zhengkai"
+    | "xiawu"
+    | "lishu"
+    | "shoujin";
+  const [readerFontFamily, setReaderFontFamily] = useState<FontKey>("mingchao");
+  // UI 字体默认值：汇文正楷
+  const [uiFontFamily, setUiFontFamily] = useState<FontKey>("zhengkai");
   const [readerFontSize, setReaderFontSize] = useState<number>(20);
   const [readerFontColor, setReaderFontColor] = useState<string>("");
   const [dateDisplay, setDateDisplay] = useState<"gregorian" | "lunar" | "both">("lunar");
@@ -517,6 +590,7 @@ function App() {
           savedBookSlug,
           savedReaderTheme,
           savedReaderFontFamily,
+          savedUiFontFamily,
           savedReaderFontSize,
           savedReaderFontColor,
           savedDateDisplay,
@@ -531,14 +605,17 @@ function App() {
             readPersistedState<ReaderNote[]>(storageKey("notes"), []),
             readPersistedState<ReaderBookmark[]>(storageKey("bookmarks"), []),
             readPersistedState<boolean>(storageKey("auto-annotate"), true),
-            readPersistedState<string>(storageKey("last-location"), ""),
+            readPersistedState<string>(storageKey("last-location"), ""), // legacy global key, used only as ming-shi fallback below
             readPersistedState<CustomAction[]>(storageKey("custom-actions"), []),
             readPersistedState<"horizontal" | "vertical">(storageKey("reader-layout"), "horizontal"),
             readPersistedState<"simplified" | "traditional">(storageKey("script-variant"), "traditional"),
             readPersistedState<"single" | "double">(storageKey("page-spread"), "single"),
             readPersistedState<string>(storageKey("current-book-slug"), "ming-shi"),
             readPersistedState<"default" | "sepia" | "dark" | "green">(storageKey("reader-theme"), "default"),
-            readPersistedState<"serif" | "fangsong" | "kaiti" | "lishu" | "shoujin">(storageKey("reader-font-family"), "fangsong"),
+            // 老 localStorage 值（serif/fangsong/kaiti/lishu/shoujin）→ 新 key 映射；
+            // 见下方 setReaderFontFamily 的迁移逻辑。这里先按 string 读，再做映射。
+            readPersistedState<string>(storageKey("reader-font-family"), "mingchao"),
+            readPersistedState<string>(storageKey("ui-font-family"), "zhengkai"),
             readPersistedState<number>(storageKey("reader-font-size"), 20),
             readPersistedState<string>(storageKey("reader-font-color"), ""),
             readPersistedState<"gregorian" | "lunar" | "both">(storageKey("date-display"), "lunar"),
@@ -592,21 +669,38 @@ function App() {
         setDbReaderIndex(0);
         setCustomActions(nextCustomActions);
         setAiSettings(mergeAiSettings(defaultsData, savedAiSettings, nextCustomActions));
-        // Drop legacy unanchored db-cfis (just `db:slug:idx` — 3 parts) that
-        // were saved before paragraph-anchored cfis (5 parts) existed. Those
-        // can't be rendered and would pollute the highlight effect.
+        // Drop legacy unanchored db-cfis (just `db:slug:idx` — 3 parts). Both
+        // single-paragraph (5 parts) and cross-paragraph (`...:m:...`, 8 parts)
+        // anchored forms are kept.
         setHighlights(
           savedHighlights.filter((h) => !h.cfiRange.startsWith("db:") || h.cfiRange.split(":").length >= 5)
         );
         setNotes(savedNotes);
         setBookmarks(savedBookmarks);
         setAutoAnnotate(savedAutoAnnotate);
-        setLastLocation(savedLastLocation);
+        // setLastLocation is called below after we've loaded the per-book CFI.
         setReaderLayout(savedReaderLayout);
         setScriptVariant(savedScriptVariant);
         setPageSpread(savedPageSpread);
         setReaderTheme(savedReaderTheme);
-        setReaderFontFamily(savedReaderFontFamily);
+        // 字体 key 老→新迁移：v1.0 之前的 5-key 体系 + 一个 v1.0.1 的 "system"
+        // → v1.0.2 的 10-key 体系（system 拆 system-songti / system-fangsong）
+        const fontKeyMigration: Record<string, FontKey> = {
+          serif: "mingchao",
+          fangsong: "fangsong",
+          kaiti: "xiawu",   // 旧"楷书"指霞鹜文楷
+          lishu: "lishu",
+          shoujin: "shoujin",
+          system: "system-songti",
+        };
+        const validKeys: FontKey[] = [
+          "system-songti", "system-fangsong",
+          "mingchao", "fangsong", "songti", "kaiti", "zhengkai", "xiawu", "lishu", "shoujin",
+        ];
+        const migrate = (raw: string, fallback: FontKey): FontKey =>
+          fontKeyMigration[raw] ?? (validKeys.includes(raw as FontKey) ? (raw as FontKey) : fallback);
+        setReaderFontFamily(migrate(savedReaderFontFamily, "mingchao"));
+        setUiFontFamily(migrate(savedUiFontFamily, "zhengkai"));
         setReaderFontSize(savedReaderFontSize);
         setReaderFontColor(savedReaderFontColor);
         setDateDisplay(savedDateDisplay);
@@ -617,7 +711,15 @@ function App() {
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
-        initialLocationRef.current = savedLastLocation;
+        // Per-book last-location: each book gets its own saved CFI so that
+        // a stale CFI from one book doesn't get applied to another (which
+        // would resolve to invalid spine and silently render the cover page).
+        // Legacy global "last-location" is read above and used as a one-time
+        // ming-shi fallback for users upgrading from before this split.
+        const perBookLocation = await readPersistedState<string>(storageKey(`last-location:${initialSlug}`), "");
+        const effectiveLastLocation = perBookLocation || (initialSlug === "ming-shi" ? savedLastLocation : "");
+        setLastLocation(effectiveLastLocation);
+        initialLocationRef.current = effectiveLastLocation;
         setHasLoadedLocalState(true);
       } catch (error) {
         if (cancelled) return;
@@ -668,8 +770,9 @@ function App() {
 
   useEffect(() => {
     if (!hasLoadedLocalState) return;
-    void writePersistedState(storageKey("last-location"), lastLocation);
-  }, [lastLocation, hasLoadedLocalState]);
+    if (!currentBookSlug) return;
+    void writePersistedState(storageKey(`last-location:${currentBookSlug}`), lastLocation);
+  }, [lastLocation, hasLoadedLocalState, currentBookSlug]);
 
   useEffect(() => {
     if (!hasLoadedLocalState) return;
@@ -688,13 +791,22 @@ function App() {
     // Bundled font names come first (always available); system fonts second
     // (cover characters the bundled font may miss); generic last as final
     // safety net.
-    const families: Record<typeof readerFontFamily, string> = {
-      serif: '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
-      fangsong: '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", serif',
-      kaiti: '"LXGWWenKai", "FZHanWZKJ", "KaiTi", "STKaiti", "BiauKai", "楷体", serif',
-      lishu: '"LiSu", "STLiti", "SimLi", "隶书", "FZHanWZKJ", serif',
-      shoujin: '"ShoujinTi", "FZHanWZKJ", "LXGWWenKai", "KaiTi", "STKaiti", serif',
+    // 字体优先级：内置自有字体 → 系统等价回退 → 通用 serif/sans 兜底。
+    // 10 个 key（前 2 个是系统宋体/仿宋两种回退栈，后 8 个是
+    // frontend/public/fonts/fonts.css 里 @font-face 注册的内置字体）。
+    const FONT_FAMILIES: Record<FontKey, string> = {
+      "system-songti":  '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
+      "system-fangsong": '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", "Noto Serif SC", serif',
+      mingchao: '"Huiwen Mingchao", "Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
+      fangsong: '"Huiwen Fangsong", "FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", serif',
+      songti: '"Jinghua Laosong", "Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
+      kaiti: '"Fangzheng Yongle", "Huiwen Zhengkai", "LXGW WenKai", "KaiTi", "STKaiti", "BiauKai", "楷体", serif',
+      zhengkai: '"Huiwen Zhengkai", "Fangzheng Yongle", "LXGW WenKai", "KaiTi", "STKaiti", serif',
+      xiawu: '"LXGW WenKai", "Huiwen Zhengkai", "Fangzheng Yongle", "KaiTi", "STKaiti", serif',
+      lishu: '"Fangzheng Liqi", "LiSu", "STLiti", "SimLi", "隶书", serif',
+      shoujin: '"Fangzheng Shoujin", "LXGW WenKai", "KaiTi", "STKaiti", serif',
     };
+    const families = FONT_FAMILIES;
     const preset = presets[readerTheme];
     const color = readerFontColor || preset.color;
     const family = families[readerFontFamily];
@@ -782,6 +894,29 @@ function App() {
     if (!hasLoadedLocalState) return;
     void writePersistedState(storageKey("reader-font-family"), readerFontFamily);
   }, [readerFontFamily, hasLoadedLocalState]);
+
+  // UI 字体（独立于正文字体）：写到 --ui-font-family CSS 变量上，App.css 里
+  // body / 各面板继承。同时持久化到 localStorage 跨 session 保留。
+  useEffect(() => {
+    const FONT_FAMILIES_UI: Record<typeof uiFontFamily, string> = {
+      "system-songti":   '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
+      "system-fangsong": '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", "Noto Serif SC", serif',
+      mingchao: '"Huiwen Mingchao", "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif',
+      fangsong: '"Huiwen Fangsong", "FangSong", "STFangsong", "仿宋", serif',
+      songti:   '"Jinghua Laosong", "Source Han Serif SC", "Songti SC", "SimSun", serif',
+      kaiti:    '"Fangzheng Yongle", "Huiwen Zhengkai", "LXGW WenKai", "KaiTi", serif',
+      zhengkai: '"Huiwen Zhengkai", "Fangzheng Yongle", "LXGW WenKai", "KaiTi", serif',
+      xiawu:    '"LXGW WenKai", "Huiwen Zhengkai", "Fangzheng Yongle", "KaiTi", serif',
+      lishu:    '"Fangzheng Liqi", "LiSu", "STLiti", "隶书", serif',
+      shoujin:  '"Fangzheng Shoujin", "LXGW WenKai", "KaiTi", serif',
+    };
+    document.documentElement.style.setProperty("--ui-font-family", FONT_FAMILIES_UI[uiFontFamily]);
+  }, [uiFontFamily]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("ui-font-family"), uiFontFamily);
+  }, [uiFontFamily, hasLoadedLocalState]);
 
   useEffect(() => {
     if (!hasLoadedLocalState) return;
@@ -937,7 +1072,18 @@ function App() {
       targetDoc.querySelector(`#${CSS.escape(anchor)}`);
 
     if (!element) return;
-    element.scrollIntoView({ block: "start" });
+    // In paginated flow (the default mode used by EPUB books here), epub.js
+    // already positions the rendered page so the requested anchor is on the
+    // visible column — no manual scroll needed. Worse, calling
+    // scrollIntoView inside an iframe asks the browser to align the element
+    // to the iframe AND the parent viewport, which yanks the reader chrome
+    // (book header, sidebar headline) off-screen on every TOC click. So we
+    // skip the scroll entirely when the rendition is paginated; only the
+    // legacy "scrolled" flow falls back to scrollIntoView.
+    const flow = (renditionRef.current as unknown as { settings?: { flow?: string } } | null)?.settings?.flow;
+    if (flow && flow !== "paginated") {
+      element.scrollIntoView({ block: "start" });
+    }
     pendingAnchorRef.current = "";
   }
 
@@ -1196,6 +1342,14 @@ function App() {
       setSelectionOverlay((prev) => ({ ...prev, visible: false }));
       return;
     }
+    // New selection ⇒ tear down any AI 句读 inline overlay from the previous run.
+    clearDudouOverlay();
+    // 累积模式：把当前 selectionText/selectionCfi 推入 pinnedSegments，
+    // 然后下面把新选段写入 selectionText/selectionCfi。这样最新一段始终
+    // 是 selectionText（其它逻辑无须改），effectiveSelectionText 拼总文本。
+    if (accumulateMode && selectionText && selectionCfi) {
+      setPinnedSegments((prev) => [...prev, { cfi: selectionCfi, text: selectionText }]);
+    }
     const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
     const rect = range?.getBoundingClientRect();
     const popupHeight = 60;
@@ -1204,12 +1358,11 @@ function App() {
     const top = (belowY + popupHeight < window.innerHeight + window.scrollY) ? belowY : Math.max(8, aboveY);
     const left = rect ? rect.left + window.scrollX + (rect.width / 2) : event.clientX;
     setSelectionText(text);
-    // Build a paragraph-anchored cfi when possible:
-    //   db:<slug>:<chapter_idx>:<paragraph_id>:<start>-<end>
-    // so we can re-render highlights on the right span on chapter load.
-    let pid = "";
-    let charStart = -1;
-    let charEnd = -1;
+    // Build a paragraph-anchored cfi when possible.
+    //   single-paragraph: db:<slug>:<idx>:<pid>:<cstart>-<cend>            (5 parts)
+    //   cross-paragraph:  db:<slug>:<idx>:m:<pidS>:<cS>:<pidE>:<cE>         (8 parts, marker "m")
+    // so we can re-render highlights on the right span(s) on chapter load.
+    let cfi = `db:${currentBookSlug}:${dbReaderIndex}`;
     if (range) {
       const findPara = (node: Node | null): HTMLElement | null => {
         let n: Node | null = node;
@@ -1218,28 +1371,32 @@ function App() {
         while (el && !el.dataset?.paragraphId) el = el.parentElement;
         return el;
       };
+      const offsetIn = (host: HTMLElement, target: Node, off: number) => {
+        const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+        let pos = 0;
+        while (walker.nextNode()) {
+          const tn = walker.currentNode;
+          if (tn === target) return pos + off;
+          pos += (tn.nodeValue || "").length;
+        }
+        return pos;
+      };
       const startPara = findPara(range.startContainer);
       const endPara = findPara(range.endContainer);
-      if (startPara && startPara === endPara) {
-        pid = startPara.dataset.paragraphId || "";
-        // Compute character offset from para start to range start/end.
-        const offsetIn = (target: Node, off: number) => {
-          const walker = document.createTreeWalker(startPara, NodeFilter.SHOW_TEXT);
-          let pos = 0;
-          while (walker.nextNode()) {
-            const tn = walker.currentNode;
-            if (tn === target) return pos + off;
-            pos += (tn.nodeValue || "").length;
+      if (startPara && endPara) {
+        const pidS = startPara.dataset.paragraphId || "";
+        const pidE = endPara.dataset.paragraphId || "";
+        const cS = offsetIn(startPara, range.startContainer, range.startOffset);
+        const cE = offsetIn(endPara, range.endContainer, range.endOffset);
+        if (startPara === endPara) {
+          if (pidS && cS >= 0 && cE > cS) {
+            cfi = `db:${currentBookSlug}:${dbReaderIndex}:${pidS}:${cS}-${cE}`;
           }
-          return pos;
-        };
-        charStart = offsetIn(range.startContainer, range.startOffset);
-        charEnd = offsetIn(range.endContainer, range.endOffset);
+        } else if (pidS && pidE) {
+          cfi = `db:${currentBookSlug}:${dbReaderIndex}:m:${pidS}:${cS}:${pidE}:${cE}`;
+        }
       }
     }
-    const cfi = pid && charStart >= 0 && charEnd > charStart
-      ? `db:${currentBookSlug}:${dbReaderIndex}:${pid}:${charStart}-${charEnd}`
-      : `db:${currentBookSlug}:${dbReaderIndex}`;
     setSelectionCfi(cfi);
     setSelectionOverlay({ visible: true, top, left });
   }
@@ -1268,7 +1425,12 @@ function App() {
       setChapterPageCurrent(1);
       setChapterPageTotal(1);
       setCurrentChapterIndex(0);
-      initialLocationRef.current = "";
+      // Load the destination book's per-book saved location so we resume
+      // where the user left off in THAT book instead of dropping them at
+      // the in-page TOC every switch.
+      const savedForTarget = await readPersistedState<string>(storageKey(`last-location:${slug}`), "");
+      initialLocationRef.current = savedForTarget;
+      setLastLocation(savedForTarget);
       pendingAnchorRef.current = "";
       currentCfiRef.current = "";
       setMeta(null);
@@ -1511,20 +1673,47 @@ function App() {
 
   function jumpToPage(targetPage: number) {
     if (!renditionRef.current || jumpingRef.current) return;
+    const rendition = renditionRef.current;
+    const book = bookRef.current;
 
-    const loc = renditionRef.current.currentLocation?.() as EpubLocationLike | null;
+    const loc = rendition.currentLocation?.() as EpubLocationLike | null;
     const liveTotal = loc?.start?.displayed?.total || 1;
     const livePage = loc?.start?.displayed?.page || 1;
-
     if (liveTotal <= 1) return;
 
     const safePage = clamp(targetPage, 1, liveTotal);
     if (safePage === livePage) return;
 
-    const stepsNeeded = safePage - livePage;
-    const rendition = renditionRef.current;
-    jumpingRef.current = true;
+    // Direct CFI jump: convert (current chapter start CFI + page offset)
+    // into a CFI via book.locations.cfiFromLocation(), then display it.
+    // Falls back to step-by-step next/prev if locations API isn't ready.
+    const navigation = chapterNavigationRef.current;
+    const currentChapter = navigation[currentChapterIndex];
+    const startLoc = currentChapter?.locationIndex;
+    const cfiFromLocation = book?.locations?.cfiFromLocation;
+    if (
+      book &&
+      typeof cfiFromLocation === "function" &&
+      typeof startLoc === "number" &&
+      Number.isFinite(startLoc)
+    ) {
+      try {
+        const targetLocation = startLoc + (safePage - 1);
+        const targetCfi = cfiFromLocation.call(book.locations, targetLocation);
+        if (targetCfi && typeof targetCfi === "string") {
+          jumpingRef.current = true;
+          rendition.display(targetCfi)
+            .catch(() => { /* swallow; relocated event won't fire on failure */ })
+            .finally(() => { jumpingRef.current = false; });
+          return;
+        }
+      } catch { /* fall through to stepping */ }
+    }
 
+    // Fallback: legacy step-by-step (slow, still here in case CFI jump
+    // fails for an unusual book whose locations index hasn't loaded).
+    const stepsNeeded = safePage - livePage;
+    jumpingRef.current = true;
     const step = stepsNeeded > 0 ? () => rendition.next?.() : () => rendition.prev?.();
     let remaining = Math.abs(stepsNeeded);
     const doStep = () => {
@@ -1587,11 +1776,19 @@ function App() {
     // Inject bundled @font-face + width/font !important overrides into each
     // rendered section. Without this, EPUB's own stylesheets win over
     // rendition.themes.default and the user's font/theme picks have no effect.
+    // EPUB iframe 不会自动继承父文档 <link> 的 fonts.css —— 必须把同样的
+    // @font-face 注入到每个 section 里，rendition.themes.font() 才能找到字体。
+    // URL 与 frontend/public/fonts/fonts.css 一致。
+    const O = window.location.origin;
     const FONT_FACE_CSS = `
-      @font-face { font-family: "ShoujinTi"; src: url("${window.location.origin}/fonts/shoujin-simplified.ttf") format("truetype"); font-display: swap; unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF; }
-      @font-face { font-family: "ShoujinTi"; src: url("${window.location.origin}/fonts/shoujin-traditional.ttf") format("truetype"); font-display: swap; unicode-range: U+3400-4DBF, U+F900-FAFF, U+20000-2A6DF; }
-      @font-face { font-family: "LXGWWenKai"; src: url("${window.location.origin}/fonts/lxgw-wenkai.ttf") format("truetype"); font-display: swap; }
-      @font-face { font-family: "FZHanWZKJ"; src: url("${window.location.origin}/fonts/kaiti.ttf") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Mingchao";    src: url("${O}/fonts/${encodeURIComponent("明體（汇文明朝）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Fangsong";    src: url("${O}/fonts/${encodeURIComponent("仿宋（匯文仿宋）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Jinghua Laosong";    src: url("${O}/fonts/${encodeURIComponent("宋體（京華老宋）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Yongle";   src: url("${O}/fonts/${encodeURIComponent("楷體（方正永樂大典）.TTF")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Zhengkai";    src: url("${O}/fonts/${encodeURIComponent("正楷（汇文正楷）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "LXGW WenKai";        src: url("${O}/fonts/${encodeURIComponent("霞鹜（霞鹜文楷）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Liqi";     src: url("${O}/fonts/${encodeURIComponent("漢隸（方正禮器碑）.TTF")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Shoujin";  src: url("${O}/fonts/${encodeURIComponent("瘦金（方正瘦金）.TTF")}") format("truetype"); font-display: swap; }
     `;
     const LAYOUT_OVERRIDE_CSS = `
       /* Only neutralize EPUB's own width caps — never set explicit width or
@@ -1618,6 +1815,28 @@ function App() {
       img, table, figure {
         max-width: 100% !important;
         height: auto !important;
+      }
+      /* AI 句读 inline overlay — 与正文页 .dudou-overlay-* 同步。
+         读号 → 实心红圆，句号 → 空心红圆。CSS 圆形避免不同 CJK 字体下
+         · / ● 字面尺寸不一致的问题。 */
+      .dudou-overlay-char { position: relative; }
+      .dudou-overlay-char.dudou-overlay-break::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        bottom: -0.32em;
+        transform: translateX(-50%);
+        width: 0.32em;
+        height: 0.32em;
+        border-radius: 50%;
+        background: #d4231b;
+        pointer-events: none;
+      }
+      .dudou-overlay-char.dudou-overlay-break.dudou-overlay-strong::after {
+        background: transparent;
+        border: 1.2px solid #d4231b;
+        width: 0.36em;
+        height: 0.36em;
       }
     `;
     type RenditionHooks = { hooks?: { content?: { register?: (cb: (contents: EpubContentsLike) => void) => void } } };
@@ -1656,6 +1875,17 @@ function App() {
         const selected = contents.window.getSelection();
         const text = selected?.toString().trim() || "";
         if (!text || !selected) return;
+        // New selection ⇒ tear down any AI 句读 inline overlay from the
+        // previous run so per-char marker spans don't pile up.
+        clearDudouOverlay();
+        // 累积模式：把当前 selectionText/selectionCfi 推入 pinnedSegments，
+        // 然后下面把新选段写入 selectionText/selectionCfi（最新一段）。
+        // 注意走 ref 而不是 state — 此 handler 闭包是 effect 注册时的 snapshot。
+        if (accumulateModeRef.current && selectionTextRef.current && selectionCfiRef.current) {
+          const prevText = selectionTextRef.current;
+          const prevCfi = selectionCfiRef.current;
+          setPinnedSegments((prev) => [...prev, { cfi: prevCfi, text: prevText }]);
+        }
 
         const iframe = readerHostRef.current?.querySelector("iframe") as HTMLIFrameElement | null;
         const range = selected.rangeCount ? selected.getRangeAt(0) : null;
@@ -1719,10 +1949,65 @@ function App() {
       setSelectionOverlay((prev) => ({ ...prev, visible: false }));
     });
 
-    rendition.on("rendered", (_section: unknown, contents: EpubContentsLike) => {
+    rendition.on("rendered", (section: unknown, contents: EpubContentsLike) => {
       const doc = contents.document as Document;
       applyReaderDocumentPreferences(doc);
       scrollPendingAnchorIntoView(doc);
+
+      // Defensive re-sync: epub.js doesn't always fire `relocated` after a
+      // display() call (in particular when navigating to a fresh anchor in
+      // the SAME spine section it sometimes treats the move as a no-op).
+      // The visible page changes but our React state — currentHref,
+      // currentChapterIndex, chapterPageCurrent/Total — stays pointing at
+      // the previous chapter, so the slider/label appear "stuck on the
+      // last page of the old chapter" until the next refresh.
+      //
+      // Detect by comparing the just-rendered section's href against the
+      // last href we recorded; if they diverge, fabricate a relocated-like
+      // state update from rendition.currentLocation().
+      const renderedHref =
+        (section as { href?: string; url?: string } | undefined)?.href ||
+        (section as { href?: string; url?: string } | undefined)?.url ||
+        "";
+      if (!renderedHref) return;
+      const recordedHref = currentHrefRef.current;
+      const sameSection =
+        normalizeDisplayTarget(renderedHref).split("#")[0] ===
+        normalizeDisplayTarget(recordedHref).split("#")[0];
+      if (sameSection) return; // relocated will fire (or already did) — no rescue needed
+
+      // Wait for epub.js to settle, then read the live location.
+      window.setTimeout(() => {
+        const live = renditionRef.current?.currentLocation?.() as EpubLocationLike | null;
+        const liveCfi = live?.start?.cfi || "";
+        const liveHref = live?.start?.href || renderedHref;
+        if (!liveCfi) return;
+        // If relocated already updated us in the meantime, bail.
+        if (currentCfiRef.current === liveCfi) return;
+
+        const livePct =
+          bookRef.current?.locations?.percentageFromCfi
+            ? (bookRef.current.locations.percentageFromCfi(liveCfi) || 0) * 100
+            : (live?.start?.percentage || 0) * 100;
+        const derived = deriveChapterState(
+          liveCfi,
+          liveHref,
+          findTocLabel(meta.tocTree, liveHref) || meta.metadata.title,
+          livePct,
+          forcedChapterTargetRef.current
+        );
+        const epubjsPage = live?.start?.displayed?.page;
+        const epubjsTotal = live?.start?.displayed?.total;
+        const finalPage = (epubjsTotal && epubjsTotal > 1 && epubjsPage) ? epubjsPage : derived.pageCurrent;
+        const finalTotal = (epubjsTotal && epubjsTotal > 1) ? epubjsTotal : derived.pageTotal;
+        setCurrentCfi(liveCfi);
+        setCurrentHref(liveHref);
+        setCurrentSectionLabel(derived.label);
+        setProgress(derived.wholeProgress);
+        setChapterPageCurrent(finalPage);
+        setChapterPageTotal(finalTotal);
+        setCurrentChapterIndex(derived.chapterIndex);
+      }, 50);
     });
 
     const init = async () => {
@@ -1789,7 +2074,18 @@ function App() {
         if (Math.abs(w - lastW) < 2 && Math.abs(h - lastH) < 2) return;
         lastW = w;
         lastH = h;
-        rendition.resize?.(w, h);
+        // ResizeObserver fires as soon as observe() is called, which can race
+        // ahead of the first display() call that wires up rendition.manager.
+        // Calling rendition.resize() before manager exists throws inside
+        // epub.js ("Cannot read properties of undefined (reading 'resize')")
+        // and prevents the initial render from completing — the user sees a
+        // blank reading area. Skip until the manager is up.
+        if (!(rendition as unknown as { manager?: unknown }).manager) return;
+        try {
+          rendition.resize?.(w, h);
+        } catch {
+          // Swallow late resize errors during teardown.
+        }
       });
     };
     window.addEventListener("resize", onResize);
@@ -1830,6 +2126,10 @@ function App() {
   useEffect(() => {
     currentCfiRef.current = currentCfi;
   }, [currentCfi]);
+
+  useEffect(() => {
+    currentHrefRef.current = currentHref;
+  }, [currentHref]);
 
   useEffect(() => {
     if (!locationsReady || !currentCfi) return;
@@ -1918,76 +2218,106 @@ function App() {
       if (!h.cfiRange.startsWith("db:")) return false;
       const parts = h.cfiRange.split(":");
       if (parts.length < 5) return false;
-      // db : slug : chapterIdx : pid : start-end
+      // single: db:slug:idx:pid:start-end       (5 parts)
+      // multi:  db:slug:idx:m:pidS:cS:pidE:cE   (8 parts, parts[3]==="m")
       return parts[1] === currentBookSlug && Number(parts[2]) === dbReaderIndex;
     });
     if (!dbHighlights.length) return;
+
+    function styleSpan(span: HTMLSpanElement, item: ReaderHighlight) {
+      span.className = `db-mark-wrap db-mark-${item.kind}`;
+      span.dataset.highlightId = item.id;
+      if (item.kind === "highlight") {
+        span.style.background = `${item.color || "#efc24f"}66`;
+        span.style.padding = "0 0.05em";
+      } else if (item.kind === "underline") {
+        span.style.borderBottom = `2px solid ${item.color || "#d4231b"}`;
+        span.style.paddingBottom = "0.05em";
+      } else if (item.kind === "circle") {
+        span.style.borderBottom = `2px dotted ${item.color || "#d4231b"}`;
+        span.style.paddingBottom = "0.05em";
+      }
+    }
+
+    // Wrap the (a, b) char range inside one paragraph with a styled span.
+    function wrapRange(para: HTMLElement, a: number, b: number, item: ReaderHighlight) {
+      if (b <= a) return;
+      const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
+      let pos = 0;
+      let startNode: Text | null = null;
+      let startOff = 0;
+      let endNode: Text | null = null;
+      let endOff = 0;
+      while (walker.nextNode()) {
+        const node = walker.currentNode as Text;
+        const len = (node.nodeValue || "").length;
+        if (!startNode && pos + len >= a) {
+          startNode = node;
+          startOff = a - pos;
+        }
+        if (pos + len >= b) {
+          endNode = node;
+          endOff = b - pos;
+          break;
+        }
+        pos += len;
+      }
+      if (!startNode || !endNode) return;
+      const range = document.createRange();
+      try {
+        range.setStart(startNode, startOff);
+        range.setEnd(endNode, endOff);
+      } catch {
+        return;
+      }
+      const span = document.createElement("span");
+      styleSpan(span, item);
+      try {
+        range.surroundContents(span);
+      } catch {
+        // surroundContents fails if the range partially encloses non-text
+        // nodes — rare here since paragraphs are plain text.
+      }
+    }
+
+    function paraTextLength(para: HTMLElement): number {
+      const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
+      let total = 0;
+      while (walker.nextNode()) total += (walker.currentNode.nodeValue || "").length;
+      return total;
+    }
 
     // Defer one frame so the fresh paragraphs from `dbReaderChapter` are in
     // the DOM before we try to walk them.
     const id = requestAnimationFrame(() => {
       for (const item of dbHighlights) {
         const parts = item.cfiRange.split(":");
-        const pid = parts[3];
-        const offsets = parts[4] || "";
-        const [a, b] = offsets.split("-").map(Number);
-        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) continue;
-        const para = host.querySelector(`[data-paragraph-id="${pid}"]`) as HTMLElement | null;
-        if (!para) continue;
-
-        // Walk text nodes to translate (charStart, charEnd) → (textNode, offset).
-        const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
-        let pos = 0;
-        let startNode: Text | null = null;
-        let startOff = 0;
-        let endNode: Text | null = null;
-        let endOff = 0;
-        while (walker.nextNode()) {
-          const node = walker.currentNode as Text;
-          const len = (node.nodeValue || "").length;
-          if (!startNode && pos + len >= a) {
-            startNode = node;
-            startOff = a - pos;
+        if (parts[3] === "m") {
+          // Cross-paragraph: walk every paragraph between pidS and pidE in
+          // document order and wrap the appropriate slice in each.
+          const pidS = parts[4];
+          const cS = Number(parts[5]);
+          const pidE = parts[6];
+          const cE = Number(parts[7]);
+          if (!pidS || !pidE || !Number.isFinite(cS) || !Number.isFinite(cE)) continue;
+          const allParas = Array.from(host.querySelectorAll<HTMLElement>("[data-paragraph-id]"));
+          const startIdx = allParas.findIndex((p) => p.dataset.paragraphId === pidS);
+          const endIdx = allParas.findIndex((p) => p.dataset.paragraphId === pidE);
+          if (startIdx < 0 || endIdx < 0 || endIdx < startIdx) continue;
+          for (let i = startIdx; i <= endIdx; i++) {
+            const para = allParas[i];
+            const a = i === startIdx ? cS : 0;
+            const b = i === endIdx ? cE : paraTextLength(para);
+            wrapRange(para, a, b, item);
           }
-          if (pos + len >= b) {
-            endNode = node;
-            endOff = b - pos;
-            break;
-          }
-          pos += len;
-        }
-        if (!startNode || !endNode) continue;
-
-        const range = document.createRange();
-        try {
-          range.setStart(startNode, startOff);
-          range.setEnd(endNode, endOff);
-        } catch {
-          continue;
-        }
-
-        const span = document.createElement("span");
-        span.className = `db-mark-wrap db-mark-${item.kind}`;
-        span.dataset.highlightId = item.id;
-        if (item.kind === "highlight") {
-          span.style.backgroundColor = item.color || "#efc24f";
-          span.style.opacity = "1";
-          // Match epub.js highlight feel: semi-transparent rect over text.
-          span.style.background = `${item.color || "#efc24f"}66`; // 66 = ~40% alpha
-          span.style.padding = "0 0.05em";
-        } else if (item.kind === "underline") {
-          span.style.borderBottom = `2px solid ${item.color || "#d4231b"}`;
-          span.style.paddingBottom = "0.05em";
-        } else if (item.kind === "circle") {
-          // 古文圈点 — dotted underline (matches the EPUB-side style)
-          span.style.borderBottom = `2px dotted ${item.color || "#d4231b"}`;
-          span.style.paddingBottom = "0.05em";
-        }
-        try {
-          range.surroundContents(span);
-        } catch {
-          // Range crosses element boundaries inside the paragraph (rare; we
-          // already filter for same-paragraph at save time). Skip silently.
+        } else {
+          // Single-paragraph: db:slug:idx:pid:start-end
+          const pid = parts[3];
+          const [a, b] = (parts[4] || "").split("-").map(Number);
+          if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+          const para = host.querySelector(`[data-paragraph-id="${pid}"]`) as HTMLElement | null;
+          if (!para) continue;
+          wrapRange(para, a, b, item);
         }
       }
     });
@@ -2034,7 +2364,10 @@ function App() {
     const timer = window.setTimeout(() => {
       const rect = readerHostRef.current?.getBoundingClientRect();
       if (rect && renditionRef.current) {
-        renditionRef.current.resize?.(Math.round(rect.width), Math.round(rect.height));
+        const r = renditionRef.current as unknown as { manager?: unknown; resize?: (w: number, h: number) => void };
+        if (r.manager) {
+          try { r.resize?.(Math.round(rect.width), Math.round(rect.height)); } catch { /* ignore */ }
+        }
         window.setTimeout(() => setHighlightRedrawTick((t) => t + 1), 80);
       }
     }, 170);
@@ -2052,6 +2385,25 @@ function App() {
     // clicks somewhere that clears the OS-level selection.
     window.getSelection()?.removeAllRanges();
     setSelectionOverlay((prev) => ({ ...prev, visible: false }));
+    // NOTE: Intentionally NOT clearing setSelectionText / setSelectionCfi
+    // / selectionContentsRef here — earlier I tried to "clear React-side
+    // selection state too for UI consistency" but it broke 识别日期 (which
+    // walks back from the iframe range stored in selectionContentsRef to
+    // build contextBefore — without the ref the resolver gets empty
+    // context and reports "查找不到") and contradicts the product spec
+    // that the selection persists until the next selection is made.
+  }
+
+  // 显式「清空当前选段」按钮 / 关闭累积开关 走这里 —— 把 React 侧 selection
+  // state + 累积 buffer + 句读 overlay 都清掉。区别于 clearSelection 只清
+  // OS-level 选区，不动 React state。
+  function clearSelectionAndPinned() {
+    setPinnedSegments([]);
+    setSelectionText("");
+    setSelectionCfi("");
+    selectionContentsRef.current = null;
+    clearDudouOverlay();
+    clearSelection();
   }
 
   useEffect(() => {
@@ -2084,38 +2436,120 @@ function App() {
 
   function addSelectionHighlight(kind: "highlight" | "underline" | "circle", color: string) {
     if (!selectionCfi || !selectionText.trim()) return;
-    // DB-reader cfi without paragraph anchor (just `db:slug:idx`) means the
-    // selection spanned multiple paragraphs — can't reliably re-render. Warn
-    // and bail. Properly-anchored cfis (`db:slug:idx:pid:start-end`) save fine.
+    // Unanchored db-cfi (just `db:slug:idx`, 3 parts) means selection didn't
+    // resolve to any paragraph — can't render. Anchored single-paragraph
+    // (5 parts) and cross-paragraph `m`-form (8 parts) both save & render.
     if (selectionCfi.startsWith("db:") && selectionCfi.split(":").length < 5) {
-      setAiError("跨段勾画暂不支持，请在单个段落内选段后再标记。");
+      setAiError("无法定位选段所在段落，请重新选取。");
       clearSelection();
       return;
     }
-    const item: ReaderHighlight = {
+    // 累积模式：把所有 pinnedSegments + 当前段 各保存一条 highlight。
+    // 非累积：只保存当前一条。
+    const allSegments = [
+      ...pinnedSegments,
+      { cfi: selectionCfi, text: selectionText },
+    ].filter((s) => {
+      // 跳过未锚定 db-cfi（防呆）。
+      if (!s.cfi || !s.text.trim()) return false;
+      if (s.cfi.startsWith("db:") && s.cfi.split(":").length < 5) return false;
+      return true;
+    });
+    const now = new Date().toISOString();
+    const items: ReaderHighlight[] = allSegments.map((s) => ({
       id: crypto.randomUUID(),
-      cfiRange: selectionCfi,
-      text: selectionText,
+      cfiRange: s.cfi,
+      text: s.text,
       color,
       kind,
-      createdAt: new Date().toISOString(),
-    };
-    setHighlights((current) => [item, ...current]);
+      createdAt: now,
+    }));
+    setHighlights((current) => [...items, ...current]);
     clearSelection();
   }
 
+  // 隐藏当前选段下面那一组 action 按钮后，启动笔记弹窗的入口暂时没了；
+  // 函数本身保留，将来如果再增加入口（如选段工具栏的 "笔记" 按钮直接弹
+  // composer 模态而非 inline 输入）可以直接复用。
   function startNoteComposer() {
     if (!selectionText.trim()) return;
     setNoteDraft("");
     setNoteComposerOpen(true);
   }
+  void startNoteComposer;
+
+  // Whenever the composer opens — either for a brand new note (editingNoteId
+  // null) or for editing an existing one — seed the timeline draft fields so
+  // the form pre-fills with sensible defaults (auto-detected date for new,
+  // saved values for edits).
+  useEffect(() => {
+    if (!noteComposerOpen) return;
+    if (editingNoteId) {
+      const n = notes.find((x) => x.id === editingNoteId);
+      if (!n) return;
+      setTlDraftEnabled(!!n.inTimeline);
+      setTlDraftYear(n.manualYear != null ? String(n.manualYear) : (n.historicalYear != null ? String(n.historicalYear) : ""));
+      setTlDraftMonth(n.manualMonth != null ? String(n.manualMonth) : "");
+      setTlDraftDay(n.manualDay != null ? String(n.manualDay) : "");
+      setTlDraftScale(n.timelineScale ?? 1);
+      setTlDraftCategory(n.timelineCategory ?? "我的笔记");
+      setTlDraftTitle(n.timelineTitle ?? "");
+    } else {
+      // New note — try to auto-detect a year from the current selection so
+      // the user only has to flip the toggle on if they want to surface it.
+      let detectedYear = "";
+      let detectedMonth = "";
+      let detectedDay = "";
+      try {
+        let contextBefore = "";
+        const contents = selectionContentsRef.current;
+        if (contents) {
+          const sel = contents.window.getSelection?.();
+          const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+          if (range) {
+            const before = contents.document.createRange();
+            before.setStart(contents.document.body, 0);
+            before.setEnd(range.startContainer, range.startOffset);
+            contextBefore = before.toString();
+          }
+        }
+        const resolved = resolveSelectionDate(selectionText, contextBefore, "lunar", false);
+        if (resolved) {
+          if (resolved.solarYear) detectedYear = String(resolved.solarYear);
+          if (resolved.solarMonth) detectedMonth = String(resolved.solarMonth);
+          if (resolved.solarDay) detectedDay = String(resolved.solarDay);
+          if (!detectedYear && resolved.gregorianYear) detectedYear = String(resolved.gregorianYear);
+        }
+      } catch { /* best-effort */ }
+      setTlDraftEnabled(false);
+      setTlDraftYear(detectedYear);
+      setTlDraftMonth(detectedMonth);
+      setTlDraftDay(detectedDay);
+      setTlDraftScale(1);
+      setTlDraftCategory("我的笔记");
+      setTlDraftTitle("");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noteComposerOpen, editingNoteId]);
 
   function saveNote() {
     if (!noteDraft.trim()) return;
 
+    // Pull timeline draft into a typed patch — applied to both edit and new
+    // note paths so behavior is uniform.
+    const tlPatch: Partial<ReaderNote> = {
+      inTimeline: tlDraftEnabled,
+      manualYear: tlDraftYear ? parseInt(tlDraftYear, 10) : undefined,
+      manualMonth: tlDraftMonth ? parseInt(tlDraftMonth, 10) : undefined,
+      manualDay: tlDraftDay ? parseInt(tlDraftDay, 10) : undefined,
+      timelineScale: tlDraftEnabled ? clamp(tlDraftScale, 1, 5) : undefined,
+      timelineCategory: tlDraftEnabled ? (tlDraftCategory || "我的笔记") : undefined,
+      timelineTitle: tlDraftEnabled ? (tlDraftTitle.trim() || undefined) : undefined,
+    };
+
     // Editing an existing note
     if (editingNoteId) {
-      setNotes((current) => current.map((n) => n.id === editingNoteId ? { ...n, note: noteDraft.trim() } : n));
+      setNotes((current) => current.map((n) => n.id === editingNoteId ? { ...n, note: noteDraft.trim(), ...tlPatch } : n));
       setEditingNoteId(null);
       setNoteDraft("");
       setNoteComposerOpen(false);
@@ -2124,27 +2558,89 @@ function App() {
 
     // Creating a new note
     if (!selectionText.trim() || !selectionCfi) return;
-    const note: ReaderNote = {
-      id: crypto.randomUUID(),
-      cfiRange: selectionCfi,
-      text: selectionText,
-      note: noteDraft.trim(),
-      createdAt: new Date().toISOString(),
-    };
-    setNotes((current) => [note, ...current]);
 
-    if (!highlights.some((item) => item.cfiRange === selectionCfi)) {
-      setHighlights((current) => [
-        {
+    // Try to derive a historical timestamp from the selection + its
+    // surrounding text. Best-effort: works only for explicit reign mentions
+    // ("嘉靖三年" / "永乐元年八月" etc.) within or just before the selection.
+    let historicalAt: string | undefined;
+    let historicalYear: number | undefined;
+    try {
+      let contextBefore = "";
+      const contents = selectionContentsRef.current;
+      if (contents) {
+        const sel = contents.window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        if (range) {
+          const before = contents.document.createRange();
+          before.setStart(contents.document.body, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      } else {
+        const sel = window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        const host = document.querySelector(".db-reader-host");
+        if (range && host) {
+          const before = document.createRange();
+          before.setStart(host, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      }
+      const resolved = resolveSelectionDate(selectionText, contextBefore, "lunar", false);
+      if (resolved) {
+        if (resolved.solarYear && resolved.solarMonth && resolved.solarDay) {
+          historicalAt = `${resolved.solarYear}-${String(resolved.solarMonth).padStart(2, "0")}-${String(resolved.solarDay).padStart(2, "0")}`;
+        } else {
+          historicalAt = resolved.phrase;
+        }
+        historicalYear = resolved.gregorianYear;
+      }
+    } catch {
+      // best-effort; missing historical timestamp is fine
+    }
+
+    // 累积模式：每个 pin 段 + 当前段都生成一条笔记，共享同一 note 文本 /
+    // 时间线 patch，但各自的 cfi/text 独立 — 跳回原文时能定位到该段。
+    const segs = [
+      ...pinnedSegments,
+      { cfi: selectionCfi, text: selectionText },
+    ].filter((s) => s.cfi && s.text.trim() && !(s.cfi.startsWith("db:") && s.cfi.split(":").length < 5));
+    const noteText = noteDraft.trim();
+    const newNotes: ReaderNote[] = segs.map((s) => ({
+      id: crypto.randomUUID(),
+      cfiRange: s.cfi,
+      text: s.text,
+      note: noteText,
+      createdAt: new Date().toISOString(),
+      historicalAt,
+      historicalYear,
+      bookSlug: currentBookSlug,
+      ...tlPatch,
+    }));
+    // Replace-on-conflict: drop existing notes whose cfi+body matches any new one.
+    setNotes((current) => {
+      const dropKeys = new Set(newNotes.map((n) => `${n.cfiRange}::${n.note}`));
+      const filtered = current.filter((n) => !dropKeys.has(`${n.cfiRange}::${n.note.trim()}`));
+      return [...newNotes, ...filtered];
+    });
+
+    // 给每段未存过 highlight 的选段补一条黄色高亮，方便日后回看。
+    const newHighlights: ReaderHighlight[] = [];
+    for (const s of segs) {
+      if (!highlights.some((item) => item.cfiRange === s.cfi)) {
+        newHighlights.push({
           id: crypto.randomUUID(),
-          cfiRange: selectionCfi,
-          text: selectionText,
+          cfiRange: s.cfi,
+          text: s.text,
           color: "#efc24f",
           kind: "highlight",
           createdAt: new Date().toISOString(),
-        },
-        ...current,
-      ]);
+        });
+      }
+    }
+    if (newHighlights.length) {
+      setHighlights((current) => [...newHighlights, ...current]);
     }
 
     setNoteDraft("");
@@ -2216,7 +2712,7 @@ function App() {
   // Resolve the first date-token in the user's selection. Reaches outward
   // into the surrounding document text to fill in missing reign+year and
   // month context — mirrors how a reader naturally tracks context.
-  function handleResolveSelectionDate() {
+  async function handleResolveSelectionDate() {
     if (!selectionText.trim()) {
       setDateResult({ error: "请先选中含日期或月份的一段文字。" });
       return;
@@ -2252,15 +2748,109 @@ function App() {
       // fall through with empty context
     }
 
-    const resolved = resolveSelectionDate(selectionText, contextBefore, dateDisplay, showEmperor);
+    // 当前章节 label：EPUB 路径用 currentSectionLabel（来自 epubjs relocated），
+    // DB-reader 路径用 dbReaderChapter.chapter（明实录走这条 — 它是 DB-only 书）。
+    const effectiveChapterLabel = currentSectionLabel || dbReaderChapter?.chapter || "";
+
+    // 实录章节用专属解析路径（不走通用 resolveSelectionDate，避免污染）
+    let resolved: ResolvedSelectionDate | null = null;
+    const inShilu = effectiveChapterLabel && shiluRangesForChapter(effectiveChapterLabel);
+    console.info("[识别日期] selectionText=", JSON.stringify(selectionText.slice(0, 60)), "label=", effectiveChapterLabel, "inShilu=", !!inShilu, "ctxBefore.len=", contextBefore.length);
+    if (inShilu) {
+      resolved = resolveShiluSelectionDate(selectionText, contextBefore, effectiveChapterLabel, dateDisplay);
+      console.info("[识别日期] shilu 解析 →", resolved ? `命中 ${resolved.phrase}` : "null");
+    }
     if (!resolved) {
-      setDateResult({ error: "选段及其前文中未找到可识别的明代年号 / 月份 / 干支日。" });
+      resolved = resolveSelectionDate(selectionText, contextBefore, dateDisplay, showEmperor);
+      console.info("[识别日期] 通用解析 →", resolved ? `命中 ${resolved.phrase}` : "null");
+    }
+
+    // Fallback chain. The resolver searches level by level (smallest unit
+    // → year → reign), so a missing reign in the current chapter is the
+    // most common reason resolve returns null. Walk back through prior
+    // chapters and retry, using the DB-side `/api/reference/chapter-context`
+    // endpoint which works for any imported book (including EPUB ones —
+    // 明史 etc. were imported via import-epub-source.mjs).
+    //
+    // We use the navigation map (chapterNavigationRef) to enumerate prior
+    // chapters by label, then ask the backend for each chapter's text.
+    if (!resolved && currentBookSlug) {
+      try {
+        let widerContext = contextBefore;
+        // 章节列表：EPUB 路径用 meta.inPageToc / tocTree；DB-reader 路径
+        // （明实录走这条 — DB-only，meta 为空）用 dbReaderChapters.chapters。
+        // 缺一不可，否则跨章兜底无法定位上一章 label。
+        const epubList: { label: string; href?: string }[] =
+          (meta?.inPageToc?.length ?? 0) > 0
+            ? meta!.inPageToc!
+            : (meta ? flattenTocItems(meta.tocTree).filter((_, idx) => idx > 0) : []);
+        const dbList: { label: string }[] =
+          (dbReaderChapters?.chapters || []).map((c) => ({ label: c.label }));
+        const fallbackList = epubList.length ? epubList : dbList;
+
+        let curIdx = -1;
+        if (selectionContentsRef.current) {
+          if (currentHref) {
+            const curHrefBase = currentHref.split("#")[0].replace(/^OEBPS\//, "");
+            curIdx = epubList.findIndex((it) => {
+              const navHref = (it.href || "").split("#")[0].replace(/^OEBPS\//, "");
+              return navHref === curHrefBase || navHref.endsWith(curHrefBase) || curHrefBase.endsWith(navHref);
+            });
+          }
+          if (curIdx < 0 && currentSectionLabel) {
+            curIdx = epubList.findIndex((it) => it.label === currentSectionLabel);
+          }
+        } else {
+          curIdx = dbReaderIndex;
+        }
+        console.info("[识别日期] fallback start: curIdx=", curIdx, "label=", effectiveChapterLabel, "fallbackList.length=", fallbackList.length);
+
+        if (curIdx > 0 && fallbackList.length > 0) {
+          const start = Math.max(0, curIdx - 5);
+          const priorTexts: string[] = [];
+          for (let i = start; i < curIdx; i++) {
+            const it = fallbackList[i];
+            const label = it?.label;
+            if (!label) continue;
+            try {
+              const data = await fetchChapterContext(currentBookSlug, label, "");
+              const txt = (data.paragraphs || []).join("\n");
+              console.info("[识别日期] idx", i, "label=", label, "len=", txt.length);
+              if (txt) priorTexts.push(txt);
+            } catch (e) {
+              console.warn("[识别日期] idx", i, "DB 抓章失败 label=", label, e);
+            }
+          }
+          if (priorTexts.length) {
+            widerContext = priorTexts.join("\n") + "\n" + contextBefore;
+            console.info("[识别日期] 扩展后 contextBefore 总长", widerContext.length);
+          }
+        }
+        if (widerContext !== contextBefore) {
+          // ⚠ 用 effectiveChapterLabel（DB-reader 走 dbReaderChapter.chapter），
+          // 否则 inShilu 为 true 但 chapterLabel 为空 → resolveShiluSelectionDate
+          // 内部 shiluRangesForChapter("") 又返回 null → 永远 null。
+          if (inShilu) {
+            resolved = resolveShiluSelectionDate(selectionText, widerContext, effectiveChapterLabel, dateDisplay);
+          }
+          if (!resolved) {
+            resolved = resolveSelectionDate(selectionText, widerContext, dateDisplay, showEmperor);
+          }
+          console.info("[识别日期] 扩展后再 resolve →", resolved ? `命中 ${resolved.phrase}` : "仍然 null");
+        }
+      } catch (e) {
+        console.warn("[识别日期] fallback 出错", e);
+      }
+    }
+
+    if (!resolved) {
+      setDateResult({ error: "选段及其前文（含前几章）中未找到可识别的明代年号 / 月份 / 干支日。" });
       return;
     }
     setDateResult(resolved);
   }
 
-  async function handleReferenceLookup(targetText = selectionText) {
+  async function handleReferenceLookup(targetText = effectiveSelectionText) {
     if (!targetText.trim()) {
       setReferenceError("请先选中词语、短句或一小段文字。");
       return;
@@ -2283,7 +2873,7 @@ function App() {
     }
   }
 
-  async function handleCrossCompare(targetText = selectionText, supplement = "") {
+  async function handleCrossCompare(targetText: string = effectiveSelectionText, supplement = "") {
     if (!targetText.trim()) {
       setReferenceError("请先选中一段《明史》原文。");
       return;
@@ -2318,22 +2908,14 @@ function App() {
     }
   }
 
-  async function openTimelinePanel() {
-    try {
-      setTimelineLoading(true);
-      setReferenceError("");
-      const hint = currentSectionLabel || selectionText;
-      const timeline = await fetchTimeline(hint);
-      setTimelineData(timeline);
-      setTimelineOpen(true);
-    } catch (error) {
-      setReferenceError(error instanceof Error ? error.message : "时间轴加载失败。");
-    } finally {
-      setTimelineLoading(false);
-    }
-  }
+  // openTimelinePanel: previously the entrypoint for the 「章节时间轴」 button
+  // in the 资料 panel; that button has been removed in v1.0 (the panel was
+  // judged not useful enough to keep). The function and its modal renderer
+  // stay in case we want to re-expose it later — referenced via the modal
+  // visibility check below.
+  void fetchTimeline; void setTimelineLoading; void setTimelineData; void setTimelineOpen;
 
-  function requestAiAction(type: "translate" | "pronounce" | "explain" | "qa" | "custom", customAction?: CustomAction) {
+  function requestAiAction(type: "translate" | "pronounce" | "explain" | "qa" | "punctuate" | "custom", customAction?: CustomAction) {
     if (type !== "qa" && !selectionText.trim()) {
       setAiError("请先在正文里选中一段文字。");
       return;
@@ -2342,7 +2924,11 @@ function App() {
       setAiError("请输入要提问的内容。");
       return;
     }
-    if (promptSupplementEnabled && type !== "qa") {
+    // 句读 / 读音 / 现代文翻译 are mechanical formatting tasks —补充说明
+    // 框对它们没意义，跳过直接执行。问答（qa）由专门的 question 输入承载，
+    // 也不走补充弹窗。其余（解释 / 自定义动作）保留原行为。
+    const SKIP_SUPPLEMENT = new Set(["qa", "punctuate", "pronounce", "translate"]);
+    if (promptSupplementEnabled && !SKIP_SUPPLEMENT.has(type)) {
       setSupplementDraft("");
       setPendingAction({ type, customAction });
       return;
@@ -2368,7 +2954,7 @@ function App() {
     const supplement = supplementDraft.trim();
     if (pendingAction.handler === "compare") {
       setPendingAction(null);
-      void handleCrossCompare(selectionText, supplement);
+      void handleCrossCompare(effectiveSelectionText, supplement);
     } else {
       const { type, customAction } = pendingAction;
       setPendingAction(null);
@@ -2376,7 +2962,269 @@ function App() {
     }
   }
 
-  async function performAiAction(type: "translate" | "pronounce" | "explain" | "qa" | "custom", customAction?: CustomAction, supplement = "") {
+  // Snapshot the live selection range so a later overlay (after the AI await
+  // resolves and we've called clearSelection) can rebuild it from saved
+  // node refs. DOM nodes stay valid even after the OS-level selection clears.
+  type DudouSnapshot =
+    | { kind: "epub"; doc: Document; sc: Node; so: number; ec: Node; eo: number }
+    | { kind: "db"; cfi: string };
+  function snapshotForDudou(): DudouSnapshot | null {
+    // EPUB iframe selection wins if present (selectionContentsRef set on iframe selection)
+    const contents = selectionContentsRef.current;
+    if (contents) {
+      const sel = contents.window?.getSelection?.();
+      const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+      if (range && contents.document) {
+        return {
+          kind: "epub",
+          doc: contents.document,
+          sc: range.startContainer,
+          so: range.startOffset,
+          ec: range.endContainer,
+          eo: range.endOffset,
+        };
+      }
+    }
+    if (selectionCfi.startsWith("db:") && selectionCfi.split(":").length >= 5) {
+      return { kind: "db", cfi: selectionCfi };
+    }
+    return null;
+  }
+
+  // Builds a Map<plainCharIndex, isSentenceEnd> from the punctuated answer.
+  // 标注规范：
+  //   读号 (，、；：·)  → 实心圆 (filled disc)        — `dudou-overlay-break`
+  //   句号 (。！？)     → 空心圆 (hollow ring)        — `+ dudou-overlay-strong`
+  function buildDudouBreaks(answer: string): Map<number, boolean> {
+    const PUNCT = /[·。，；：！？、]/;
+    const SENTENCE_END = /[。！？]/; // 句号类 → 空心圆
+    const breaks = new Map<number, boolean>();
+    let plainIdx = -1;
+    for (let i = 0; i < answer.length; i++) {
+      const ch = answer[i];
+      if (PUNCT.test(ch)) {
+        if (plainIdx >= 0) {
+          // 同位置多个标点：句号优先（视觉上句号 > 读号）。
+          const prev = breaks.get(plainIdx) || false;
+          breaks.set(plainIdx, prev || SENTENCE_END.test(ch));
+        }
+      } else {
+        plainIdx++;
+      }
+    }
+    return breaks;
+  }
+
+  // 累积模式：按 pinnedSegments 顺序解析每段为 DudouSnapshot，再把
+  // 当前段 snapshot 接到末尾（顺序须与 effectiveSelectionText 拼接顺序一致）。
+  // pinned 的 EPUB cfi 用 book.getRange 异步解析，跨章节 / 已离开当前章节
+  // 的段会失败 → 静默跳过（plainIdx 仍按 segment.text.length 推进，避免
+  // 后续 segment 的圆点错位）。
+  async function snapshotsForDudou(): Promise<{ snap: DudouSnapshot | null; textLen: number }[]> {
+    const out: { snap: DudouSnapshot | null; textLen: number }[] = [];
+    for (const seg of pinnedSegments) {
+      if (seg.cfi.startsWith("db:")) {
+        const ok = seg.cfi.split(":").length >= 5;
+        out.push({ snap: ok ? { kind: "db", cfi: seg.cfi } : null, textLen: seg.text.length });
+      } else {
+        // epub.js cfi → 重建 Range，需要章节当前 in-DOM
+        const book = bookRef.current as unknown as { getRange?: (cfi: string) => Promise<Range | null> } | null;
+        let snap: DudouSnapshot | null = null;
+        try {
+          const r = await book?.getRange?.(seg.cfi);
+          if (r && r.startContainer.ownerDocument) {
+            snap = {
+              kind: "epub",
+              doc: r.startContainer.ownerDocument,
+              sc: r.startContainer, so: r.startOffset,
+              ec: r.endContainer, eo: r.endOffset,
+            };
+          }
+        } catch { /* 段已不在当前 iframe；plainIdx 仍按 textLen 推进 */ }
+        out.push({ snap, textLen: seg.text.length });
+      }
+    }
+    const cur = snapshotForDudou();
+    out.push({ snap: cur, textLen: selectionText.length });
+    return out;
+  }
+
+  // Wrap each char of the (start, end) range in a per-char span; chars whose
+  // plain-index appears in `breaks` get a `dudou-overlay-break` class. Returns
+  // (cleanup, consumedChars) — caller accumulates consumedChars across snaps
+  // in 累积模式 to keep break indices aligned with effectiveSelectionText.
+  function applyDudouOverlayForSnap(
+    snap: DudouSnapshot,
+    breaks: Map<number, boolean>,
+    startPlainIdx: number,
+  ): { cleanup: () => void; consumed: number } | null {
+    let range: Range | null = null;
+    let doc: Document;
+    if (snap.kind === "epub") {
+      doc = snap.doc;
+      try {
+        range = doc.createRange();
+        range.setStart(snap.sc, snap.so);
+        range.setEnd(snap.ec, snap.eo);
+      } catch {
+        return null;
+      }
+    } else {
+      const host = dbReaderHostRef.current;
+      if (!host) return null;
+      doc = document;
+      const parts = snap.cfi.split(":");
+      let pidS: string, cS: number, pidE: string, cE: number;
+      if (parts[3] === "m") {
+        pidS = parts[4]; cS = Number(parts[5]); pidE = parts[6]; cE = Number(parts[7]);
+      } else {
+        pidS = parts[3]; pidE = parts[3];
+        const [a, b] = (parts[4] || "").split("-").map(Number);
+        cS = a; cE = b;
+      }
+      const allParas = Array.from(host.querySelectorAll<HTMLElement>("[data-paragraph-id]"));
+      const sIdx = allParas.findIndex((p) => p.dataset.paragraphId === pidS);
+      const eIdx = allParas.findIndex((p) => p.dataset.paragraphId === pidE);
+      if (sIdx < 0 || eIdx < 0) return null;
+      const startPara = allParas[sIdx];
+      const endPara = allParas[eIdx];
+      const findTextOffset = (para: HTMLElement, target: number): { node: Text; off: number } | null => {
+        const walker = doc.createTreeWalker(para, NodeFilter.SHOW_TEXT);
+        let pos = 0;
+        while (walker.nextNode()) {
+          const node = walker.currentNode as Text;
+          const len = (node.nodeValue || "").length;
+          if (pos + len >= target) return { node, off: target - pos };
+          pos += len;
+        }
+        return null;
+      };
+      const startLoc = findTextOffset(startPara, cS);
+      const endLoc = findTextOffset(endPara, cE);
+      if (!startLoc || !endLoc) return null;
+      try {
+        range = doc.createRange();
+        range.setStart(startLoc.node, startLoc.off);
+        range.setEnd(endLoc.node, endLoc.off);
+      } catch {
+        return null;
+      }
+    }
+    if (!range) return null;
+
+    // Collect every char position inside the range as (textNode, offset).
+    // We split text nodes char-by-char and replace each with a wrapping span,
+    // remembering enough state to undo the change cleanly.
+    const orig: { parent: Node; before: ChildNode | null; original: Text }[] = [];
+    const inserted: HTMLSpanElement[] = [];
+    const ancestor = range.commonAncestorContainer;
+    const root: Node = ancestor.nodeType === 1 ? ancestor : (ancestor.parentNode || ancestor);
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => range!.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
+    } as NodeFilter);
+    const textNodes: Text[] = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
+
+    let plainIdx = startPlainIdx;
+    let consumed = 0;
+    for (const tn of textNodes) {
+      const value = tn.nodeValue || "";
+      let from = 0;
+      let to = value.length;
+      if (tn === range.startContainer) from = range.startOffset;
+      if (tn === range.endContainer) to = range.endOffset;
+      if (to <= from) continue;
+      const slice = value.slice(from, to);
+
+      const parent = tn.parentNode;
+      if (!parent) continue;
+      const next = tn.nextSibling;
+      orig.push({ parent, before: next as ChildNode | null, original: tn });
+
+      // Replace the whole text node with: [pre-text] + per-char spans + [post-text]
+      const pre = value.slice(0, from);
+      const post = value.slice(to);
+      const frag = doc.createDocumentFragment();
+      if (pre) frag.appendChild(doc.createTextNode(pre));
+      for (let i = 0; i < slice.length; i++) {
+        const ch = slice[i];
+        const span = doc.createElement("span");
+        span.className = "dudou-overlay-char";
+        const isBreak = breaks.has(plainIdx);
+        if (isBreak) {
+          span.classList.add("dudou-overlay-break");
+          if (breaks.get(plainIdx)) span.classList.add("dudou-overlay-strong");
+        }
+        span.textContent = ch;
+        frag.appendChild(span);
+        inserted.push(span);
+        plainIdx++;
+        consumed++;
+      }
+      if (post) frag.appendChild(doc.createTextNode(post));
+      parent.replaceChild(frag, tn);
+    }
+
+    // Cleanup: replace the inserted fragments back with the original text nodes.
+    const cleanup = () => {
+      for (const span of inserted) {
+        const parent = span.parentNode;
+        if (!parent) continue;
+        parent.removeChild(span);
+      }
+      // Restore original text nodes in their original positions and merge.
+      for (const { parent, before, original } of orig) {
+        try {
+          if (before && before.parentNode === parent) parent.insertBefore(original, before);
+          else parent.appendChild(original);
+        } catch { /* best-effort */ }
+      }
+      // Clean up any leftover text nodes from pre/post split — normalize merges
+      // adjacent text nodes back together.
+      const ancestors = new Set<Node>();
+      orig.forEach((o) => ancestors.add(o.parent));
+      ancestors.forEach((n) => (n as Element).normalize?.());
+    };
+    return { cleanup, consumed };
+  }
+
+  // 顶层入口：单段 / 多段 通用。snaps 为 null 的位置仅推进 plainIdx，
+  // 表示该段不在当前可见 DOM 中（pinned EPUB 段离开了 iframe），跳过 wrap。
+  async function applyDudouOverlays(snaps: { snap: DudouSnapshot | null; textLen: number }[], answer: string): Promise<(() => void) | null> {
+    const breaks = buildDudouBreaks(answer);
+    const cleanups: Array<() => void> = [];
+    let plainIdx = 0;
+    for (const item of snaps) {
+      if (item.snap) {
+        const r = applyDudouOverlayForSnap(item.snap, breaks, plainIdx);
+        if (r) {
+          cleanups.push(r.cleanup);
+          // 用 segment.textLen 推进而不是 r.consumed —— 二者通常一致，
+          // 但取 textLen 能保证即使 wrap 部分失败 plainIdx 仍对齐。
+          plainIdx += item.textLen;
+          continue;
+        }
+      }
+      // 未渲染 / 渲染失败 → 仅推进 plainIdx。
+      plainIdx += item.textLen;
+    }
+    if (!cleanups.length) return null;
+    return () => { for (const c of cleanups) { try { c(); } catch { /* ignore */ } } };
+  }
+
+  function clearDudouOverlay() {
+    try { dudouCleanupRef.current?.(); } catch { /* ignore */ }
+    dudouCleanupRef.current = null;
+  }
+
+  // Tear down 句读 overlay whenever the rendered chapter changes (db-reader
+  // chapter switch / book switch). Without this, a stale cleanup function
+  // can hold refs to nodes that no longer exist in the DOM.
+  useEffect(() => {
+    return () => clearDudouOverlay();
+  }, [currentBookSlug, dbReaderIndex, currentChapterIndex]);
+
+  async function performAiAction(type: "translate" | "pronounce" | "explain" | "qa" | "punctuate" | "custom", customAction?: CustomAction, supplement = "") {
     if (type !== "qa" && !selectionText.trim()) {
       setAiError("请先在正文里选中一段文字。");
       return;
@@ -2388,16 +3236,29 @@ function App() {
 
     const effectiveQuestion = supplement ? `${questionDraft}\n补充说明：${supplement}` : questionDraft;
 
+    // Snapshot the selection range(s) BEFORE the await — clearSelection will
+    // wipe the live OS-level selection. 累积模式下要 snapshot 所有 pin 段 +
+    // 当前段；非累积模式下只 snapshot 当前段。
+    const dudouSnaps = type === "punctuate" ? await snapshotsForDudou() : null;
+
     try {
       setAiLoading(true);
       setAiError("");
       setAiResponse(null);
       setAiPanelTitle(
-        type === "custom" ? customAction?.name || "自定义操作" : type === "qa" ? "问答" : type === "translate" ? "翻译为现代文" : type === "pronounce" ? "读音标注" : "解释",
+        type === "custom" ? customAction?.name || "自定义操作"
+          : type === "qa" ? "问答"
+          : type === "translate" ? "翻译为现代文"
+          : type === "pronounce" ? "读音标注"
+          : type === "punctuate" ? "AI 句读"
+          : "解释",
       );
+      // 累积模式 → 用 effectiveSelectionText（拼好的总文本）发给 AI；非累积时
+      // effectiveSelectionText === selectionText。
+      const aiSelection = effectiveSelectionText;
       const response = await runAiAction({
         type,
-        selection: supplement ? `${selectionText}\n【用户补充】${supplement}` : selectionText,
+        selection: supplement ? `${aiSelection}\n【用户补充】${supplement}` : aiSelection,
         question: effectiveQuestion,
         aiSettings: {
           ...aiSettings,
@@ -2407,6 +3268,14 @@ function App() {
       });
       setAiResponse(response);
       clearSelection();
+      // Apply 句读 inline overlay AFTER clearSelection — snapshots still
+      // point at valid DOM nodes; tear down any prior overlay first so
+      // re-running 句读 doesn't stack markers.
+      if (type === "punctuate" && dudouSnaps && response?.answer) {
+        clearDudouOverlay();
+        const cleanup = await applyDudouOverlays(dudouSnaps, response.answer);
+        if (cleanup) dudouCleanupRef.current = cleanup;
+      }
     } catch (error) {
       setAiError(error instanceof Error ? error.message : "AI 操作失败。");
     } finally {
@@ -2420,7 +3289,8 @@ function App() {
       setSearchLoading(true);
       setSearchError("");
       setSearchResponse(null);
-      const response = await searchBook(searchQuery.trim(), searchMode, aiSettings);
+      // searchSlugs 空数组 = 搜全部；非空 = 仅搜这些书。
+      const response = await searchBook(searchQuery.trim(), searchMode, aiSettings, searchLimit, searchSlugs);
       startTransition(() => {
         setSearchResponse(response);
       });
@@ -2428,6 +3298,25 @@ function App() {
       setSearchError(error instanceof Error ? error.message : "搜索失败。");
     } finally {
       setSearchLoading(false);
+    }
+  }
+
+  // 点搜索结果：跨书时先 switchBook 再跳章节；同本书直接跳。
+  async function navigateToSearchResult(result: SearchResult) {
+    const targetSlug = result.bookSlug;
+    if (targetSlug && targetSlug !== currentBookSlug) {
+      await switchBook(targetSlug);
+    }
+    // EPUB 类（hasEpub）的 anchor 即 chapterHref，直接 openLocation；
+    // DB-only 类用 chapterOrder 调 loadDbReaderChapter。
+    const targetBook = readableBooks.find((b) => b.slug === (targetSlug || currentBookSlug));
+    if (targetBook?.hasEpub === false && typeof result.chapterOrder === "number") {
+      // 等下一个 frame 让 dbReaderChapters 完成 fetch（switchBook 内部已 await meta）
+      requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
+    } else if (result.chapterHref) {
+      void openLocation(result.chapterHref);
+    } else if (typeof result.chapterOrder === "number") {
+      requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
     }
   }
 
@@ -2548,6 +3437,8 @@ function App() {
     downloadTextFile("明史-书签.md", lines.join("\n"));
   }
 
+  // 助理面板的勾画记录列表已在 v1.0 隐藏（导出按钮也随之拆除），但函数本身
+  // 保留：将来如果再次给笔记/勾画面板装回 "导出摘录" 入口，可以直接复用。
   function exportHighlights() {
     const lines = [
       `# ${meta?.metadata.title || "明史"}阅读摘录`,
@@ -2567,6 +3458,7 @@ function App() {
     ];
     downloadTextFile("明史-阅读摘录.md", lines.join("\n"));
   }
+  void exportHighlights;
 
   function addCustomAction() {
     if (!newActionName.trim() || !newActionTemplate.trim()) return;
@@ -2625,23 +3517,63 @@ function App() {
               </button>
               {bookMenuOpen && (
                 <div className="book-selector-menu" role="menu">
-                  {readableBooks.map((book) => (
-                    <button
-                      key={book.slug}
-                      type="button"
-                      className={`book-selector-item ${book.slug === currentBookSlug ? "is-active" : ""}`}
-                      onClick={() => void switchBook(book.slug)}
-                      role="menuitem"
-                    >
-                      <div className="book-selector-item-title">
-                        《{book.title}》
-                        {book.hasEpub ? <span className="book-tag book-tag-epub">原典</span> : <span className="book-tag book-tag-db">检索</span>}
-                      </div>
-                      <div className="book-selector-item-meta">
-                        {(book.author || "佚名")} · 约 {formatChars(book.charCount)} 字
-                      </div>
-                    </button>
-                  ))}
+                  {/*
+                    手工指定的书目顺序（v1.0 起）：明史(底本) → 实录 → 纪事本末
+                    → 国榷 → 罪惟录 → 明通鉴 → 石匮书 → 石匮书后集 → 崇祯长编
+                    → 三朝辽事实录 → 万历野获编 → 明季北略 → 明季南略
+                    → 东林列传 → 国朝献征录 → 皇明经世文编 → 大明会典 → 大明律
+                    → 天下郡国利病书 → 廿二史札记 → 菽园杂记 → 读通鉴论
+                    → 明史(四库全书本)。不在此列表里的书目按原顺序排在最后。
+                  */}
+                  {(() => {
+                    const ORDER = [
+                      "ming-shi",
+                      "ming-shi-lu",
+                      "mingshi-jishi-benmo",
+                      "guoque",
+                      "zuiwei-lu",
+                      "ming-tong-jian",
+                      "shiku-shu",
+                      "shiku-shu-houji",
+                      "chongzhen-changbian",
+                      "sanchao-liaoshi-shilu",
+                      "wanli-yehuobian",
+                      "mingji-beilue",
+                      "mingji-nanlue",
+                      "donglin-liezhuan",
+                      "guochao-xianzhenlu",
+                      "huangming-jingshi-wenbian",
+                      "da-ming-hui-dian",
+                      "da-ming-lv",
+                      "tianxia-junguo-libingshu",
+                      "nianer-shi-zhaji",
+                      "shuyuan-zaji",
+                      "du-tong-jian-lun",
+                      "ming-shi-siku",
+                    ];
+                    const idx = (slug: string) => {
+                      const i = ORDER.indexOf(slug);
+                      return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+                    };
+                    const sorted = [...readableBooks].sort((a, b) => idx(a.slug) - idx(b.slug));
+                    return sorted.map((book) => (
+                      <button
+                        key={book.slug}
+                        type="button"
+                        className={`book-selector-item ${book.slug === currentBookSlug ? "is-active" : ""}`}
+                        onClick={() => void switchBook(book.slug)}
+                        role="menuitem"
+                      >
+                        <div className="book-selector-item-title">
+                          《{book.title}》
+                          {book.hasEpub ? <span className="book-tag book-tag-epub">原典</span> : <span className="book-tag book-tag-db">检索</span>}
+                        </div>
+                        <div className="book-selector-item-meta">
+                          {(book.author || "佚名")} · 约 {formatChars(book.charCount)} 字
+                        </div>
+                      </button>
+                    ));
+                  })()}
                 </div>
               )}
             </div>
@@ -2651,7 +3583,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v0.4.1</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.1</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -2746,14 +3678,75 @@ function App() {
                   placeholder={'输入关键词、句子，或用模糊意图搜索，例如\u300c朱元璋少年经历\u300d\u300c海禁相关记载\u300d'}
                 />
                 <div className="inline-actions">
-                  <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as "hybrid" | "ai")} className="select-input">
-                    <option value="hybrid">本地模糊检索</option>
+                  <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as "local" | "fuzzy" | "ai")} className="select-input">
+                    <option value="local">本地检索</option>
+                    <option value="fuzzy">模糊检索</option>
                     <option value="ai">AI 意图检索</option>
                   </select>
+                  <label style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", fontSize: "0.78rem" }}>
+                    最多
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      step={10}
+                      value={searchLimit}
+                      onChange={(e) => {
+                        const v = Number.parseInt(e.target.value, 10);
+                        if (!Number.isNaN(v) && v > 0 && v <= 500) setSearchLimit(v);
+                      }}
+                      style={{ width: "4.5rem", padding: "0.18rem 0.3rem" }}
+                    />
+                    条
+                  </label>
                   <button type="button" className="primary-button" onClick={handleSearch} disabled={searchLoading}>
                     {searchLoading ? "检索中…" : "开始搜索"}
                   </button>
                 </div>
+                {(searchMode === "local" || searchMode === "fuzzy") && (
+                  <details
+                    open={searchScopeOpen}
+                    onToggle={(e) => setSearchScopeOpen((e.target as HTMLDetailsElement).open)}
+                    style={{ background: "rgba(110,66,23,0.04)", border: "1px solid rgba(110,66,23,0.18)", borderRadius: 6, padding: "0.4rem 0.6rem" }}
+                  >
+                    <summary style={{ cursor: "pointer", fontSize: "0.78rem" }}>
+                      检索范围：{searchSlugs.length === 0
+                        ? `全部（${readableBooks.length} 部）`
+                        : `${searchSlugs.length} / ${readableBooks.length} 部`}
+                    </summary>
+                    <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem", marginTop: "0.5rem" }}>
+                      <button
+                        type="button"
+                        className={`ghost-button compact-button ${searchSlugs.length === 0 ? "is-active" : ""}`}
+                        style={searchSlugs.length === 0 ? { background: "rgba(110,66,23,0.16)", borderColor: "rgba(110,66,23,0.22)" } : {}}
+                        onClick={() => setSearchSlugs([])}
+                      >
+                        全部
+                      </button>
+                      {readableBooks.map((book) => {
+                        const checked = searchSlugs.includes(book.slug);
+                        return (
+                          <button
+                            key={book.slug}
+                            type="button"
+                            className={`ghost-button compact-button ${checked ? "is-active" : ""}`}
+                            style={checked ? { background: "rgba(110,66,23,0.16)", borderColor: "rgba(110,66,23,0.22)" } : {}}
+                            onClick={() => {
+                              setSearchSlugs((prev) => {
+                                if (prev.includes(book.slug)) {
+                                  return prev.filter((s) => s !== book.slug);
+                                }
+                                return [...prev, book.slug];
+                              });
+                            }}
+                          >
+                            {book.title}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </details>
+                )}
                 {searchError && <div className="error-box">{searchError}</div>}
                 {searchResponse?.aiExpansion?.note && <div className="info-box">{searchResponse.aiExpansion.note}</div>}
                 {searchResponse && (
@@ -2768,9 +3761,14 @@ function App() {
                           key={result.id}
                           type="button"
                           className="result-card"
-                          onClick={() => openLocation(result.chapterHref)}
+                          onClick={() => void navigateToSearchResult(result)}
                         >
-                          <div className="result-title">{result.chapterTitle}</div>
+                          <div className="result-title">
+                            {result.bookTitle && (
+                              <span className="muted-text" style={{ fontSize: "0.72rem", marginRight: "0.4rem" }}>《{result.bookTitle}》</span>
+                            )}
+                            {result.chapterTitle}
+                          </div>
                           <div className="result-snippet">{result.snippet}</div>
                           {result.years.length > 0 && (
                             <div className="tag-row">
@@ -2802,32 +3800,140 @@ function App() {
                   </button>
                 </div>
               </div>
+              <div className="stack-gap compact" style={{ marginBottom: "0.6rem" }}>
+                <label className="field-label">
+                  排序
+                  <select className="select-input" value={notesSort} onChange={(e) => setNotesSort(e.target.value as typeof notesSort)}>
+                    <option value="created-desc">按记笔记时间（新→旧）</option>
+                    <option value="created-asc">按记笔记时间（旧→新）</option>
+                    <option value="historical-asc">按历史时间（早→晚）</option>
+                    <option value="historical-desc">按历史时间（晚→早）</option>
+                    <option value="book">按书目分组</option>
+                  </select>
+                </label>
+                <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem" }}>
+                  <input
+                    type="number"
+                    className="text-input"
+                    style={{ flex: 1, minWidth: "5rem" }}
+                    placeholder="历史年起"
+                    value={notesYearMin}
+                    onChange={(e) => setNotesYearMin(e.target.value)}
+                  />
+                  <input
+                    type="number"
+                    className="text-input"
+                    style={{ flex: 1, minWidth: "5rem" }}
+                    placeholder="历史年止"
+                    value={notesYearMax}
+                    onChange={(e) => setNotesYearMax(e.target.value)}
+                  />
+                </div>
+                <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem" }}>
+                  <input
+                    type="date"
+                    className="text-input"
+                    style={{ flex: 1, minWidth: "8rem" }}
+                    value={notesCreatedMin}
+                    onChange={(e) => setNotesCreatedMin(e.target.value)}
+                    title="记笔记时间下限"
+                  />
+                  <input
+                    type="date"
+                    className="text-input"
+                    style={{ flex: 1, minWidth: "8rem" }}
+                    value={notesCreatedMax}
+                    onChange={(e) => setNotesCreatedMax(e.target.value)}
+                    title="记笔记时间上限"
+                  />
+                </div>
+              </div>
               <div className="result-list">
-                {notes.length === 0 && <div className="empty-state">先在正文里选段，再点"记笔记"。</div>}
-                {notes.map((note) => {
-                  const isExpanded = expandedNoteId === note.id;
-                  const preview = note.note.length > 30 ? note.note.slice(0, 30) + "…" : note.note;
-                  return (
-                    <div key={note.id} className="result-card static-card">
-                      <button type="button" className="note-summary-row" onClick={() => setExpandedNoteId(isExpanded ? null : note.id)}>
-                        <span className="note-time">{formatTime(note.createdAt)}</span>
-                        <span className="note-preview">{preview}</span>
-                        <span className="note-expand-icon">{isExpanded ? "▾" : "▸"}</span>
-                      </button>
-                      {isExpanded && (
-                        <div className="note-detail">
-                          <div className="result-snippet">{note.text}</div>
-                          <div className="note-body">{note.note}</div>
-                          <div className="inline-actions">
-                            <button type="button" className="ghost-button" onClick={() => openLocation(note.cfiRange)}>回到原文</button>
-                            <button type="button" className="ghost-button" onClick={() => { setEditingNoteId(note.id); setNoteDraft(note.note); setNoteComposerOpen(true); }}>编辑</button>
-                            <button type="button" className="ghost-button danger" onClick={() => { setNotes((current) => current.filter((item) => item.id !== note.id)); setExpandedNoteId(null); }}>删除</button>
+                {(() => {
+                  // Filter
+                  const minY = notesYearMin ? parseInt(notesYearMin, 10) : null;
+                  const maxY = notesYearMax ? parseInt(notesYearMax, 10) : null;
+                  const minC = notesCreatedMin ? new Date(notesCreatedMin).getTime() : null;
+                  const maxC = notesCreatedMax ? new Date(notesCreatedMax).getTime() + 24 * 3600 * 1000 : null;
+                  let list = notes.filter((n) => {
+                    if (minY != null || maxY != null) {
+                      const y = n.historicalYear;
+                      if (y == null) return false;
+                      if (minY != null && y < minY) return false;
+                      if (maxY != null && y > maxY) return false;
+                    }
+                    if (minC != null || maxC != null) {
+                      const t = new Date(n.createdAt).getTime();
+                      if (minC != null && t < minC) return false;
+                      if (maxC != null && t > maxC) return false;
+                    }
+                    return true;
+                  });
+                  // Sort
+                  if (notesSort === "created-desc") list = [...list].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+                  else if (notesSort === "created-asc") list = [...list].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+                  else if (notesSort === "historical-asc") list = [...list].sort((a, b) => (a.historicalYear ?? 9999) - (b.historicalYear ?? 9999));
+                  else if (notesSort === "historical-desc") list = [...list].sort((a, b) => (b.historicalYear ?? -9999) - (a.historicalYear ?? -9999));
+                  else if (notesSort === "book") {
+                    list = [...list].sort((a, b) => (a.bookSlug || "").localeCompare(b.bookSlug || "") || b.createdAt.localeCompare(a.createdAt));
+                  }
+
+                  if (list.length === 0) return <div className="empty-state">先在正文里选段，再点"记笔记"。</div>;
+                  // For "book" sort, render group headers
+                  const groupedByBook = notesSort === "book";
+                  const out: React.ReactNode[] = [];
+                  let lastBook = "";
+                  for (const note of list) {
+                    if (groupedByBook && note.bookSlug !== lastBook) {
+                      lastBook = note.bookSlug || "";
+                      const bookTitle = readableBooks.find((b) => b.slug === lastBook)?.title || lastBook || "（未指定书目）";
+                      out.push(
+                        <div key={`group-${lastBook}`} className="muted-text" style={{ padding: "0.4rem 0", fontSize: "0.78rem", fontWeight: 600 }}>
+                          《{bookTitle}》
+                        </div>,
+                      );
+                    }
+                    const isExpanded = expandedNoteId === note.id;
+                    const preview = note.note.length > 30 ? note.note.slice(0, 30) + "…" : note.note;
+                    out.push(
+                      <div key={note.id} className="result-card static-card">
+                        <button type="button" className="note-summary-row" onClick={() => setExpandedNoteId(isExpanded ? null : note.id)}>
+                          <span className="note-time">{formatTime(note.createdAt)}</span>
+                          <span className="note-preview">{preview}</span>
+                          <span className="note-expand-icon">{isExpanded ? "▾" : "▸"}</span>
+                        </button>
+                        {note.historicalAt && (
+                          <div className="muted-text" style={{ fontSize: "0.7rem", padding: "0 0.6rem 0.2rem" }}>
+                            史时：{note.historicalAt}
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                        )}
+                        {isExpanded && (
+                          <div className="note-detail">
+                            <div className="result-snippet">{note.text}</div>
+                            <div className="note-body">{note.note}</div>
+                            <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem" }}>
+                              <button type="button" className="ghost-button" onClick={() => openLocation(note.cfiRange)}>回到原文</button>
+                              <button type="button" className="ghost-button" onClick={() => { setEditingNoteId(note.id); setNoteDraft(note.note); setNoteComposerOpen(true); }}>编辑</button>
+                              {/* 一键切换 在时间线显示，无需进 编辑 弹窗 */}
+                              <button
+                                type="button"
+                                className="ghost-button"
+                                onClick={() => {
+                                  setNotes((cur) => cur.map((it) => it.id === note.id ? { ...it, inTimeline: !it.inTimeline } : it));
+                                }}
+                                title={note.inTimeline ? "从历史时间线中隐藏" : "在历史时间线中显示"}
+                              >
+                                {note.inTimeline ? "从历史时间线隐藏" : "加入历史时间线"}
+                              </button>
+                              <button type="button" className="ghost-button danger" onClick={() => { setNotes((current) => current.filter((item) => item.id !== note.id)); setExpandedNoteId(null); }}>删除</button>
+                            </div>
+                          </div>
+                        )}
+                      </div>,
+                    );
+                  }
+                  return out;
+                })()}
               </div>
             </div>
           )}
@@ -2906,9 +4012,9 @@ function App() {
                   <MapPinned size={16} />
                   <span>古今地名地图</span>
                 </button>
-                <button type="button" className="resource-entry-button" onClick={() => void openTimelinePanel()}>
+                <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("history-timeline")}>
                   <History size={16} />
-                  <span>时间轴</span>
+                  <span>历史时间线</span>
                 </button>
               </div>
             </div>
@@ -2981,13 +4087,10 @@ function App() {
                     <option value="traditional">繁体</option>
                   </select>
                 </label>
-                <label className="field-label">
-                  虚拟翻页分栏
-                  <select className="select-input" value={pageSpread} onChange={(event) => setPageSpread(event.target.value as "single" | "double")}>
-                    <option value="single">单栏分页</option>
-                    <option value="double">双栏对开分页</option>
-                  </select>
-                </label>
+                {/* 「虚拟翻页分栏」设置 v1.0.2 起隐藏：双栏在窄屏 / 高字号 +
+                    长行时容易把段落截到栏外、挤压可读性。state（pageSpread /
+                    setPageSpread）和持久化保留，将来要再 expose 直接把这段
+                    label 放回来即可。 */}
                 <div className="divider" />
                 <div className="panel-headline small">
                   <Highlighter size={14} />
@@ -3002,14 +4105,49 @@ function App() {
                     <option value="green">护眼绿</option>
                   </select>
                 </label>
+                {/*
+                  字体下拉顺序按用户指定：
+                    系统宋体 / 系统仿宋
+                    京华老宋 / 汇文仿宋 / 汇文正楷 / 汇文明朝 / 霞鹜文楷
+                    方正永乐大典 / 方正瘦金 / 方正礼器碑
+                  正文字体默认 mingchao（汇文明朝），界面字体默认 zhengkai（汇文正楷）
+                */}
                 <label className="field-label">
                   正文字体
-                  <select className="select-input" value={readerFontFamily} onChange={(e) => setReaderFontFamily(e.target.value as "serif" | "fangsong" | "kaiti" | "lishu" | "shoujin")}>
-                    <option value="serif">宋体（系统）</option>
-                    <option value="fangsong">仿宋（系统）</option>
-                    <option value="kaiti">楷书（霞鹜文楷·内置）</option>
-                    <option value="lishu">隶书（系统）</option>
-                    <option value="shoujin">瘦金体（方正·内置）</option>
+                  <select
+                    className="select-input"
+                    value={readerFontFamily}
+                    onChange={(e) => setReaderFontFamily(e.target.value as typeof readerFontFamily)}
+                  >
+                    <option value="system-songti">系统宋体</option>
+                    <option value="system-fangsong">系统仿宋</option>
+                    <option value="songti">宋體（京华老宋·内置）</option>
+                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
+                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
+                    <option value="mingchao">明體（匯文明朝·内置）</option>
+                    <option value="xiawu">霞鹜文楷（内置）</option>
+                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
+                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
+                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
+                  </select>
+                </label>
+                <label className="field-label">
+                  界面字体
+                  <select
+                    className="select-input"
+                    value={uiFontFamily}
+                    onChange={(e) => setUiFontFamily(e.target.value as typeof uiFontFamily)}
+                  >
+                    <option value="system-songti">系统宋体</option>
+                    <option value="system-fangsong">系统仿宋</option>
+                    <option value="songti">宋體（京华老宋·内置）</option>
+                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
+                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
+                    <option value="mingchao">明體（匯文明朝·内置）</option>
+                    <option value="xiawu">霞鹜文楷（内置）</option>
+                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
+                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
+                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
                   </select>
                 </label>
                 <label className="field-label">
@@ -3199,46 +4337,58 @@ function App() {
             </div>
           </div>
           <div className="selection-card">
-            <div className="selection-title">当前选段</div>
-            <div className="selection-body">{selectionText || "在正文中选中一段内容后，可一键翻译为现代文、标音、解释、做笔记或进行史料比对。"}</div>
-            <div className="action-grid">
-              <button type="button" className="ghost-button" onClick={() => void requestAiAction("translate")} disabled={!hasSelection || aiLoading}>
-                <Languages size={15} />
-                现代文
-              </button>
-              <button type="button" className="ghost-button" onClick={() => void requestAiAction("pronounce")} disabled={!hasSelection || aiLoading}>
-                <Mic size={15} />
-                读音
-              </button>
-              <button type="button" className="ghost-button" onClick={() => void requestAiAction("explain")} disabled={!hasSelection || aiLoading}>
-                <Brain size={15} />
-                解释
-              </button>
-              <button type="button" className="ghost-button" onClick={() => void handleReferenceLookup()} disabled={!hasSelection || lookupLoading}>
-                <MapPinned size={15} />
-                百科
-              </button>
-              <button type="button" className="ghost-button" onClick={() => void requestCrossCompare()} disabled={!hasSelection || compareLoading}>
-                <LibraryBig size={15} />
-                史料比对
-              </button>
-              <button type="button" className="ghost-button" onClick={startNoteComposer} disabled={!hasSelection}>
-                <NotebookPen size={15} />
-                记笔记
-              </button>
+            <div className="selection-title" style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexWrap: "wrap" }}>
+              <span>当前选段{pinnedSegments.length > 0 && <span className="muted-text" style={{ fontSize: "0.72rem", marginLeft: "0.4rem" }}>（已累积 {pinnedSegments.length + 1} 段）</span>}</span>
+              {/* 「保留」累积开关 — 默认关；开启后新选段不替换旧选段，而是追加。
+                  用以解决 EPUB / DB-reader 跨页跨章选段无法被一次 OS-level
+                  selection 覆盖的问题。开关关掉 / 「清空」按钮 都会清光 buffer。 */}
+              <label className="toggle-row" style={{ marginLeft: "auto", fontSize: "0.72rem", gap: "0.3rem" }} title="开启后新选段不清空旧选段，而是接在后面；AI/笔记/勾画等动作对累积后的整段生效。关掉或点清空才会重置。">
+                <input
+                  type="checkbox"
+                  checked={accumulateMode}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setAccumulateMode(on);
+                    if (!on) setPinnedSegments([]); // 关掉 → 清光累积 buffer
+                  }}
+                />
+                <span>保留</span>
+              </label>
+              {(hasSelection || pinnedSegments.length > 0) && (
+                <button
+                  type="button"
+                  className="ghost-button compact-button"
+                  style={{ fontSize: "0.72rem" }}
+                  onClick={clearSelectionAndPinned}
+                  title="清空当前选段（含已累积段）"
+                >
+                  清空
+                </button>
+              )}
             </div>
-            {customActions.filter((a) => a.id !== "vernacular" && a.name !== "结构梳理" && a.name !== "翻译为现代文").slice(0, 3).map((action) => (
-              <button
-                key={action.id}
-                type="button"
-                className="secondary-button full-width"
-                onClick={() => void requestAiAction("custom", action)}
-                disabled={!hasSelection || aiLoading}
-              >
-                <Sparkles size={15} />
-                {action.name}
-              </button>
-            ))}
+            <div className="selection-body">
+              {pinnedSegments.length > 0 && (
+                <div style={{ marginBottom: "0.4rem" }}>
+                  {pinnedSegments.map((s, i) => (
+                    <div key={i} className="muted-text" style={{ fontSize: "0.78rem", padding: "0.15rem 0", borderLeft: "2px solid rgba(110,66,23,0.18)", paddingLeft: "0.5rem" }}>
+                      <span style={{ opacity: 0.6 }}>#{i + 1} </span>{s.text}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {selectionText
+                ? (pinnedSegments.length > 0
+                    ? <div style={{ borderLeft: "2px solid #d4231b", paddingLeft: "0.5rem" }}><span className="muted-text" style={{ fontSize: "0.78rem", opacity: 0.7 }}>#{pinnedSegments.length + 1}（最新）</span><div>{selectionText}</div></div>
+                    : selectionText)
+                : "在正文中选中一段内容后，可在悬浮工具栏中一键翻译、标音、解释、做笔记或进行史料比对。"}
+            </div>
+            {/*
+              v1.0 起隐藏「当前选段」卡片下方的 7 个 action 按钮（现代文 /
+              读音 / 解释 / 百科 / 史料比对 / AI 句读 / 记笔记）—— 它们与
+              悬浮选段工具栏（在 selection-overlay.visible 时显示）的入口
+              重复，而工具栏本来就贴着选段位置弹出，更顺手。自定义 AI 操作
+              的 secondary-button 同此理，跟着隐藏。
+            */}
           </div>
 
           <div className="question-box">
@@ -3270,7 +4420,38 @@ function App() {
               <Sparkles size={16} />
               <span>{aiPanelTitle}</span>
             </div>
-            <div className="answer-card">{aiLoading ? "AI 正在思考…" : aiResponse?.answer || ""}</div>
+            {aiPanelTitle === "AI 句读" && !aiLoading && aiResponse?.answer ? (
+              // 标注规范：读号 (，、；：) → 实心红圆，句号 (。！？) → 空心红圆。
+              // 标点字符自身不渲染；前一个汉字下方加圆点（古书圈点样式）。
+              // 仅在右栏展示，不入笔记 / 勾画。
+              (() => {
+                const PUNCT = /[·。，；：！？、]/;
+                const SENTENCE_END = /[。！？]/;
+                const chars = aiResponse.answer.match(/[\s\S]/g) || [];
+                const out: React.ReactNode[] = [];
+                for (let i = 0; i < chars.length; i++) {
+                  const ch = chars[i];
+                  if (PUNCT.test(ch)) continue; // hide marker
+                  const next = chars[i + 1] || "";
+                  if (PUNCT.test(next)) {
+                    const cls = SENTENCE_END.test(next) ? "dudou-char dudou-break dudou-strong" : "dudou-char dudou-break";
+                    out.push(<span key={i} className={cls}>{ch}</span>);
+                  } else {
+                    out.push(<span key={i} className="dudou-char">{ch}</span>);
+                  }
+                }
+                return <div className="answer-card dudou-card">{out}</div>;
+              })()
+            ) : (
+              <div
+                className="answer-card markdown-body"
+                dangerouslySetInnerHTML={{
+                  __html: aiLoading
+                    ? "AI 正在思考…"
+                    : renderMarkdown(aiResponse?.answer || ""),
+                }}
+              />
+            )}
             {aiResponse?.contextSnippets?.length ? (
               <div className="context-list">
                 {aiResponse.contextSnippets.map((item) => (
@@ -3291,11 +4472,16 @@ function App() {
               <MapPinned size={16} />
               <span>划词百科</span>
             </div>
-            <div className="answer-card">
-              {lookupLoading
-                ? "正在检索本地资料并请求 AI 释义…"
-                : referenceLookup?.aiExplanation || "选中官职、人物、地名、年号后，可一键查看百科说明。"}
-            </div>
+            <div
+              className="answer-card markdown-body"
+              dangerouslySetInnerHTML={{
+                __html: lookupLoading
+                  ? "正在检索本地资料并请求 AI 释义…"
+                  : referenceLookup?.aiExplanation
+                    ? renderMarkdown(referenceLookup.aiExplanation)
+                    : "选中官职、人物、地名、年号后，可一键查看百科说明。",
+              }}
+            />
             {referenceLookup?.reignMatch && (
               <div className="tag-row">
                 <span className="soft-tag">
@@ -3432,7 +4618,16 @@ function App() {
 
       {selectionOverlay.visible && (
         <>
-        <div className="selection-backdrop" onClick={clearSelection} />
+        {/*
+          点 backdrop 仅折叠工具栏 UI，不清空选段（selectionText / cfi /
+          OS-level range 都保留）。这样用户：
+            - 选好段后想看右侧助理面板的具体动作（百科/史料比对等）—
+              点空白处工具栏让位，但选段还在，按钮仍 hasSelection=true 可点
+            - 之前我把 clearSelection 写到这儿，导致一点别处选段就被全清，
+              和"再次勾画前不会自动清空"的产品预期相违。
+          想真清空就用工具栏左侧的 ✕ 按钮（仍调 clearSelection）。
+        */}
+        <div className="selection-backdrop" onClick={() => setSelectionOverlay((p) => ({ ...p, visible: false }))} />
         <div className="selection-toolbar" style={{ top: selectionOverlay.top, left: selectionOverlay.left }}>
           <button type="button" className="toolbar-mini close-mini" onClick={clearSelection} title="关闭">
             <X size={14} />
@@ -3463,10 +4658,11 @@ function App() {
           )}
           <button type="button" className="toolbar-mini" onClick={() => { setAssistantCollapsed(false); noteInputRef.current?.focus(); }}>笔记</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("pronounce")} disabled={aiLoading}>读音</button>
-          <button type="button" className="toolbar-mini" onClick={handleResolveSelectionDate}>识别日期</button>
+          <button type="button" className="toolbar-mini" onClick={() => void handleResolveSelectionDate()}>识别日期</button>
           <button type="button" className="toolbar-mini" onClick={() => void handleReferenceLookup()} disabled={lookupLoading}>百科</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestCrossCompare()} disabled={compareLoading}>史料比对</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("translate")} disabled={aiLoading}>现代文</button>
+          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("punctuate")} disabled={aiLoading}>AI 句读</button>
           <button type="button" className="toolbar-mini" onClick={() => void speakText(selectionText)}>朗读</button>
           {ttsStatus && (
             <>
@@ -3488,6 +4684,7 @@ function App() {
                 {openResourcePanel === "familytree" && "主支三代谱系"}
                 {openResourcePanel === "officials" && "职官制度与检索"}
                 {openResourcePanel === "map" && "古今地名地图"}
+                {openResourcePanel === "history-timeline" && "历史时间线"}
                 {openResourcePanel === "custom-actions" && "自定义 AI 操作"}
               </span>
               <button type="button" className="ghost-button compact-button" onClick={() => setOpenResourcePanel(null)}>关闭</button>
@@ -3509,10 +4706,24 @@ function App() {
                   <button type="button" className="secondary-button" onClick={() => void loadPersonChronology(true)} disabled={personLoading}>
                     {personLoading ? "AI 编年中…" : "AI 编年"}
                   </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setBaikeQuery(personQuery.trim())}
+                    disabled={!personQuery.trim()}
+                    title="在内置窗口中打开百度百科条目"
+                  >
+                    百度百科
+                  </button>
                 </div>
                 {aiError && <div className="error-box">{aiError}</div>}
                 {personLoading && <div className="muted-text">检索《明史》并请 AI 整理中，通常 30–60 秒…</div>}
-                {personChronology?.summary && <div className="answer-card">{personChronology.summary}</div>}
+                {personChronology?.summary && (
+                  <div
+                    className="answer-card markdown-body"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(personChronology.summary) }}
+                  />
+                )}
                 <div className="result-list compact">
                   {personChronology?.items.slice(0, 8).map((item) => (
                     <button key={item.id} type="button" className="result-card" onClick={() => { openLocation(item.chapterHref); setOpenResourcePanel(null); }}>
@@ -3521,6 +4732,41 @@ function App() {
                     </button>
                   ))}
                 </div>
+                {baikeQuery && (
+                  <div className="stack-gap" style={{ marginTop: "0.6rem" }}>
+                    <div className="inline-actions" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: "0.4rem" }}>
+                      <span className="muted-text">百度百科 · {baikeQuery}（嵌入预览）</span>
+                      <div className="inline-actions" style={{ gap: "0.3rem" }}>
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          onClick={() => window.open(`https://baike.baidu.com/item/${encodeURIComponent(baikeQuery)}`, "_blank", "noopener,noreferrer")}
+                        >
+                          新窗口打开
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button compact-button"
+                          onClick={() => setBaikeQuery("")}
+                          title="关闭嵌入面板"
+                        >
+                          关闭
+                        </button>
+                      </div>
+                    </div>
+                    <div className="muted-text" style={{ fontSize: "0.74rem", marginTop: "-0.4rem" }}>
+                      若下方嵌入页空白或被反第三方 cookie 拦截，请用「新窗口打开」按钮在浏览器外部访问。
+                    </div>
+                    <iframe
+                      key={baikeQuery}
+                      src={`https://baike.baidu.com/item/${encodeURIComponent(baikeQuery)}`}
+                      className="hgis-iframe"
+                      title={`百度百科 - ${baikeQuery}`}
+                      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
+                      referrerPolicy="no-referrer-when-downgrade"
+                    />
+                  </div>
+                )}
               </div>
             )}
 
@@ -3825,6 +5071,31 @@ function App() {
               </div>
             )}
 
+            {openResourcePanel === "history-timeline" && (
+              <HistoryTimelinePanel
+                notes={notes}
+                readableBooks={readableBooks}
+                onNoteClick={(n) => {
+                  // Jump to the chapter at the note's saved CFI. If the note
+                  // belongs to a different book, switch first; otherwise
+                  // openLocation directly. Close the resource panel so the
+                  // reader is immediately visible.
+                  setOpenResourcePanel(null);
+                  if (n.bookSlug && n.bookSlug !== currentBookSlug) {
+                    void switchBook(n.bookSlug).then(() => {
+                      // After the switchBook promise settles the new book's
+                      // rendition should be ready; openLocation queues the
+                      // CFI display.
+                      window.setTimeout(() => openLocation(n.cfiRange), 200);
+                    });
+                  } else {
+                    openLocation(n.cfiRange);
+                  }
+                  setExpandedNoteId(n.id);
+                }}
+              />
+            )}
+
             {openResourcePanel === "custom-actions" && (
               <div className="stack-gap">
                 <div className="muted-text">创建自定义 AI 操作，可在阅读器选段后使用。</div>
@@ -4080,7 +5351,7 @@ function App() {
 
       {noteComposerOpen && (
         <div className="modal-backdrop">
-          <div className="modal-card">
+          <div className="modal-card" style={{ maxWidth: "36rem" }}>
             <div className="panel-headline">
               <NotebookPen size={18} />
               <span>{editingNoteId ? "编辑笔记" : "添加笔记"}</span>
@@ -4093,6 +5364,104 @@ function App() {
               onChange={(event) => setNoteDraft(event.target.value)}
               placeholder="写下你的理解、疑问或联想"
             />
+            {/*
+              历史时间线集成：用户可以勾选把这条笔记加进 历史时间线 panel。
+              年/月/日 默认填的是从选段及其上下文自动检测出来的时间（基于
+              resolveSelectionDate 的年号→公历换算），允许手工覆盖。
+              重要度 1-5 与官方事件 scale 对齐，类别默认"我的笔记"（暖橙色）。
+            */}
+            <details className="prince-section" open={tlDraftEnabled}>
+              <summary style={{ cursor: "pointer" }}>
+                <label className="inline-actions" style={{ gap: "0.4rem", alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={tlDraftEnabled}
+                    onChange={(e) => { e.stopPropagation(); setTlDraftEnabled(e.target.checked); }}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  <span>在历史时间线中显示这条笔记</span>
+                </label>
+              </summary>
+              <div className="stack-gap" style={{ paddingTop: "0.5rem" }}>
+                <div className="muted-text" style={{ fontSize: "0.74rem" }}>
+                  时间默认按选段上下文自动检测，可手工覆盖（只填年也可以）。
+                </div>
+                <div className="inline-actions" style={{ gap: "0.4rem", flexWrap: "wrap" }}>
+                  <label className="field-label" style={{ flex: 1, minWidth: "5rem" }}>
+                    <span className="muted-text" style={{ fontSize: "0.72rem" }}>年</span>
+                    <input
+                      type="number"
+                      className="text-input"
+                      value={tlDraftYear}
+                      onChange={(e) => setTlDraftYear(e.target.value)}
+                      placeholder="如 1573"
+                    />
+                  </label>
+                  <label className="field-label" style={{ flex: 1, minWidth: "4rem" }}>
+                    <span className="muted-text" style={{ fontSize: "0.72rem" }}>月（可选）</span>
+                    <input
+                      type="number"
+                      className="text-input"
+                      min={1}
+                      max={12}
+                      value={tlDraftMonth}
+                      onChange={(e) => setTlDraftMonth(e.target.value)}
+                    />
+                  </label>
+                  <label className="field-label" style={{ flex: 1, minWidth: "4rem" }}>
+                    <span className="muted-text" style={{ fontSize: "0.72rem" }}>日（可选）</span>
+                    <input
+                      type="number"
+                      className="text-input"
+                      min={1}
+                      max={31}
+                      value={tlDraftDay}
+                      onChange={(e) => setTlDraftDay(e.target.value)}
+                    />
+                  </label>
+                </div>
+                <div className="inline-actions" style={{ gap: "0.4rem", flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+                    <span className="muted-text" style={{ fontSize: "0.72rem" }}>重要度（1-5，默认 1）</span>
+                    <select
+                      className="select-input"
+                      value={String(tlDraftScale)}
+                      onChange={(e) => setTlDraftScale(parseInt(e.target.value, 10))}
+                    >
+                      <option value="1">1 - 一般</option>
+                      <option value="2">2 - 较重要</option>
+                      <option value="3">3 - 重要</option>
+                      <option value="4">4 - 很重要</option>
+                      <option value="5">5 - 大事</option>
+                    </select>
+                  </label>
+                  <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+                    <span className="muted-text" style={{ fontSize: "0.72rem" }}>事件类别</span>
+                    <select
+                      className="select-input"
+                      value={tlDraftCategory}
+                      onChange={(e) => setTlDraftCategory(e.target.value)}
+                    >
+                      <option value="我的笔记">我的笔记</option>
+                      {HISTORY_CATEGORIES.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <label className="field-label">
+                  <span className="muted-text" style={{ fontSize: "0.72rem" }}>时间线显示标题（留空则用笔记前 20 字）</span>
+                  <input
+                    type="text"
+                    className="text-input"
+                    value={tlDraftTitle}
+                    onChange={(e) => setTlDraftTitle(e.target.value)}
+                    placeholder="可选 · 用于在时间线轴上展示"
+                    maxLength={40}
+                  />
+                </label>
+              </div>
+            </details>
             <div className="inline-actions">
               <button type="button" className="ghost-button" onClick={() => { setNoteComposerOpen(false); setEditingNoteId(null); }}>
                 取消
@@ -4120,7 +5489,7 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v0.4.1</p>
+              <p><strong>版本：</strong>v1.1（2026-05-09）— 石匱書本紀卷1-17 &amp; 石匱書後集卷1-63 OCR &amp; 粗點校。詳見 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
               <p><strong>使用说明：</strong></p>
               <ul>
                 <li>首次进入软件请打开右上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
@@ -4132,10 +5501,16 @@ function App() {
                 <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对</li>
                 <li>职官检索 / 人物编年 / 皇帝世系 / 年号公元换算 / 古今地名地图</li>
                 <li>农历⇄公历精确换算（含干支日）；选段「识别日期」按钮自动追溯前文上下文</li>
-                <li>4 套阅读主题、5 款字体、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
+                <li>4 套阅读主题、10 款字体（界面/正文独立可选）、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
                 <li>自定义 AI 供应商（URL + Key + 模型组）— 不同模型用不同家的 key</li>
               </ul>
-              <p><strong>数据声明：</strong>古籍文本来自互联网公开资源，版权归原始来源所有。AI 回答仅供参考。本软件仅供个人学习研究使用。</p>
+              <p><strong>数据声明：</strong></p>
+              <ul>
+                <li>正文/古籍文本来自互联网公开资源（Wikisource、CText 等）+ 个人整理 + 基于公开资源的 OCR 处理（PaddleOCR-VL / MinerU + Claude Sonnet 重写）。版权归原始来源所有。</li>
+                <li>历史时间线数据：《中国历史大事年表 古代及中世纪史部分》（吉林师范大学历史系，中国古代及中世纪史教研室 编）OCR 扫描版本，仅引用，原始版权归编者所有。</li>
+                <li>字体：内置 8 款中文字体许可不一，绝大多数开源（霞鹜文楷 / 汇文系列 / 京华老宋 等），方正系列（永乐大典楷体 / 瘦金 / 礼器碑）仅个人非商用授权。具体许可请查发行方原始声明。</li>
+                <li>AI 回答仅供参考。本软件仅供个人学习研究使用，不得用于商业用途。</li>
+              </ul>
             </div>
             <div className="inline-actions">
               <button type="button" className="primary-button" onClick={() => setAboutOpen(false)}>关闭</button>
@@ -4449,6 +5824,640 @@ function MingGeographyMap({ places }: { places: GeocodePlace[] }) {
     <div className="map-shell">
       <div ref={containerRef} className="leaflet-map" />
       {!places.length && <div className="map-empty">输入地名后将在这里标点显示。</div>}
+    </div>
+  );
+}
+
+// Map a Ming reign name → its (startYear, endYear) for the "按年号" filter.
+const MING_REIGN_RANGES: { reign: string; from: number; to: number }[] = [
+  { reign: "洪武", from: 1368, to: 1398 },
+  { reign: "建文", from: 1399, to: 1402 },
+  { reign: "永乐", from: 1403, to: 1424 },
+  { reign: "洪熙", from: 1425, to: 1425 },
+  { reign: "宣德", from: 1426, to: 1435 },
+  { reign: "正统", from: 1436, to: 1449 },
+  { reign: "景泰", from: 1450, to: 1456 },
+  { reign: "天顺", from: 1457, to: 1464 },
+  { reign: "成化", from: 1465, to: 1487 },
+  { reign: "弘治", from: 1488, to: 1505 },
+  { reign: "正德", from: 1506, to: 1521 },
+  { reign: "嘉靖", from: 1522, to: 1566 },
+  { reign: "隆庆", from: 1567, to: 1572 },
+  { reign: "万历", from: 1573, to: 1620 },
+  { reign: "泰昌", from: 1620, to: 1620 },
+  { reign: "天启", from: 1621, to: 1627 },
+  { reign: "崇祯", from: 1628, to: 1644 },
+];
+
+// Stable color per category, used by both the filter chips and the per-event
+// badge so the user can visually scan the timeline by topic.
+const CATEGORY_COLORS: Record<string, string> = {
+  皇室: "#c8262d",
+  政争: "#8d5a3f",
+  制度: "#6e7c8e",
+  军事: "#3a6f4f",
+  民变: "#c9963a",
+  外交: "#4f78a3",
+  经济: "#7a8a4a",
+  灾异: "#a04d8a",
+  文化: "#5b6e9c",
+  人物: "#7a6a5a",
+  其他: "#9aa3aa",
+  // 用户笔记单独着色（暖橙），方便和官修史事件视觉区分
+  我的笔记: "#d97a3a",
+};
+
+function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: ReaderNote[]; readableBooks: ReadableBook[]; onNoteClick?: (note: ReaderNote) => void }) {
+  // Two interchangeable input modes:
+  //   "center" — pick a center year and a ± halfRange (good for "show me a
+  //              decade around this year")
+  //   "range"  — give explicit start/end years (good for "show me 1573–1620"
+  //              or matching a reign exactly). Reign quick-pick fills both
+  //              underlying state pairs so toggling modes stays consistent.
+  const [mode, setMode] = useState<"center" | "range" | "reign">("range");
+  const [centerYear, setCenterYear] = useState<number>(1500);
+  const [halfRange, setHalfRange] = useState<number>(40);
+  const [rangeFrom, setRangeFrom] = useState<number>(1368);
+  const [rangeTo, setRangeTo] = useState<number>(1644);
+  const [selectedReign, setSelectedReign] = useState<string>("");
+  // Importance filter — multi-select. Empty = no restriction (all 5 levels shown).
+  // Clicking a chip ADDS that level to the filter; "全部" clears back to empty.
+  const [selectedScales, setSelectedScales] = useState<number[]>([]);
+  // Double-click event → edit modal
+  const [editingEventId, setEditingEventId] = useState<number | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  // Category filter — empty = all categories shown.
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
+  const [events, setEvents] = useState<HistoryTimelineEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  // Keyword search applied client-side on top of the year/category/scale
+  // filters — matches against event description and reign label so the user
+  // can narrow within the loaded window without re-querying the backend.
+  const [keyword, setKeyword] = useState("");
+
+  const from = mode === "center"
+    ? Math.max(1368, centerYear - halfRange)
+    : Math.max(1368, Math.min(rangeFrom, rangeTo));
+  const to = mode === "center"
+    ? Math.min(1644, centerYear + halfRange)
+    : Math.min(1644, Math.max(rangeFrom, rangeTo));
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchHistoryTimeline({ from, to, scales: selectedScales, categories: selectedCategories, limit: 5000 })
+      .then((res) => { if (!cancelled) setEvents(res.events); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [from, to, selectedScales, selectedCategories, refreshKey]);
+
+  // Compute the effective timeline year for a note: manual override wins,
+  // otherwise fall back to auto-detected historicalYear.
+  const noteYear = (n: ReaderNote): number | null => {
+    if (typeof n.manualYear === "number" && Number.isFinite(n.manualYear)) return n.manualYear;
+    if (typeof n.historicalYear === "number") return n.historicalYear;
+    return null;
+  };
+
+  // Only notes the user has explicitly opted into the timeline are surfaced.
+  // Auto-detected notes still need an explicit `inTimeline === true` to show.
+  const notesInRange = notes.filter((n) => {
+    if (!n.inTimeline) return false;
+    const y = noteYear(n);
+    return y != null && y >= from && y <= to;
+  });
+
+  // Apply client-side keyword filter on top of the year/category/scale window.
+  const kw = keyword.trim();
+  const filteredEvents = kw
+    ? events.filter(
+        (e) =>
+          (e.description || "").includes(kw) ||
+          (e.reign || "").includes(kw) ||
+          (e.category || "").includes(kw)
+      )
+    : events;
+  const filteredNotes = kw
+    ? notesInRange.filter(
+        (n) =>
+          (n.text || "").includes(kw) ||
+          (n.note || "").includes(kw)
+      )
+    : notesInRange;
+
+  // Build a year-indexed list of axis points (event or note) for rendering.
+  type Item =
+    | { kind: "event"; year: number; data: HistoryTimelineEvent }
+    | { kind: "note"; year: number; data: ReaderNote };
+  const items: Item[] = [
+    ...filteredEvents.map((e) => ({ kind: "event" as const, year: e.year, data: e })),
+    ...filteredNotes.map((n) => ({ kind: "note" as const, year: noteYear(n)!, data: n })),
+  ].sort((a, b) => a.year - b.year);
+
+  const scaleColor = (s: number) => ["#9aa3aa", "#7080a0", "#5a8b6c", "#c9963a", "#c8262d"][Math.max(0, Math.min(4, s - 1))];
+  const scaleSize = (s: number) => 6 + s * 2;
+
+  // Click an event/note to recenter on its year. In "center" mode this is just
+  // setCenterYear; in "range" mode we keep the current span width and shift
+  // both endpoints so the clicked year lands at the middle.
+  const recenterOn = (year: number) => {
+    if (mode === "center") {
+      setCenterYear(year);
+    } else {
+      // range / reign mode — keep the current span, shift endpoints to center
+      // on the clicked year. In reign mode this also clears the active reign
+      // pill since the window no longer matches a named reign.
+      const halfSpan = Math.max(5, Math.round((rangeTo - rangeFrom) / 2));
+      setRangeFrom(Math.max(1368, year - halfSpan));
+      setRangeTo(Math.min(1644, year + halfSpan));
+      if (mode === "reign") setSelectedReign("");
+    }
+  };
+
+  return (
+    <div className="stack-gap">
+      <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+        以《明代大事年表》为底，按重要级别分级展示。可按中心年份+范围、起止年份或年号三种方式查询。笔记会按照其历史时间叠加在轴上。
+      </div>
+
+      {/* Row 1: three compact dropdowns — mode / category / scale */}
+      <div
+        className="inline-actions"
+        style={{ flexWrap: "wrap", gap: "0.4rem", alignItems: "center" }}
+      >
+        <label className="field-label" style={{ flex: 1, minWidth: "10rem" }}>
+          <span className="muted-text" style={{ fontSize: "0.72rem" }}>查询方式</span>
+          <select
+            className="select-input"
+            value={mode}
+            onChange={(e) => setMode(e.target.value as "center" | "range" | "reign")}
+          >
+            <option value="center">中心年份+范围</option>
+            <option value="range">起止年份</option>
+            <option value="reign">按年号</option>
+          </select>
+        </label>
+      </div>
+
+      {/* Multi-select chip rows for category and importance. */}
+      <div className="stack-gap" style={{ gap: "0.35rem" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", alignItems: "center" }}>
+          <span className="muted-text" style={{ fontSize: "0.72rem", marginRight: "0.2rem" }}>事件类别</span>
+          <button
+            type="button"
+            className={`chip-button${selectedCategories.length === 0 ? " chip-button-active" : ""}`}
+            onClick={() => setSelectedCategories([])}
+            style={{ fontSize: "0.7rem", padding: "0.18rem 0.55rem" }}
+          >全部</button>
+          {HISTORY_CATEGORIES.map((c) => {
+            const active = selectedCategories.includes(c);
+            return (
+              <button
+                key={c}
+                type="button"
+                className={`chip-button${active ? " chip-button-active" : ""}`}
+                onClick={() => {
+                  setSelectedCategories((cur) =>
+                    cur.includes(c) ? cur.filter((x) => x !== c) : [...cur, c]
+                  );
+                }}
+                style={{
+                  fontSize: "0.7rem",
+                  padding: "0.18rem 0.55rem",
+                  borderColor: active ? CATEGORY_COLORS[c] ?? "#9aa3aa" : undefined,
+                  color: active ? CATEGORY_COLORS[c] ?? "#9aa3aa" : undefined,
+                }}
+              >{c}</button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", alignItems: "center" }}>
+          <span className="muted-text" style={{ fontSize: "0.72rem", marginRight: "0.2rem" }}>重要性</span>
+          <button
+            type="button"
+            className={`chip-button${selectedScales.length === 0 ? " chip-button-active" : ""}`}
+            onClick={() => setSelectedScales([])}
+            style={{ fontSize: "0.7rem", padding: "0.18rem 0.55rem" }}
+          >全部</button>
+          {[1, 2, 3, 4, 5].map((s) => {
+            const active = selectedScales.includes(s);
+            const labelMap: Record<number, string> = { 1: "1 细", 2: "2 较细", 3: "3 中", 4: "4 重要", 5: "5 大事" };
+            return (
+              <button
+                key={s}
+                type="button"
+                className={`chip-button${active ? " chip-button-active" : ""}`}
+                onClick={() => {
+                  setSelectedScales((cur) =>
+                    cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]
+                  );
+                }}
+                style={{ fontSize: "0.7rem", padding: "0.18rem 0.55rem" }}
+              >{labelMap[s]}</button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Row 2: mode-specific filter on the left, keyword search on the right */}
+      <div
+        className="inline-actions"
+        style={{ flexWrap: "wrap", gap: "0.6rem", alignItems: "flex-end" }}
+      >
+        <div style={{ flex: 2, minWidth: "16rem" }}>
+          {mode === "center" && (
+            <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.4rem" }}>
+              <label className="field-label" style={{ flex: 1, minWidth: "9rem" }}>
+                中心年份 {centerYear}
+                <input
+                  type="range"
+                  min={1368}
+                  max={1644}
+                  step={1}
+                  value={centerYear}
+                  onChange={(e) => setCenterYear(parseInt(e.target.value, 10))}
+                />
+              </label>
+              <label className="field-label" style={{ flex: 1, minWidth: "9rem" }}>
+                范围 ±{halfRange} 年（{from}–{to}）
+                <input
+                  type="range"
+                  min={5}
+                  max={140}
+                  step={1}
+                  value={halfRange}
+                  onChange={(e) => setHalfRange(parseInt(e.target.value, 10))}
+                />
+              </label>
+            </div>
+          )}
+
+          {mode === "range" && (
+            <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.4rem" }}>
+              <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+                起始年份
+                <input
+                  type="number"
+                  min={1368}
+                  max={1644}
+                  step={1}
+                  value={rangeFrom}
+                  onChange={(e) => setRangeFrom(parseInt(e.target.value, 10) || 1368)}
+                />
+              </label>
+              <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+                结束年份
+                <input
+                  type="number"
+                  min={1368}
+                  max={1644}
+                  step={1}
+                  value={rangeTo}
+                  onChange={(e) => setRangeTo(parseInt(e.target.value, 10) || 1644)}
+                />
+              </label>
+              <div className="muted-text" style={{ fontSize: "0.74rem", width: "100%" }}>
+                实际范围：{from}–{to}（共 {to - from + 1} 年）
+              </div>
+            </div>
+          )}
+
+          {mode === "reign" && (
+            <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem" }}>
+              {MING_REIGN_RANGES.map((r) => (
+                <button
+                  key={r.reign}
+                  type="button"
+                  className={`ghost-button compact-button ${selectedReign === r.reign ? "is-active" : ""}`}
+                  style={selectedReign === r.reign ? { background: "rgba(110,66,23,0.16)", borderColor: "rgba(110,66,23,0.22)" } : {}}
+                  onClick={() => {
+                    setSelectedReign(r.reign);
+                    setRangeFrom(r.from);
+                    setRangeTo(r.to);
+                    setCenterYear(Math.round((r.from + r.to) / 2));
+                    setHalfRange(Math.max(5, Math.ceil((r.to - r.from) / 2) + 2));
+                  }}
+                >
+                  {r.reign}
+                </button>
+              ))}
+              <div className="muted-text" style={{ fontSize: "0.74rem", width: "100%" }}>
+                {selectedReign ? `${selectedReign}（${from}–${to}，共 ${to - from + 1} 年）` : "选择一个年号以载入对应的起止年份。"}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <label className="field-label" style={{ flex: 1, minWidth: "12rem" }}>
+          <span className="muted-text" style={{ fontSize: "0.72rem" }}>关键词搜索</span>
+          <input
+            type="search"
+            placeholder="如「张居正」「倭寇」"
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+            className="text-input"
+          />
+        </label>
+      </div>
+
+      <div className="muted-text" style={{ fontSize: "0.74rem" }}>
+        {loading
+          ? "加载中…"
+          : `${filteredEvents.length}/${events.length} 条年表事件 · ${filteredNotes.length}/${notesInRange.length} 条笔记${
+              selectedScales.length > 0 && selectedScales.length < 5
+                ? " · 重要性: " + [...selectedScales].sort().join(",")
+                : ""
+            }${selectedCategories.length > 0 ? " · 类别: " + selectedCategories.join("、") : ""}${kw ? ` · 关键词: ${kw}` : ""}`}
+      </div>
+
+      <div className="history-timeline">
+        {items.map((item, i) => {
+          if (item.kind === "event") {
+            const e = item.data;
+            return (
+              <div
+                key={`e-${i}`}
+                className="ht-row"
+                onClick={() => recenterOn(e.year)}
+                onDoubleClick={(ev) => { ev.stopPropagation(); if (e.id) setEditingEventId(e.id); }}
+                title="双击编辑此事件"
+              >
+                <div className="ht-axis">
+                  <span className="ht-year">{e.year}</span>
+                  <span
+                    className="ht-dot"
+                    style={{
+                      background: scaleColor(e.scale),
+                      width: `${scaleSize(e.scale)}px`,
+                      height: `${scaleSize(e.scale)}px`,
+                    }}
+                  />
+                </div>
+                <div className="ht-content">
+                  <div className="ht-meta">
+                    <span className="ht-reign">{e.reign}{e.reignYearText}年</span>
+                    <span
+                      className="ht-category"
+                      style={{
+                        background: CATEGORY_COLORS[e.category] + "22",
+                        color: CATEGORY_COLORS[e.category],
+                        border: `1px solid ${CATEGORY_COLORS[e.category]}55`,
+                      }}
+                    >
+                      {e.category}
+                    </span>
+                    <span className="ht-scale" style={{ color: scaleColor(e.scale) }}>★{e.scale}</span>
+                  </div>
+                  <div>{e.description}</div>
+                </div>
+              </div>
+            );
+          }
+          const n = item.data;
+          const bookTitle = readableBooks.find((b) => b.slug === n.bookSlug)?.title || n.bookSlug;
+          const noteScale = clamp(n.timelineScale ?? 1, 1, 5);
+          const noteCategory = n.timelineCategory ?? "我的笔记";
+          const noteColor = CATEGORY_COLORS[noteCategory] ?? CATEGORY_COLORS["我的笔记"] ?? "#d97a3a";
+          const displayTitle = (n.timelineTitle && n.timelineTitle.trim()) || (n.note || "").slice(0, 20);
+          // Click semantics: when an onNoteClick handler is provided we
+          // navigate to the note (jump back to the chapter at the note's
+          // CFI). Otherwise just recenter the timeline window — useful when
+          // the panel is used in read-only mode.
+          const handleNoteClick = () => {
+            if (onNoteClick) onNoteClick(n);
+            else recenterOn(item.year);
+          };
+          // Also display the resolved date (manual override > auto-detect)
+          // — gives the user a quick visual confirmation of when the note
+          // is anchored on the axis.
+          const dateLabel = (() => {
+            if (typeof n.manualYear === "number") {
+              let s = `${n.manualYear}年`;
+              if (typeof n.manualMonth === "number") s += `${n.manualMonth}月`;
+              if (typeof n.manualDay === "number") s += `${n.manualDay}日`;
+              return s;
+            }
+            return n.historicalAt || `${n.historicalYear}年`;
+          })();
+          return (
+            <div key={`n-${i}`} className="ht-row ht-row-note" onClick={handleNoteClick} style={{ cursor: "pointer" }}>
+              <div className="ht-axis">
+                <span className="ht-year">{item.year}</span>
+                <span
+                  className="ht-dot ht-dot-note"
+                  style={{
+                    background: noteColor,
+                    width: `${6 + noteScale * 2}px`,
+                    height: `${6 + noteScale * 2}px`,
+                  }}
+                />
+              </div>
+              <div className="ht-content">
+                <div className="ht-meta">
+                  <span
+                    className="ht-category"
+                    style={{
+                      background: noteColor + "22",
+                      color: noteColor,
+                      border: `1px solid ${noteColor}55`,
+                    }}
+                  >
+                    {noteCategory}
+                  </span>
+                  {bookTitle && <span className="muted-text" style={{ fontSize: "0.7rem" }}>《{bookTitle}》</span>}
+                  {dateLabel && <span className="muted-text" style={{ fontSize: "0.7rem" }}>{dateLabel}</span>}
+                  <span className="ht-scale" style={{ color: noteColor }}>★{noteScale}</span>
+                </div>
+                <div style={{ fontWeight: 600 }}>{displayTitle}</div>
+                {n.note && n.note !== displayTitle && <div className="muted-text" style={{ fontSize: "0.78rem" }}>{n.note}</div>}
+                <div className="muted-text" style={{ fontSize: "0.7rem" }}>选段：{n.text.slice(0, 40)}{n.text.length > 40 ? "…" : ""}</div>
+              </div>
+            </div>
+          );
+        })}
+        {items.length === 0 && !loading && <div className="empty-state">当前范围 / 详细级别下没有可显示的事件或笔记。</div>}
+      </div>
+      {editingEventId != null && (
+        <TimelineEventEditModal
+          eventId={editingEventId}
+          allEvents={events}
+          onClose={() => setEditingEventId(null)}
+          onSaved={() => { setEditingEventId(null); setRefreshKey((k) => k + 1); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// (TimelineAdminPanel removed; double-click modal still in TimelineEventEditModal below)
+
+function TimelineEventEditModal({
+  eventId,
+  allEvents,
+  onClose,
+  onSaved,
+}: {
+  eventId: number;
+  allEvents: HistoryTimelineEvent[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const initial = allEvents.find((e) => e.id === eventId);
+  const [draft, setDraft] = useState<HistoryTimelineEvent | null>(initial || null);
+  const [saving, setSaving] = useState(false);
+  const [comparing, setComparing] = useState(false);
+  const [comparisonResult, setComparisonResult] = useState<string | null>(null);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!initial) {
+      // fallback: fetch the single row
+      fetchAllTimelineEvents()
+        .then((d) => {
+          const fresh = d.events.find((x) => x.id === eventId);
+          if (fresh) setDraft(fresh);
+        })
+        .catch(() => {});
+    }
+  }, [eventId, initial]);
+
+  if (!draft) return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "32rem", padding: "1.5rem" }}>
+        <div>加载中…</div>
+      </div>
+    </div>
+  );
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await patchTimelineEventApi(eventId, {
+        description: draft.description,
+        category: draft.category,
+        scale: draft.scale,
+        hidden: draft.hidden ?? 0,
+        year: draft.year,
+        reign: draft.reign,
+        reignYearText: draft.reignYearText,
+      });
+      onSaved();
+    } catch (err) {
+      alert("保存失败：" + (err as Error)?.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const runCompare = async () => {
+    setComparing(true);
+    setComparisonError(null);
+    setComparisonResult(null);
+    try {
+      // Reuse the existing /api/reference/compare endpoint — it expects a
+      // free-form text snippet and returns AI-summarized cross-book hits.
+      const response = await fetch("/api/reference/compare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedText: draft.description }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      // The compare endpoint returns either a markdown summary or a list of
+      // matched paragraphs with snippets — render whatever shape comes back.
+      if (typeof data === "string") {
+        setComparisonResult(data);
+      } else if (data.summary) {
+        setComparisonResult(data.summary);
+      } else if (Array.isArray(data.results) || Array.isArray(data.hits)) {
+        const hits = data.results || data.hits;
+        setComparisonResult(
+          hits.map((h: any, i: number) =>
+            `[${i + 1}] 《${h.bookTitle || h.book || "?"}》 ${h.chapter || ""}\n${h.snippet || h.content || ""}`
+          ).join("\n\n")
+        );
+      } else {
+        setComparisonResult(JSON.stringify(data, null, 2));
+      }
+    } catch (err) {
+      setComparisonError((err as Error)?.message || "比对失败");
+    } finally {
+      setComparing(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "44rem", maxHeight: "85vh", overflowY: "auto", padding: "1.2rem" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.6rem" }}>
+          <h3 style={{ margin: 0 }}>编辑事件 #{eventId}</h3>
+          <button type="button" className="ghost-button compact-button" onClick={onClose}>关闭</button>
+        </div>
+
+        <div className="stack-gap">
+          <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
+            <label className="field-label" style={{ flex: 1, minWidth: "6rem" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>公元年</span>
+              <input className="text-input" type="number" value={draft.year} onChange={(e) => setDraft({ ...draft, year: parseInt(e.target.value, 10) })} />
+            </label>
+            <label className="field-label" style={{ flex: 1, minWidth: "6rem" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>年号</span>
+              <input className="text-input" value={draft.reign} onChange={(e) => setDraft({ ...draft, reign: e.target.value })} />
+            </label>
+            <label className="field-label" style={{ flex: 1, minWidth: "6rem" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>年号年（汉字）</span>
+              <input className="text-input" value={draft.reignYearText} onChange={(e) => setDraft({ ...draft, reignYearText: e.target.value })} />
+            </label>
+          </div>
+
+          <label className="field-label">
+            <span className="muted-text" style={{ fontSize: "0.72rem" }}>描述</span>
+            <textarea
+              className="text-input tall"
+              value={draft.description}
+              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+              rows={4}
+            />
+          </label>
+
+          <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
+            <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>类别</span>
+              <select className="select-input" value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })}>
+                {HISTORY_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+            <label className="field-label" style={{ flex: 1, minWidth: "8rem" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>重要性</span>
+              <select className="select-input" value={String(draft.scale)} onChange={(e) => setDraft({ ...draft, scale: parseInt(e.target.value, 10) })}>
+                {[1, 2, 3, 4, 5].map((s) => <option key={s} value={String(s)}>★{s}</option>)}
+              </select>
+            </label>
+            <label className="field-label" style={{ flex: 0, minWidth: "5rem", justifyContent: "center" }}>
+              <span className="muted-text" style={{ fontSize: "0.72rem" }}>隐藏</span>
+              <input type="checkbox" checked={Boolean(draft.hidden)} onChange={(e) => setDraft({ ...draft, hidden: e.target.checked ? 1 : 0 })} />
+            </label>
+          </div>
+
+          <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
+            <button type="button" className="primary-button" onClick={save} disabled={saving}>
+              {saving ? "保存中…" : "保存改动"}
+            </button>
+            <button type="button" className="secondary-button" onClick={runCompare} disabled={comparing}>
+              {comparing ? "比对中…" : "史料比对"}
+            </button>
+          </div>
+
+          {(comparisonResult || comparisonError) && (
+            <div style={{ marginTop: "0.6rem", padding: "0.6rem", background: "rgba(110,66,23,0.04)", borderRadius: "0.4rem", maxHeight: "20rem", overflowY: "auto" }}>
+              <div style={{ fontSize: "0.74rem", color: "var(--text-muted, #6f6557)", marginBottom: "0.3rem" }}>史料比对结果：</div>
+              {comparisonError && <div style={{ color: "#c8262d" }}>{comparisonError}</div>}
+              {comparisonResult && <div style={{ whiteSpace: "pre-wrap", fontSize: "0.8rem", lineHeight: 1.5 }}>{comparisonResult}</div>}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

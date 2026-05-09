@@ -6,11 +6,27 @@ import unzipper from "unzipper";
 import Fuse from "fuse.js";
 import { XMLParser } from "fast-xml-parser";
 import { parse } from "node-html-parser";
+import * as OpenCC from "opencc-js";
 import { BOOK_PATH, BOOKS_DIR, CACHE_ROOT } from "../config/defaults.js";
 import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
+import { getDb } from "./library-db.js";
 
 export const DEFAULT_BOOK_SLUG = "ming-shi";
+
+// 繁简转换：corpus 大部分以简体落库，但用户常用繁体输入（软件 UI 默认繁体
+// 显示）。把查询关键词同时扩成简体 + 繁体两种形式去匹配，覆盖两类场景。
+const t2s = OpenCC.Converter({ from: "t", to: "cn" });
+const s2t = OpenCC.Converter({ from: "cn", to: "t" });
+
+function expandSimpTradVariants(term) {
+  const t = String(term || "").trim();
+  if (!t) return [];
+  const variants = new Set([t]);
+  try { variants.add(t2s(t)); } catch { /* ignore */ }
+  try { variants.add(s2t(t)); } catch { /* ignore */ }
+  return [...variants].filter(Boolean);
+}
 
 export function resolveBookEpubPath(slug) {
   // ming-shi defaults to BOOK_PATH (env-configurable for the legacy single-book setup)
@@ -633,6 +649,224 @@ export async function searchBook(query, options = {}) {
   };
 }
 
+// Cross-book full-text search via library-db FTS5. Supports optional book
+// scope (empty `slugs` = all readable books). Used by 「本地模糊检索」 when the
+// user wants to search across multiple titles instead of just the current book.
+//
+// Returns paragraph-shaped results carrying the host book's slug & title so
+// the frontend can route clicks through switchBook + chapter jump.
+export async function searchAcrossBooks(query, options = {}) {
+  const { limit = 30, slugs = [], expandedQueries = [] } = options;
+  const safeQuery = sanitizeQuery(query);
+  if (!safeQuery) {
+    return { query: safeQuery, expandedQueries: [], total: 0, results: [] };
+  }
+
+  // Build keyword set: primary query + AI-expanded + heuristic n-grams.
+  // FTS5 requires terms ≥ 2 chars; we already filter inside library-db.
+  const keywords = unique([
+    safeQuery,
+    ...expandedQueries.map((it) => sanitizeQuery(it)),
+    ...heuristicKeywords(safeQuery),
+  ]).filter(Boolean);
+
+  const db = getDb();
+  // 关键词清洗 + 简繁同时扩展。corpus 多数为简体落库，但用户输入常为繁体，
+  // 不扩两形会导致繁体查询完全空命中。
+  const baseKeywords = unique(
+    keywords
+      .map((it) => String(it || "").trim())
+      .filter((it) => it.length >= 2)
+  ).slice(0, 8);
+  const cleanedKeywords = unique(baseKeywords.flatMap(expandSimpTradVariants)).slice(0, 16);
+
+  if (!cleanedKeywords.length) {
+    return { query: safeQuery, expandedQueries: keywords, total: 0, results: [] };
+  }
+
+  const matchExpr = cleanedKeywords.map((it) => `"${it.replace(/"/g, '""')}"`).join(" OR ");
+  const hasScope = Array.isArray(slugs) && slugs.length > 0;
+  const scopeClause = hasScope ? ` AND b.slug IN (${slugs.map(() => "?").join(",")})` : "";
+  const scopeParams = hasScope ? slugs : [];
+
+  let rows = [];
+  try {
+    rows = db
+      .prepare(
+        `
+        SELECT p.id, p.chapter, p.chapter_order AS chapterOrder, p.anchor, p.content,
+               b.slug AS bookSlug, b.title AS bookTitle,
+               bm25(paragraphs_fts, 1.0, 0.35) AS rank
+        FROM paragraphs_fts
+        JOIN paragraphs p ON p.id = paragraphs_fts.rowid
+        JOIN books b ON b.id = p.book_id
+        WHERE paragraphs_fts MATCH ?
+          ${scopeClause}
+        ORDER BY rank
+        LIMIT ?
+        `
+      )
+      .all(matchExpr, ...scopeParams, limit);
+  } catch {
+    // 通常是 FTS MATCH 语法报错（极少数特殊字符）—— 回退到 LIKE。
+    rows = [];
+  }
+
+  if (!rows.length) {
+    // LIKE fallback for queries FTS5 trigram can't match (≤2-char queries 等).
+    // SQLite 没有内建 occurrence-count 函数，单纯 LIKE 不带排序时结果按物理
+    // 插入顺序回，先导入的明史几乎独占 — 给 frontend 看就像 "搜索仍只覆盖明史"。
+    // 解决：用 (length - length-without-term)/term-length 算每段的命中次数，
+    // 按它倒序，自然把命中最密集的段排前面，再叠加给跨书结果一个软配额。
+    const term = cleanedKeywords[0];
+    const conditions = cleanedKeywords.map(() => "p.content LIKE ?").join(" OR ");
+    const params = cleanedKeywords.map((it) => `%${it}%`);
+    const overFetch = limit * 4;
+    const candidates = db
+      .prepare(
+        `
+        SELECT p.id, p.chapter, p.chapter_order AS chapterOrder, p.anchor, p.content,
+               b.slug AS bookSlug, b.title AS bookTitle,
+               CAST(LENGTH(p.content) - LENGTH(REPLACE(p.content, ?, '')) AS REAL) / NULLIF(LENGTH(?),0) AS hits,
+               LENGTH(p.content) AS plen
+        FROM paragraphs p
+        JOIN books b ON b.id = p.book_id
+        WHERE (${conditions})
+          ${scopeClause}
+        ORDER BY hits DESC, plen ASC
+        LIMIT ?
+        `
+      )
+      .all(term, term, ...params, ...scopeParams, overFetch);
+    // 软配额：每本书最多 ceil(limit / 4)，避免某一本（通常是明史）独占
+    // 整页结果。balanced 不够 limit 时不再用同本书的 overflow 补齐 —— 用户
+    // 想看更多某本书的命中，可以用「检索范围」面板把它单选出来再搜。
+    const perBookCap = Math.max(2, Math.ceil(limit / 4));
+    const pickedByBook = new Map();
+    const balanced = [];
+    for (const row of candidates) {
+      const cnt = pickedByBook.get(row.bookSlug) || 0;
+      if (cnt >= perBookCap) continue;
+      pickedByBook.set(row.bookSlug, cnt + 1);
+      balanced.push({ ...row, rank: -row.hits });
+      if (balanced.length >= limit) break;
+    }
+    rows = balanced;
+  }
+
+  const results = rows.map((row, index) => ({
+    id: `${row.bookSlug}-${row.id}`,
+    bookSlug: row.bookSlug,
+    bookTitle: row.bookTitle,
+    chapterId: String(row.chapterOrder ?? index),
+    chapterOrder: row.chapterOrder ?? null,
+    chapterHref: row.anchor || "", // EPUB books: anchor 可作 chapter href；DB-only：可能空，前端按 chapterOrder 跳
+    chapterTitle: row.chapter || "",
+    score: typeof row.rank === "number" ? Number((-row.rank).toFixed(3)) : 0,
+    snippet: toSnippet(row.content, safeQuery),
+    text: row.content,
+    years: extractYearMentions ? extractYearMentions(row.content).slice(0, 5) : [],
+  }));
+
+  return {
+    query: safeQuery,
+    expandedQueries: cleanedKeywords,
+    total: results.length,
+    results,
+  };
+}
+
+// 真·模糊检索：把查询切成 bigram，对每个段落计算「命中了几个不同的 bigram」
+// 作为 coverage 分。即使查询里有 1–2 个字与正文不一致，剩下的 bigram 仍能命
+// 中，按 coverage 排序仍能把高度相关的段落排上来。配合 simp/trad 双展。
+//
+// 用途：用户记不全完整原文 / 输入有错字 / 想找语义相近的段落。
+export async function searchFuzzy(query, options = {}) {
+  const { limit = 18, slugs = [] } = options;
+  const safeQuery = sanitizeQuery(query);
+  if (!safeQuery || safeQuery.length < 2) {
+    return { query: safeQuery, expandedQueries: [], total: 0, results: [] };
+  }
+
+  // bigram + (一定长度阈值后) trigram 一起做。trigram 加分能让长查询里
+  // 完全连续的片段比零散 bigram 命中得分更高。
+  const bigrams = [];
+  for (let i = 0; i < safeQuery.length - 1; i += 1) bigrams.push(safeQuery.slice(i, i + 2));
+  const trigrams = [];
+  if (safeQuery.length >= 4) {
+    for (let i = 0; i < safeQuery.length - 2; i += 1) trigrams.push(safeQuery.slice(i, i + 3));
+  }
+  const baseGrams = unique([...bigrams, ...trigrams]);
+  // simp/trad 双展，控制总变体数 ≤ 64（SQLite 参数上限是几百个，留余地）
+  const variants = unique(baseGrams.flatMap(expandSimpTradVariants)).slice(0, 64);
+  if (!variants.length) {
+    return { query: safeQuery, expandedQueries: [], total: 0, results: [] };
+  }
+
+  const totalQueryGrams = bigrams.length || 1;
+  const db = getDb();
+  const hasScope = Array.isArray(slugs) && slugs.length > 0;
+  const scopeClause = hasScope ? ` AND b.slug IN (${slugs.map(() => "?").join(",")})` : "";
+  const scopeParams = hasScope ? slugs : [];
+
+  // 一次 SQL：covered = sum(CASE WHEN content LIKE %v% THEN 1 ELSE 0 END)
+  // WHERE 至少命中一个 variant；ORDER BY covered DESC, plen ASC（更短段落排前
+  // 面 → 更聚焦的命中段落优先）。
+  const likeParams = variants.map((v) => `%${v}%`);
+  const coverageExpr = variants.map(() => "(CASE WHEN p.content LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+  const whereOr = variants.map(() => "p.content LIKE ?").join(" OR ");
+  const overFetch = limit * 6;
+  const candidates = db
+    .prepare(
+      `
+      SELECT p.id, p.chapter, p.chapter_order AS chapterOrder, p.anchor, p.content,
+             b.slug AS bookSlug, b.title AS bookTitle,
+             (${coverageExpr}) AS coverage,
+             LENGTH(p.content) AS plen
+      FROM paragraphs p
+      JOIN books b ON b.id = p.book_id
+      WHERE (${whereOr})
+        ${scopeClause}
+      ORDER BY coverage DESC, plen ASC
+      LIMIT ?
+      `
+    )
+    .all(...likeParams, ...likeParams, ...scopeParams, overFetch);
+
+  // 每本书软配额，避免一本独占
+  const perBookCap = Math.max(2, Math.ceil(limit / 4));
+  const pickedByBook = new Map();
+  const balanced = [];
+  for (const row of candidates) {
+    const cnt = pickedByBook.get(row.bookSlug) || 0;
+    if (cnt >= perBookCap) continue;
+    pickedByBook.set(row.bookSlug, cnt + 1);
+    balanced.push(row);
+    if (balanced.length >= limit) break;
+  }
+
+  const results = balanced.map((row) => ({
+    id: `${row.bookSlug}-${row.id}`,
+    bookSlug: row.bookSlug,
+    bookTitle: row.bookTitle,
+    chapterId: String(row.chapterOrder ?? 0),
+    chapterOrder: row.chapterOrder ?? null,
+    chapterHref: row.anchor || "",
+    chapterTitle: row.chapter || "",
+    score: Math.round((row.coverage / variants.length) * 100) / 100,
+    snippet: toSnippet(row.content, safeQuery),
+    text: row.content,
+    years: extractYearMentions(row.content).slice(0, 5),
+  }));
+
+  return {
+    query: safeQuery,
+    expandedQueries: variants,
+    total: results.length,
+    results,
+  };
+}
+
 export async function buildPersonChronology(person, slug = DEFAULT_BOOK_SLUG) {
   const search = await searchBook(person, { limit: 32, slug });
   const timeline = search.results.map((result, index) => ({
@@ -648,6 +882,152 @@ export async function buildPersonChronology(person, slug = DEFAULT_BOOK_SLUG) {
     total: timeline.length,
     items: timeline
   };
+}
+
+// --- Biography-index aware extraction ----------------------------------
+//
+// `biography-index.json` (built by scripts/build-biography-index.mjs) lists
+// where each notable person's dedicated 列传 / 世家 chapter lives across
+// 明史 / 石匮书后集 / 东林列传 / 罪惟录. When the user queries a person who
+// IS in the index, we extract that exact chapter slice (from the person's
+// section start to the next person's start) and pass it as the AI's primary
+// reference material — far higher quality than the keyword-fuzzy results
+// returned by buildPersonChronology(). Falls back to keyword search when no
+// biographical chapter is indexed for that person.
+
+let _bioIndexCache = null;
+function loadBiographyIndex() {
+  if (_bioIndexCache) return _bioIndexCache;
+  try {
+    const file = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../data/biography-index.json");
+    const raw = fsSync.readFileSync(file, "utf8");
+    _bioIndexCache = JSON.parse(raw);
+  } catch (e) {
+    console.warn(`[biography-index] failed to load: ${e.message}`);
+    _bioIndexCache = { index: {} };
+  }
+  return _bioIndexCache;
+}
+
+/**
+ * Extract the slice of a chapter that belongs to a specific person.
+ * Heuristic: paragraphs are scanned in order; the slice starts at the first
+ * paragraph whose leading text begins with the person's name (or contains
+ * `<name>，字` / `<name>，<surname>` style biographical opener), and ends
+ * at the first paragraph after that whose leading text begins with the NEXT
+ * person's name (or end-of-chapter if the person is the last in the chapter).
+ *
+ * Returns { paragraphs: string[], chapterLabel, bookSlug, bookTitle, anchor }
+ * or null if the slice can't be located.
+ */
+function extractPersonSlice(db, entry, personName, allPersonsInChapter) {
+  const book = db.prepare("SELECT id, title FROM books WHERE slug = ?").get(entry.bookSlug);
+  if (!book) return null;
+  const rows = db.prepare(`
+    SELECT content FROM paragraphs
+    WHERE book_id = ? AND chapter = ? AND chapter_order = ?
+    ORDER BY id
+  `).all(book.id, entry.chapterLabel, entry.chapterOrder);
+  if (!rows.length) return null;
+
+  // Locate the paragraph where a given person's biographical section begins.
+  // Two heuristics, in order:
+  //   (a) Clean case — the paragraph's head (after stripping leading
+  //       whitespace and ○/●/◎ markers) begins with the name. This is the
+  //       common 明史 / 罪惟录 layout where each new biography starts a
+  //       fresh paragraph.
+  //   (b) Mid-paragraph case — paragraph chunking concatenated the previous
+  //       person's tail onto this person's opener (e.g. paragraph contains
+  //       "...特以拱故，不容于朝。张居正，字叔大，..."). Detect by searching
+  //       for `<name>，字` or `<name>，<surname>` as a known biographical
+  //       opener anywhere in the first half of the paragraph.
+  const findStartIdx = (rows, name) => {
+    for (let i = 0; i < rows.length; i++) {
+      const head = rows[i].content.replace(/^[○●◎○\s]+/, "").slice(0, 8);
+      if (head.startsWith(name)) return i;
+    }
+    // Fallback: biographical opener anywhere in the first half of the para
+    for (let i = 0; i < rows.length; i++) {
+      const text = rows[i].content;
+      const idx = text.indexOf(`${name}，字`);
+      if (idx >= 0 && idx < Math.max(40, text.length / 2)) return i;
+    }
+    return -1;
+  };
+
+  let startIdx = findStartIdx(rows, personName);
+  if (startIdx < 0) startIdx = 0; // unable to locate — fall back to whole chapter
+  let endIdx = rows.length;
+
+  // Find end: first paragraph after startIdx whose head/opener matches a
+  // later person's section in the chapter.
+  if (entry.personOrder < allPersonsInChapter.length - 1) {
+    const laterNames = allPersonsInChapter.slice(entry.personOrder + 1);
+    for (let i = startIdx + 1; i < rows.length; i++) {
+      const text = rows[i].content;
+      const head = text.replace(/^[○●◎○\s]+/, "").slice(0, 8);
+      const matched = laterNames.some(
+        (n) =>
+          head.startsWith(n) ||
+          (() => {
+            const idx = text.indexOf(`${n}，字`);
+            return idx >= 0 && idx < Math.max(40, text.length / 2);
+          })()
+      );
+      if (matched) {
+        endIdx = i;
+        break;
+      }
+    }
+  }
+
+  return {
+    paragraphs: rows.slice(startIdx, endIdx).map((r) => r.content),
+    chapterLabel: entry.chapterLabel,
+    bookSlug: entry.bookSlug,
+    bookTitle: book.title,
+    anchor: entry.anchor || "",
+    sliceFromIndex: startIdx,
+    sliceToIndex: endIdx,
+    chapterParagraphCount: rows.length,
+  };
+}
+
+/**
+ * Returns biography-aware chronology references for a person query.
+ *  - When the person IS in the biography index: the dedicated chapter slice
+ *    from each indexed book is returned as the primary reference.
+ *  - When NOT indexed: returns null (caller should fall back to keyword
+ *    search via buildPersonChronology()).
+ */
+export function lookupBiographicalReferences(personQuery) {
+  const idx = loadBiographyIndex();
+  const name = (personQuery || "").trim();
+  if (!name) return null;
+  const entries = idx.index?.[name];
+  if (!entries || !entries.length) return null;
+
+  // We need the list of every person in each chapter (to know where the
+  // current person's slice ends). Build a quick lookup by walking the index.
+  const personsInChapter = new Map(); // `${slug}#${order}` -> [name, …] sorted by personOrder
+  for (const [pname, plist] of Object.entries(idx.index || {})) {
+    for (const e of plist) {
+      const key = `${e.bookSlug}#${e.chapterOrder}`;
+      if (!personsInChapter.has(key)) personsInChapter.set(key, []);
+      personsInChapter.get(key).push({ name: pname, order: e.personOrder });
+    }
+  }
+  for (const arr of personsInChapter.values()) arr.sort((a, b) => a.order - b.order);
+
+  const db = getDb();
+  const slices = [];
+  for (const e of entries) {
+    const key = `${e.bookSlug}#${e.chapterOrder}`;
+    const orderedNames = (personsInChapter.get(key) || []).map((x) => x.name);
+    const slice = extractPersonSlice(db, e, name, orderedNames);
+    if (slice) slices.push(slice);
+  }
+  return slices.length ? slices : null;
 }
 
 export async function getContextSnippets(query, limit = 6, slug = DEFAULT_BOOK_SLUG) {

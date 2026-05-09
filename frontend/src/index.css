@@ -1,9 +1,13 @@
 :root {
   /* Theme-aware: page background and base text color come from CSS vars
-     defined in App.css, overridden per [data-reader-theme="..."]. */
+     defined in App.css, overridden per [data-reader-theme="..."].
+     界面字体（--ui-font-family）独立于正文字体（--reader-font-family），
+     由设置面板的两个独立选择器控制。EPUB iframe / DB-reader 文章区
+     用 --reader-font-family；外层 UI（侧栏 / 工具栏 / 助理面板等）用
+     --ui-font-family。 */
   color: var(--ui-text-strong, #261912);
   background: var(--ui-page-bg);
-  font-family: var(--reader-font-family, "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif);
+  font-family: var(--ui-font-family, "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif);
   line-height: 1.5;
   font-weight: 400;
   font-synthesis: none;

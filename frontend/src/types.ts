@@ -93,6 +93,10 @@ export type SearchResult = {
   snippet: string;
   text: string;
   years: YearMention[];
+  // 跨书检索：标记结果属于哪本书 + 章节序号；同书检索时这两项可缺省。
+  bookSlug?: string;
+  bookTitle?: string;
+  chapterOrder?: number | null;
 };
 
 export type SearchResponse = {
@@ -183,6 +187,32 @@ export type ReaderNote = {
   text: string;
   note: string;
   createdAt: string;
+  // Historical timestamp inferred from the note's selection / surrounding
+  // context (e.g. "1457-02-11" if a 干支日 was resolved, or "嘉靖三年八月"
+  // if only year+month was found). Empty string when nothing matched.
+  historicalAt?: string;
+  // Sortable Gregorian year derived from historicalAt (for "按历史时间排序"
+  // and date-range filtering). Stored separately so we don't have to re-parse
+  // historicalAt on every list re-render.
+  historicalYear?: number;
+  // Which book the note was taken in (book slug). Used to group notes by book.
+  bookSlug?: string;
+  // Timeline integration — when true, the note shows up as an entry in the
+  // 历史时间线 panel alongside dynasty events. Defaults to false (opt-in).
+  inTimeline?: boolean;
+  // Manual override for historical timing. When set, takes priority over the
+  // auto-detected `historicalAt` / `historicalYear` for timeline placement.
+  manualYear?: number;
+  manualMonth?: number;
+  manualDay?: number;
+  // Importance score 1–5 (aligns with 历史时间线 event scale). Default 1.
+  timelineScale?: number;
+  // Category label for timeline rendering. Default "我的笔记" — gets its own
+  // accent color so user notes stand out from dynasty events.
+  timelineCategory?: string;
+  // Short title used as the note's display label on the timeline. Falls back
+  // to the first ~20 chars of `note` when empty.
+  timelineTitle?: string;
 };
 
 export type ReaderHighlight = {

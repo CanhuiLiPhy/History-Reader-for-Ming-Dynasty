@@ -121,14 +121,9 @@
     "author": "张岱",
     "dynasty": "明",
     "category": "reference",
-    "sourceType": "wikisource",
-    "sourceUrl": "https://zh.wikisource.org/wiki/%E7%9F%B3%E5%8C%AE%E6%9B%B8",
-    "crawl": {
-      "mode": "toc",
-      "sameTitlePrefix": "石匱書",
-      "recommendedMaxPages": 30
-    },
-    "description": "张岱私修明史，叙事生动，多可与官修《明史》互证，尤重人物描写。"
+    "sourceType": "local-text",
+    "sourceUrl": "local://database",
+    "description": "张岱私修明史，叙事生动，多可与官修《明史》互证，尤重人物描写。本项目使用 ctext 净本（卷一~卷四）+ shiku-shu OCR Pass 3 手工重写（卷五~卷十七）。"
   },
   {
     "slug": "zuiwei-lu",
@@ -327,5 +322,25 @@
     "sourceType": "local-epub",
     "sourceUrl": "local://database",
     "description": "清人夏燮编撰的明代编年通史，适合与《明史》纪传互证。"
+  },
+  {
+    "slug": "shiku-shu-houji",
+    "title": "石匮书后集",
+    "author": "张岱",
+    "dynasty": "明末清初",
+    "category": "reference",
+    "sourceType": "local-text",
+    "sourceUrl": "local://database",
+    "description": "张岱《石匮书》之续编，专记崇祯一朝及南明史事，是南明史研究核心私家史料。"
+  },
+  {
+    "slug": "du-tong-jian-lun",
+    "title": "读通鉴论",
+    "author": "王夫之 著；舒士彦 点校",
+    "dynasty": "清",
+    "category": "reference",
+    "sourceType": "local-epub",
+    "sourceUrl": "local://database",
+    "description": "王夫之以《资治通鉴》为基础的史评，覆盖战国至五代；论史观、王霸、人君、用兵、治法等，可与明史互参。"
   }
 ]

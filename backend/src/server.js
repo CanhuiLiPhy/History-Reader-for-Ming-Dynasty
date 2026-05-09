@@ -5,11 +5,12 @@ import express from "express";
 import mime from "mime-types";
 import { FRONTEND_DIST, PORT, getPublicDefaults } from "./config/defaults.js";
 import { explainReignTerm } from "./data/reign-map.js";
-import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook, resolveBookEpubPath, bookEpubExists, DEFAULT_BOOK_SLUG } from "./services/book-service.js";
+import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook, searchAcrossBooks, searchFuzzy, resolveBookEpubPath, bookEpubExists, DEFAULT_BOOK_SLUG, lookupBiographicalReferences } from "./services/book-service.js";
 import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, synthesizeSpeech } from "./services/ai-service.js";
 import { initializeLibrary } from "./services/library-db.js";
 import { ensureSplitEpub } from "./services/epub-splitter.js";
 import { getReadableBooks, getReaderChapters, getReaderChapter } from "./services/library-reader.js";
+import { queryTimelineEvents, ALL_CATEGORIES, listAllTimelineEvents, patchTimelineEvent, deleteTimelineEvent, createTimelineEvent } from "./services/timeline-service.js";
 import {
   answerReadingQuestion,
   convertChronologyTerm,
@@ -139,9 +140,29 @@ async function handleBookSearch(req, res, next) {
   try {
     const payload = req.method === "POST" ? req.body || {} : req.query;
     const query = String(payload.q || "").trim();
-    const mode = String(payload.mode || "hybrid");
-    const limit = Number.parseInt(String(payload.limit || "20"), 10);
-    const slug = String(payload.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
+    // 三种模式：
+    //   local —— 本地检索（FTS5 trigram 子串 + LIKE 回退，简繁双展）
+    //   fuzzy —— 模糊检索（bigram 覆盖度评分 + 简繁双展）
+    //   ai    —— AI 意图检索（先让 LLM 改写 / 扩展查询，再走 local；失败或
+    //            空命中时自动回落到 fuzzy）
+    // 兼容老前端的 "hybrid" → 视作 local。
+    const rawMode = String(payload.mode || "local");
+    const mode = rawMode === "hybrid" ? "local" : rawMode;
+    // Mode-specific defaults when frontend doesn't pass an explicit limit:
+    //   local 100 / fuzzy 50 / ai 80
+    const MODE_DEFAULT_LIMIT = { local: 100, fuzzy: 50, ai: 80 };
+    const limit = payload.limit
+      ? Number.parseInt(String(payload.limit), 10)
+      : MODE_DEFAULT_LIMIT[mode] ?? 50;
+
+    let slugs = Array.isArray(payload.slugs)
+      ? payload.slugs
+      : typeof payload.slugs === "string" && payload.slugs.trim()
+      ? payload.slugs.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+    if (!slugs.length && payload.slug && String(payload.slug).trim()) {
+      slugs = [String(payload.slug).trim()];
+    }
     const aiSettings = resolveAiSettings(payload.aiSettings || {
       baseURL: payload.baseURL,
       apiKey: payload.apiKey,
@@ -162,15 +183,42 @@ async function handleBookSearch(req, res, next) {
           ...(aiExpansion?.searchQueries || [])
         ];
       } catch (error) {
-        aiExpansion = { note: `AI 扩展失败，已回退到本地搜索：${error.message}` };
+        aiExpansion = { note: `AI 扩展失败，已自动回退到本地模糊检索：${error.message}` };
       }
     }
 
-    const result = await searchBook(query, { limit, expandedQueries, slug });
-    res.json({
-      ...result,
-      aiExpansion
-    });
+    // 单本搜索路由：
+    //   - 有 EPUB 文件的书 → searchBook（基于 EPUB segments + Fuse.js 模糊）
+    //   - 没 EPUB 的书（local-text / wikisource / ctext 仅 paragraph）→ 走
+    //     searchAcrossBooks 单 slug 模式（FTS5）
+    // 老逻辑直接调 searchBook 会抛 ENOENT，导致 .txt / 抓取来源的书全程搜不到。
+    const singleSlug = slugs.length === 1 ? slugs[0] : null;
+    const singleHasEpub = singleSlug ? bookEpubExists(singleSlug) : false;
+    const useEpubSearch = singleSlug && singleHasEpub;
+
+    let result;
+    if (mode === "fuzzy") {
+      result = await searchFuzzy(query, { limit, slugs });
+    } else if (mode === "ai") {
+      // AI 模式：先做 local（带扩展词）；为空 → 自动回退 fuzzy。
+      result = useEpubSearch
+        ? await searchBook(query, { limit, expandedQueries, slug: singleSlug })
+        : await searchAcrossBooks(query, { limit, expandedQueries, slugs });
+      if (!result.total) {
+        const fb = await searchFuzzy(query, { limit, slugs });
+        if (fb.total) {
+          result = fb;
+          aiExpansion = aiExpansion || {};
+          aiExpansion.note = (aiExpansion.note || "") + (aiExpansion.note ? " " : "") + "本地未找到精确匹配，已使用模糊检索结果。";
+        }
+      }
+    } else {
+      // local（含老的 hybrid 别名）
+      result = useEpubSearch
+        ? await searchBook(query, { limit, expandedQueries, slug: singleSlug })
+        : await searchAcrossBooks(query, { limit, expandedQueries, slugs });
+    }
+    res.json({ ...result, aiExpansion });
   } catch (error) {
     next(error);
   }
@@ -228,9 +276,12 @@ app.post("/api/reference/compare", async (req, res, _next) => {
       return;
     }
     const aiSettings = resolveAiSettings(clientAiSettings);
+    // 整个 cross-compare 流程 = 4 步串行 AI 调用（关键词抽取 → 书目筛选 →
+    // 候选过滤 → 最终报告），每步可能撞 timeout 走 fallback 队列。给足空间。
+    // 前端 fetchWithTimeout 是 900s，这里设 850s 留 50s 给响应序列化。
     const result = await Promise.race([
       runCrossSourceComparison(String(selectedText).trim(), aiSettings, String(currentBookSlug || DEFAULT_BOOK_SLUG)),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 280000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 850000))
     ]);
     res.json(result);
   } catch (error) {
@@ -268,6 +319,60 @@ app.get("/api/reference/emperors", (_req, res) => {
 
 app.get("/api/reference/officials", (_req, res) => {
   res.json(getOfficialsPayload());
+});
+
+app.get("/api/reference/history-timeline", (req, res) => {
+  const from = req.query.from ? Number.parseInt(String(req.query.from), 10) : undefined;
+  const to = req.query.to ? Number.parseInt(String(req.query.to), 10) : undefined;
+  const reign = String(req.query.reign || "").trim() || undefined;
+  const minScale = req.query.minScale ? Math.max(1, Math.min(5, Number.parseInt(String(req.query.minScale), 10))) : 1;
+  const limit = req.query.limit ? Math.max(1, Math.min(2000, Number.parseInt(String(req.query.limit), 10))) : 200;
+  // categories=皇室,军事,灾异 — comma-separated; omit/empty = all
+  const catParam = String(req.query.categories || "").trim();
+  const categories = catParam ? catParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+  // scales=3,4,5 — multi-select importance; omit/empty = all (subject to minScale legacy)
+  const scaleParam = String(req.query.scales || "").trim();
+  const scales = scaleParam
+    ? scaleParam.split(",").map((s) => Number.parseInt(s.trim(), 10)).filter((n) => n >= 1 && n <= 5)
+    : undefined;
+  res.json(queryTimelineEvents({ from, to, reign, minScale, scales, categories, limit }));
+});
+
+app.get("/api/reference/history-timeline-categories", (_req, res) => {
+  res.json({ categories: ALL_CATEGORIES });
+});
+
+// ===== timeline event admin (inline edit + double-click modal) =====
+app.get("/api/timeline-events", (_req, res) => {
+  res.json({ events: listAllTimelineEvents({ includeHidden: true }) });
+});
+
+app.patch("/api/timeline-events/:id", (req, res) => {
+  const id = Number.parseInt(String(req.params.id), 10);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "bad id" }); return; }
+  try {
+    const updated = patchTimelineEvent(id, req.body || {});
+    if (!updated) { res.status(404).json({ error: "not found or no fields" }); return; }
+    res.json({ event: updated });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+app.delete("/api/timeline-events/:id", (req, res) => {
+  const id = Number.parseInt(String(req.params.id), 10);
+  if (!Number.isInteger(id)) { res.status(400).json({ error: "bad id" }); return; }
+  const r = deleteTimelineEvent(id);
+  res.json({ deleted: r.changes });
+});
+
+app.post("/api/timeline-events", (req, res) => {
+  try {
+    const created = createTimelineEvent(req.body || {});
+    res.json({ event: created });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
 });
 
 app.get("/api/reference/reign-convert", (req, res) => {
@@ -376,23 +481,58 @@ app.post("/api/ai/person-chronology", async (req, res, next) => {
       return;
     }
 
+    // First try the biography index — if this person has a dedicated 列传 /
+    // 世家 / 行状 chapter in any of 明史 / 石匮书后集 / 东林列传 / 罪惟录,
+    // pass that exact slice as the AI's primary reference. Otherwise fall
+    // back to the keyword-fuzzy chronology built from full-text search.
+    const bioSlices = lookupBiographicalReferences(person);
     const chronology = await buildPersonChronology(person);
-    const result = await runReaderAction({
-      type: "chronology",
-      person,
-      contextSnippets: chronology.items.slice(0, 16).map((item, index) => ({
+
+    let contextSnippets;
+    if (bioSlices && bioSlices.length) {
+      // Each slice's paragraphs are joined into one big snippet per book —
+      // the AI receives the full biographical chapter slice, not just a
+      // 200-char fuzzy match. Cap each slice's joined text to keep the
+      // total prompt under model context.
+      const PER_SLICE_CHAR_CAP = 6000;
+      contextSnippets = bioSlices.map((s, i) => ({
+        index: i + 1,
+        chapterTitle: `${s.bookTitle}·${s.chapterLabel}`,
+        chapterHref: s.anchor,
+        snippet: s.paragraphs.join("\n").slice(0, PER_SLICE_CHAR_CAP),
+        biographical: true
+      }));
+    } else {
+      contextSnippets = chronology.items.slice(0, 16).map((item, index) => ({
         index: index + 1,
         chapterTitle: item.chapterTitle,
         chapterHref: item.chapterHref,
         snippet: item.snippet
-      })),
+      }));
+    }
+
+    const result = await runReaderAction({
+      type: "chronology",
+      person,
+      contextSnippets,
       aiSettings
     });
 
     res.json({
       ...chronology,
       summary: result.answer,
-      model: result.model
+      model: result.model,
+      sourceMode: bioSlices && bioSlices.length ? "biography-index" : "keyword-search",
+      biographicalChapters: bioSlices ? bioSlices.map((s) => ({
+        bookSlug: s.bookSlug,
+        bookTitle: s.bookTitle,
+        chapterLabel: s.chapterLabel,
+        anchor: s.anchor,
+        paragraphCount: s.paragraphs.length,
+        sliceFromIndex: s.sliceFromIndex,
+        sliceToIndex: s.sliceToIndex,
+        chapterParagraphCount: s.chapterParagraphCount,
+      })) : []
     });
   } catch (error) {
     next(error);

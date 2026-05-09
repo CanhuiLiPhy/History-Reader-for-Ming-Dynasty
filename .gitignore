@@ -18,6 +18,10 @@ CLAUDE.md
 donotpack/
 database/
 archive/
+OCR/
+
+# === 内部审计/整理笔记（不入公开仓库） ===
+docs/项目整理建议.md
 
 # === 原始数据源 ===
 *.epub

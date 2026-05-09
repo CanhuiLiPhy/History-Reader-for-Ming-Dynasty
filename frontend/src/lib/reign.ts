@@ -5,6 +5,31 @@ const MING_REIGNS = [
   // that the regex should also accept; reignYearToGregorian normalizes them
   // back to the canonical simplified `reign`. The default reader scriptVariant
   // is "traditional", so traditional matches are the common case.
+  //
+  // 范围说明：本表已扩展到包含 元朝晚期 + 清朝前期 的年号，主要服务于：
+  //   - 明实录卷首/罪惟录早期对元末年号（至正、天历、至顺等）的引用
+  //   - 廿二史札记、明史纪事本末、读通鉴论 等清人著作里清前期年号
+  //   - 跨明清史料比对时正确识别公元年份
+  // 名为 MING_REIGNS 是历史遗留，实际是"本库识别的所有年号"列表。
+
+  // ====== 元朝晚期（与明初接轨）======
+  { reign: "至元", aliases: [], emperor: "元世祖忽必烈/元顺帝妥懽帖睦尔", startYear: 1264, endYear: 1340 }, // 早 1264-1294 (世祖) + 晚 1335-1340 (顺帝)，按晚期连续段处理
+  { reign: "元贞", aliases: [], emperor: "元成宗铁穆耳", startYear: 1295, endYear: 1297 },
+  { reign: "大德", aliases: [], emperor: "元成宗铁穆耳", startYear: 1297, endYear: 1307 },
+  { reign: "至大", aliases: [], emperor: "元武宗海山", startYear: 1308, endYear: 1311 },
+  { reign: "皇庆", aliases: ["皇慶"], emperor: "元仁宗爱育黎拔力八达", startYear: 1312, endYear: 1313 },
+  { reign: "延祐", aliases: ["延祐", "延佑"], emperor: "元仁宗爱育黎拔力八达", startYear: 1314, endYear: 1320 },
+  { reign: "至治", aliases: [], emperor: "元英宗硕德八剌", startYear: 1321, endYear: 1323 },
+  { reign: "泰定", aliases: [], emperor: "元泰定帝也孙铁木儿", startYear: 1324, endYear: 1328 },
+  { reign: "致和", aliases: [], emperor: "元泰定帝也孙铁木儿", startYear: 1328, endYear: 1328 },
+  { reign: "天历", aliases: ["天曆"], emperor: "元文宗图帖睦尔", startYear: 1328, endYear: 1330 },
+  { reign: "至顺", aliases: ["至順"], emperor: "元文宗图帖睦尔/元宁宗", startYear: 1330, endYear: 1333 },
+  { reign: "元统", aliases: ["元統"], emperor: "元顺帝妥懽帖睦尔", startYear: 1333, endYear: 1335 },
+  { reign: "至正", aliases: [], emperor: "元顺帝妥懽帖睦尔", startYear: 1341, endYear: 1370 },
+
+  // ====== 明朝（核心）======
+  // 吴：朱元璋称帝前的自立年号（1364 自立为吴王 → 1364-1367 计年；1368 改元洪武）
+  { reign: "吴", aliases: ["吳"], emperor: "明太祖朱元璋（称帝前）", startYear: 1364, endYear: 1367 },
   { reign: "洪武", aliases: [], emperor: "明太祖朱元璋", startYear: 1368, endYear: 1398 },
   { reign: "建文", aliases: [], emperor: "明惠帝朱允炆", startYear: 1399, endYear: 1402 },
   { reign: "永乐", aliases: ["永樂"], emperor: "明成祖朱棣", startYear: 1403, endYear: 1424 },
@@ -22,6 +47,14 @@ const MING_REIGNS = [
   { reign: "泰昌", aliases: [], emperor: "明光宗朱常洛", startYear: 1620, endYear: 1620 },
   { reign: "天启", aliases: ["天啟"], emperor: "明熹宗朱由校", startYear: 1621, endYear: 1627 },
   { reign: "崇祯", aliases: ["崇禎"], emperor: "明思宗朱由检", startYear: 1628, endYear: 1644 },
+
+  // ====== 清朝前期（南明史料/清人著作里常见）======
+  { reign: "顺治", aliases: ["順治"], emperor: "清世祖福临", startYear: 1644, endYear: 1661 },
+  { reign: "康熙", aliases: [], emperor: "清圣祖玄烨", startYear: 1662, endYear: 1722 },
+  { reign: "雍正", aliases: [], emperor: "清世宗胤禛", startYear: 1723, endYear: 1735 },
+  { reign: "乾隆", aliases: [], emperor: "清高宗弘历", startYear: 1736, endYear: 1795 },
+  { reign: "嘉庆", aliases: ["嘉慶"], emperor: "清仁宗颙琰", startYear: 1796, endYear: 1820 },
+  { reign: "道光", aliases: [], emperor: "清宣宗旻宁", startYear: 1821, endYear: 1850 },
 ];
 
 // Map any reign-name form (simplified or traditional alias) to its canonical
@@ -34,6 +67,7 @@ for (const r of MING_REIGNS) {
 
 const NUMERAL_MAP: Record<string, number> = {
   元: 1,
+  正: 1, // 正月 — defensive: callers normally remap "正" → "一" before calling, but this catches direct calls.
   零: 0,
   〇: 0,
   一: 1,
@@ -112,12 +146,86 @@ export function reignYearToGregorian(reign: string, yearText: string) {
 // "天順元年 春正月 壬午" still match.
 export const TIANGAN = "甲乙丙丁戊己庚辛壬癸";
 export const DIZHI = "子丑寅卯辰巳午未申酉戌亥";
+
+// ---------------------------------------------------------------------------
+// 干支纪年：60 年一周期，给定 干支 + 候选年份范围 → 唯一年份
+// ---------------------------------------------------------------------------
+//
+// 古历用 干支 标年（"乙未春正月戊午" 里 "乙未" 就是 干支年）。一个 干支 对
+// 应每 60 年出现一次的年份；只要给定一个不超过 60 年的窗口就能唯一定位。
+// 公元年→干支：(year - 4) mod 60 → 干支 序号（0=甲子）
+const TIANGAN_ARR = TIANGAN.split("");
+const DIZHI_ARR = DIZHI.split("");
+
+function ganzhiYearOf(year: number): string {
+  const n = ((year - 4) % 60 + 60) % 60;
+  return TIANGAN_ARR[n % 10] + DIZHI_ARR[n % 12];
+}
+
+/**
+ * 给定 干支 字符串和一个候选年份窗口，返回窗口内唯一的公元年；窗口跨度
+ * 大于 60 年时返回多个候选，由上层逻辑（章节上下文）来挑选。
+ */
+export function ganzhiToYear(ganzhi: string, fromYear: number, toYear: number): number[] {
+  const out: number[] = [];
+  for (let y = fromYear; y <= toYear; y++) {
+    if (ganzhiYearOf(y) === ganzhi) out.push(y);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 明实录 干支纪年专属逻辑：仅适用 太祖实录/卷之一 ~ 卷之二十一
+// ---------------------------------------------------------------------------
+//
+// 明实录 大部分卷仍用 「年号+年」（永乐X年 / 洪武Y年 / 宣德Z年 ...）—— 走
+// 通用 reign+year 解析路径即可。**唯一**需要干支专属处理的是 太祖实录前
+// 21 卷：覆盖 朱元璋 出生（1328）到 称帝前一年 吴元年（1367）这段，无明朝
+// 年号可用，元朝年号也基本被作者刻意废弃，文中以 干支 标年（"乙未春正月戊午"
+// 这种）。
+//
+// 卷之二十二 起进入 洪武元年，正常用「洪武 N 年」纪年，跟其它实录无异。
+//
+// 范围限定 [1328, 1367]：1328 = 朱元璋 生年；1367 = 吴元年（自立 吴 王末年）。
+// 1368 起用 洪武，由通用路径接管。
+
+type ShiluRange = { from: number; to: number; primaryReign?: string };
+
+const TAIZU_PRE_REIGN_RANGE: ShiluRange = { from: 1328, to: 1367 };
+
+/**
+ * 给定章节标签返回该章节适用的「干支年→公元年」反查窗口。返回 null 表示
+ * 该章节走通用 reign+year 解析路径，不进入 实录 干支专属分支。
+ *
+ * 命中条件（仅有这一种）：
+ *   - 章节是 太祖实录/序 或 太祖实录/卷之X，且 X 的汉字数字 1..21
+ *
+ * 其它实录（太宗实录…崇祯实录）以及 太祖实录/卷之二十二 之后，统统返回
+ * null —— 它们都正常使用「年号+年」纪年，没必要绕道。
+ */
+export function shiluRangesForChapter(chapterLabel: string): ShiluRange[] | null {
+  if (!chapterLabel.startsWith("太祖实录")) return null;
+  // 太祖实录/序 一并适用（小序通常含纪年信息）
+  if (chapterLabel.startsWith("太祖实录/序")) {
+    return [TAIZU_PRE_REIGN_RANGE];
+  }
+  // 太祖实录/卷之X — 仅 1..21
+  const m = chapterLabel.match(/^太祖实录\/卷之([元一二三四五六七八九十百\d]+)/);
+  if (!m) return null;
+  const n = chineseNumeralToInt(m[1]);
+  if (n == null) return null;
+  if (n < 1 || n > 21) return null;
+  return [TAIZU_PRE_REIGN_RANGE];
+}
 // REIGN_NAMES enumerates every accepted spelling (canonical + traditional
 // aliases), so the regex matches whichever form appears in the text.
 const REIGN_NAMES = MING_REIGNS.flatMap((item) => [item.reign, ...item.aliases]).join("|");
 const NUM_CLASS = "〇零一二三四五六七八九十百千两\\d";
 const LEAP = "(?:闰|閏)";
-const GAP = "[\\s·、，,]*";
+// GAP 允许「年」「月」「日」之间出现的分隔符。补上 句号 / 分号 / 中文逗号
+// / 中文/英文括号注释起讫等，以兼容 "永乐元年。春正月戊午"、
+// "嘉靖三十六年（1557）八月" 这种带注释或标点的写法。
+const GAP = "[\\s·、，,。．；;（）()【】\\[\\]]*";
 
 export const REIGN_DATE_PATTERN = new RegExp(
   `(${REIGN_NAMES})?(元|[${NUM_CLASS}]+)年` +
@@ -327,7 +435,11 @@ export const REIGN_PATTERN = REIGN_DATE_PATTERN;
 //      month boundaries).
 // ---------------------------------------------------------------------------
 
+// ANCHOR_RE retired — superseded by YEAR_OPTIONAL_REIGN_RE below which
+// matches both `<reign>N年` and bare `N年` in one pass. Keep for any
+// external callers (none in tree right now) — `void` to silence TS unused.
 const ANCHOR_RE = new RegExp(`(${REIGN_NAMES})(元|[${NUM_CLASS}]+)年`, "g");
+void ANCHOR_RE;
 // Plain month — used by lastMonthBefore (context lookup). Doesn't capture
 // trailing ganzhi; that's handled by MONTH_WITH_DAY_RE in the selection
 // matcher.
@@ -343,23 +455,283 @@ const GANZHI_RE = new RegExp(`[${TIANGAN}][${DIZHI}](?=日|[，。、；,;\\s]|$
 
 type Anchor = { reign: string; yearText: string; year: number; gregorianYear: number; emperor: string };
 
+// 单一遍历的年份搜索：捕获 `(reign)?N年` 形式（reign 可选）。这样可以一次
+// 遍历就能按位置向后扫描，**最近的"X年"优先**（不管带不带年号），符合
+// "先找年、再回溯年号"的逻辑。
+//   - 命中带年号 → 直接组成 anchor
+//   - 命中裸年 → 从裸年位置往前再找最近的年号名（永乐 / 嘉靖 / …）配上
+//   - 都失败 → null（caller 通常会扩 context 到上一章重试）
+const YEAR_OPTIONAL_REIGN_RE = new RegExp(
+  `(${REIGN_NAMES})?\\s*(元|[${NUM_CLASS}]+)年`,
+  "g",
+);
+const REIGN_NAME_RE = new RegExp(`(${REIGN_NAMES})`, "g");
+
+function lastReignNameBefore(text: string): string | null {
+  const matches = [...text.matchAll(REIGN_NAME_RE)];
+  if (!matches.length) return null;
+  return matches[matches.length - 1][1];
+}
+
 function lastAnchorBefore(text: string): Anchor | null {
-  const matches = [...text.matchAll(ANCHOR_RE)];
+  const matches = [...text.matchAll(YEAR_OPTIONAL_REIGN_RE)];
   for (let i = matches.length - 1; i >= 0; i--) {
     const m = matches[i];
-    const base = reignYearToGregorian(m[1], m[2]);
+    const yearText = m[2];
+    let reign = m[1];
+    if (!reign) {
+      // 裸年 → 从该年位置之前再回溯最近的年号名
+      reign = lastReignNameBefore(text.slice(0, m.index ?? 0)) ?? "";
+    }
+    if (!reign) continue;
+    const base = reignYearToGregorian(reign, yearText);
     if (!base) continue;
-    const canonical = REIGN_CANONICAL[m[1]] || m[1];
-    const reignInfo = MING_REIGNS.find((r) => r.reign === canonical)!;
+    const canonical = REIGN_CANONICAL[reign] || reign;
+    const reignInfo = MING_REIGNS.find((r) => r.reign === canonical);
+    if (!reignInfo) continue;
     return {
-      reign: m[1],
-      yearText: m[2],
-      year: chineseNumeralToInt(m[2])!,
+      reign,
+      yearText,
+      year: chineseNumeralToInt(yearText)!,
       gregorianYear: base.gregorian,
       emperor: reignInfo.emperor,
     };
   }
   return null;
+}
+
+// =====================================================================
+// 明实录专用日期解析
+// =====================================================================
+//
+// 这条路径**只**给章节是 X实录/卷之N 的选段用，不影响通用 resolveSelectionDate。
+// 实录用 干支 标年（"乙未春正月戊午" → 乙未 = 1355 年），通用逻辑（年号+年）
+// 在这里完全失效。
+//
+// 三种识别目标：
+//   (a) 选段就是「干支+季节[+月][+干支日]」    → 自包含，直接算
+//       例: "乙未春正月戊午" / "癸巳春" / "丙申夏四月丁巳"
+//   (b) 选段是「月[+干支日]」                  → 月在选段里，年从 contextBefore 拿
+//       例: "正月辛巳"
+//   (c) 选段是「干支日」                       → 月+年都从 contextBefore 拿
+//       例: "辛巳"
+//
+// contextBefore 里的 anchor 形态（重要的是这两种 ——「干支+季节」就够当年用）：
+//   "干支+季节[+月]"  例: "乙未春正月戊午" / "癸巳春" / "丙申夏四月"
+//
+// 由于 干支 60 年一周期，要靠章节所在 实录 的年份范围把 干支 反查为公元年。
+// 太祖实录跨度 70 年（1328-1398），SHILU_RANGES 把它拆成 1328-1368（元末）+
+// 1368-1398（洪武）两段，分别反查后取**靠近 contextBefore 末尾**的候选。
+
+const SHILU_GZ_SEASON_MONTH_RE = new RegExp(
+  `([${TIANGAN}][${DIZHI}])([春夏秋冬])(?:${GAP}(${LEAP}?)([元正${NUM_CLASS}]+)月)?`,
+  "g",
+);
+// 选段里的「干支+季节(+月)(+干支日)」
+const SEL_SHILU_FULL_RE = new RegExp(
+  `([${TIANGAN}][${DIZHI}])([春夏秋冬])` +
+    `(?:${GAP}(${LEAP}?)([元正${NUM_CLASS}]+)月)?` +
+    `(?:${GAP}([${TIANGAN}][${DIZHI}])日?)?`,
+);
+// 选段里的「[闰]月[+干支日]」
+const SEL_MONTH_DAY_RE = new RegExp(
+  `(${LEAP}?)([元正${NUM_CLASS}]+)月(?:${GAP}([${TIANGAN}][${DIZHI}])日?)?`,
+);
+// 选段里的「干支日」
+const SEL_BARE_GANZHI_RE = new RegExp(`[${TIANGAN}][${DIZHI}]`);
+
+// =====================================================================
+// 章节级默认 干支年 补丁
+// =====================================================================
+//
+// 卷21 开头是 "丙午八月庚戌朔..."，但卷20 末尾是廖永安传记倒叙了 乙未/甲辰
+// 等更早年份，用 "text 位置最靠后" 或 "max year" 之类启发式都会被传记内容
+// 误导。比起加复杂的"识别叙事年 vs 传记年"逻辑，这里直接给这一章登记一个
+// 硬编码默认值：当 selection / contextBefore 都找不出 干支年 时，回退到
+// "丙午"。其它卷如果之后发现类似 corner case 再补这张表即可。
+const CHAPTER_DEFAULT_GANZHI: Record<string, string> = {
+  "太祖实录/卷之二十一": "丙午",
+};
+
+function ganzhiYearToGregorian(ganzhi: string, ranges: Array<{ from: number; to: number }>): number | null {
+  // 在每个 range 段内反查，返回最靠后的候选（实录顺序写，靠后 = 较晚事件 = 较大年份）
+  let candidates: number[] = [];
+  for (const r of ranges) {
+    candidates.push(...ganzhiToYear(ganzhi, r.from, r.to));
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a - b);
+  return candidates[candidates.length - 1];
+}
+
+function monthAndDayFromMonthMatch(
+  m: RegExpExecArray,
+  leapIdx = 1,
+  monthIdx = 2,
+  dayIdx = 3,
+): { isLeap: boolean; monthOrdinal: number; monthText: string; ganzhiDay?: string } | null {
+  const monthRaw = m[monthIdx];
+  if (!monthRaw) return null;
+  const monthText = MONTH_NORMALIZE[monthRaw] ?? monthRaw;
+  const ord = chineseNumeralToInt(monthText === "正" ? "一" : monthText);
+  if (!ord || ord < 1 || ord > 12) return null;
+  return {
+    isLeap: Boolean(m[leapIdx]),
+    monthOrdinal: ord,
+    monthText,
+    ganzhiDay: m[dayIdx] || undefined,
+  };
+}
+
+/**
+ * 明实录专用日期解析。仅当 chapterLabel 命中 SHILU_RANGES 时调用。
+ *
+ * 算法：
+ *   1. 选段里如果有「干支+季节」，用它作年（必要时还用它带的月/日）。
+ *   2. 选段里如果有「月+干支日」，月直接用；年回溯 contextBefore 找最近的
+ *      「干支+季节」复合体。
+ *   3. 选段里只有「干支日」，年和月都回溯 contextBefore 找最近的
+ *      「干支+季节[+月]」复合体；如果该复合体里没带月，再回退到 lastMonthBefore。
+ *   4. 用 SHILU_RANGES 把 干支年 反查为公元年；落到对应年号上下文，构造结果。
+ */
+export function resolveShiluSelectionDate(
+  selectionText: string,
+  contextBefore: string,
+  chapterLabel: string,
+  mode: DateDisplayMode = "lunar",
+): ResolvedSelectionDate | null {
+  const ranges = shiluRangesForChapter(chapterLabel);
+  if (!ranges) return null;
+
+  let ganzhiYear = "";
+  let monthOrdinal: number | undefined;
+  let monthText: string | undefined;
+  let isLeap = false;
+  let ganzhiDay = "";
+  let season = "";
+
+  // (a) 选段含「干支+季节(+月)(+干支日)」
+  const fullSel = SEL_SHILU_FULL_RE.exec(selectionText);
+  if (fullSel) {
+    ganzhiYear = fullSel[1];
+    season = fullSel[2];
+    isLeap = Boolean(fullSel[3]);
+    if (fullSel[4]) {
+      const md = monthAndDayFromMonthMatch(fullSel as RegExpExecArray, 3, 4, 5);
+      if (md) {
+        monthOrdinal = md.monthOrdinal;
+        monthText = md.monthText;
+        if (md.ganzhiDay) ganzhiDay = md.ganzhiDay;
+      }
+    }
+  } else {
+    // (b) 选段含「[闰]月[+干支日]」
+    const monthSel = SEL_MONTH_DAY_RE.exec(selectionText);
+    if (monthSel) {
+      const md = monthAndDayFromMonthMatch(monthSel as RegExpExecArray, 1, 2, 3);
+      if (md) {
+        isLeap = md.isLeap;
+        monthOrdinal = md.monthOrdinal;
+        monthText = md.monthText;
+        if (md.ganzhiDay) ganzhiDay = md.ganzhiDay;
+      }
+    } else {
+      // (c) 选段只有「干支日」
+      const ganzhiSel = SEL_BARE_GANZHI_RE.exec(selectionText);
+      if (ganzhiSel) ganzhiDay = ganzhiSel[0];
+    }
+  }
+
+  // 选段没年 → 回溯 contextBefore 找最近的「干支+季节(+月)」
+  if (!ganzhiYear) {
+    const ctxMatches = [...contextBefore.matchAll(SHILU_GZ_SEASON_MONTH_RE)];
+    if (ctxMatches.length > 0) {
+      const last = ctxMatches[ctxMatches.length - 1];
+      ganzhiYear = last[1];
+      if (!season) season = last[2];
+      // 选段里没有月 → 用 anchor 复合体里的月（如果有）
+      if (monthOrdinal === undefined && last[4]) {
+        const md = monthAndDayFromMonthMatch(last as unknown as RegExpExecArray, 3, 4, -1);
+        if (md) {
+          isLeap = md.isLeap;
+          monthOrdinal = md.monthOrdinal;
+          monthText = md.monthText;
+        }
+      }
+    } else {
+      // 章节级硬编码补丁（CHAPTER_DEFAULT_GANZHI 表）
+      const fallback = CHAPTER_DEFAULT_GANZHI[chapterLabel];
+      if (fallback) ganzhiYear = fallback;
+    }
+  }
+  if (!ganzhiYear) return null;
+
+  // 干支年 → 公元年
+  const gregorianYear = ganzhiYearToGregorian(ganzhiYear, ranges);
+  if (!gregorianYear) return null;
+
+  // 命中年号信息（用于显示）
+  const reignInfo = MING_REIGNS.find((r) => gregorianYear >= r.startYear && gregorianYear <= r.endYear);
+  const reign = reignInfo?.reign || "";
+  const yearInReign = reignInfo ? gregorianYear - reignInfo.startYear + 1 : 0;
+  const yearLabel = reign
+    ? `${reign}${yearInReign === 1 ? "元" : monthOrdinalToChinese(yearInReign)}年（${ganzhiYear}）`
+    : `${ganzhiYear}年（${gregorianYear}）`;
+
+  // 拼显示用 phrase
+  let phrase = yearLabel;
+  if (season) phrase += season;
+  if (monthOrdinal !== undefined && monthText) {
+    phrase += `${isLeap ? "闰" : ""}${monthText}月`;
+  }
+  if (ganzhiDay) phrase += ganzhiDay + "日";
+
+  // 算具体公历日（如有月+干支日）
+  let gregorian: string | undefined;
+  let lunar: string | undefined;
+  let preciseSolarY: number | undefined;
+  let preciseSolarM: number | undefined;
+  let preciseSolarD: number | undefined;
+  let rolledOver = false;
+
+  if (ganzhiDay && monthOrdinal !== undefined) {
+    const precise = resolvePreciseDate(gregorianYear, monthOrdinal, isLeap, ganzhiDay);
+    if (precise) {
+      rolledOver = precise.rolledOver;
+      preciseSolarY = precise.solarYear;
+      preciseSolarM = precise.solarMonth;
+      preciseSolarD = precise.solarDay;
+      gregorian = `${precise.solarYear} 年 ${precise.solarMonth} 月 ${precise.solarDay} 日`;
+      lunar = `${gregorianYear} 年${precise.isLeap ? "闰" : ""}${monthOrdinalToChinese(precise.monthOrdinal)}月${precise.lunarDayChinese}`;
+    }
+  } else if (monthOrdinal !== undefined) {
+    gregorian = `${gregorianYear} 年（${isLeap ? "闰" : ""}农历${monthOrdinal}月）`;
+    lunar = `${gregorianYear} 年${isLeap ? "闰" : ""}${monthOrdinalToChinese(monthOrdinal)}月`;
+  } else {
+    gregorian = `${gregorianYear} 年`;
+    lunar = `${gregorianYear} 年（农历）`;
+  }
+
+  let gregOut: string | undefined;
+  let lunarOut: string | undefined;
+  if (mode === "gregorian" || mode === "both") gregOut = gregorian;
+  if (mode === "lunar" || mode === "both") lunarOut = lunar;
+
+  return {
+    phrase,
+    gregorian: gregOut,
+    lunar: lunarOut,
+    reign,
+    emperor: reignInfo?.emperor,
+    rolledOver: rolledOver || undefined,
+    reignYear: yearInReign,
+    gregorianYear,
+    solarYear: preciseSolarY,
+    solarMonth: preciseSolarM,
+    solarDay: preciseSolarD,
+    monthOrdinal: monthOrdinal,
+    isLeapMonth: isLeap || undefined,
+  };
 }
 
 function lastMonthBefore(text: string): { isLeap: boolean; ordinal: number; monthText: string } | null {
@@ -470,6 +842,16 @@ export type ResolvedSelectionDate = {
   emperor?: string;
   warning?: string;      // "选段未含年号，已用前文最近年号" 之类
   rolledOver?: boolean;  // true if 干支 was found in next month (text-elision)
+  // Numeric breakdown — useful for sorting / range filtering. Set when the
+  // resolver had enough info to compute them (year always; solar*/lunar* only
+  // when 干支 day was given and a precise date came back).
+  reignYear?: number;     // numeric reign-year (e.g. 36 for 嘉靖三十六年)
+  gregorianYear?: number; // year derived from reign (e.g. 1557)
+  solarYear?: number;     // precise solar Y/M/D when 干支 found
+  solarMonth?: number;
+  solarDay?: number;
+  monthOrdinal?: number;  // 1-12 lunar month if known
+  isLeapMonth?: boolean;
 };
 
 export function resolveSelectionDate(
@@ -511,7 +893,6 @@ export function resolveSelectionDate(
     // ganzhi only
     anchor = lastAnchorBefore(contextBefore);
     if (!anchor) return null;
-    // Find most recent month — could be in selection BEFORE the ganzhi index, or in contextBefore
     const beforeGanzhi = selectionText.slice(0, token.index);
     monthInfo = lastMonthBefore(beforeGanzhi) || lastMonthBefore(contextBefore);
     if (!monthInfo) return null;
@@ -527,11 +908,17 @@ export function resolveSelectionDate(
   let gregorian: string | undefined;
   let lunar: string | undefined;
   let rolledOver = false;
+  let preciseSolarY: number | undefined;
+  let preciseSolarM: number | undefined;
+  let preciseSolarD: number | undefined;
 
   if (ganzhi && monthInfo) {
     const precise = resolvePreciseDate(anchor.gregorianYear, monthInfo.ordinal, monthInfo.isLeap, ganzhi);
     if (precise) {
       rolledOver = precise.rolledOver;
+      preciseSolarY = precise.solarYear;
+      preciseSolarM = precise.solarMonth;
+      preciseSolarD = precise.solarDay;
       gregorian = `${precise.solarYear} 年 ${precise.solarMonth} 月 ${precise.solarDay} 日`;
       lunar = `${anchor.gregorianYear} 年${precise.isLeap ? "闰" : ""}${monthOrdinalToChinese(precise.monthOrdinal)}月${precise.lunarDayChinese}`;
     }
@@ -560,5 +947,12 @@ export function resolveSelectionDate(
     warning: token.kind !== "year" || !token.reign
       ? `选段未含完整年号，已用前文最近的「${anchor.reign}${anchor.yearText}年」作为参照`
       : undefined,
+    reignYear: anchor.year,
+    gregorianYear: anchor.gregorianYear,
+    solarYear: preciseSolarY,
+    solarMonth: preciseSolarM,
+    solarDay: preciseSolarD,
+    monthOrdinal: monthInfo?.ordinal,
+    isLeapMonth: monthInfo?.isLeap || undefined,
   };
 }

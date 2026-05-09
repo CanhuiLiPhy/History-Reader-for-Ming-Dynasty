@@ -89,10 +89,10 @@ export function libraryEpubUrl(slug: string): string {
 
 export async function searchBook(
   query: string,
-  mode: "hybrid" | "ai",
+  mode: "local" | "fuzzy" | "ai",
   aiSettings: AiSettings,
-  limit = 18,
-  slug?: string,
+  limit = 50,
+  slugs?: string[],
 ): Promise<SearchResponse> {
   const response = await fetchWithTimeout("/api/book/search", {
     method: "POST",
@@ -101,7 +101,8 @@ export async function searchBook(
       q: query,
       mode,
       limit,
-      slug,
+      // slugs 为空数组 / undefined 时后端默认搜全部书
+      slugs: slugs && slugs.length ? slugs : undefined,
       aiSettings: mode === "ai" ? aiSettings : undefined,
     }),
   });
@@ -116,8 +117,8 @@ export async function fetchPersonChronology(person: string): Promise<ChronologyR
 }
 
 export async function fetchAiChronology(person: string, aiSettings: AiSettings): Promise<ChronologyResponse> {
-  // Server-side flow: FTS search 32 snippets → format context → single AI call
-  // (often 30–60 s on slow models). 35 s default is too tight; match runAiAction.
+  // FTS search 32 snippets → format context → single AI call.
+  // 后端单模型 timeout 已升到 300s；留 600s 给最多 2 次 fallback。
   const response = await fetchWithTimeout("/api/ai/person-chronology", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -125,12 +126,12 @@ export async function fetchAiChronology(person: string, aiSettings: AiSettings):
       person,
       aiSettings,
     }),
-  }, 180000);
+  }, 600000);
   return parseJsonResponse<ChronologyResponse>(response);
 }
 
 export async function runAiAction(payload: {
-  type: "translate" | "pronounce" | "explain" | "qa" | "custom";
+  type: "translate" | "pronounce" | "explain" | "qa" | "punctuate" | "custom";
   selection?: string;
   question?: string;
   aiSettings: AiSettings;
@@ -138,9 +139,10 @@ export async function runAiAction(payload: {
 }): Promise<AiActionResponse> {
   // QA chain: up to 4 sequential AI calls (qaPlan + book scope + reference
   // filter + final answer) plus web search. Each backend AI call can take up
-  // to 180s, so the chain can run for several minutes on slow models. Be
-  // generous on the frontend abort.
-  const timeoutMs = payload.type === "qa" ? 360000 : 180000;
+  // to 300s after the timeout bump; with multi-model fallback the whole chain
+  // can take 10+ minutes on a slow primary. Give the frontend abort enough
+  // headroom that we never beat the backend's own retry chain.
+  const timeoutMs = payload.type === "qa" ? 900000 : 600000;
   const response = await fetchWithTimeout("/api/ai/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -180,6 +182,10 @@ export async function lookupReference(query: string, aiSettings: AiSettings): Pr
 }
 
 export async function compareReference(selectedText: string, aiSettings: AiSettings, currentBookSlug?: string): Promise<ReferenceCompareResponse> {
+  // 史料对比内部要串行：抽关键词 → 圈选书目 → 大批量检索 → 二次过滤
+  // → 最终 6 节报告。每步可能触发 timeout fallback（一个模型挂了换下一个）。
+  // 后端单模型 timeout=300s × 最多 6 个模型轮询 = 30 分钟上限太长。
+  // 折中：前端给 15 分钟（900s），让后端有空间做 2-3 次 fallback。
   const response = await fetchWithTimeout("/api/reference/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -188,7 +194,7 @@ export async function compareReference(selectedText: string, aiSettings: AiSetti
       aiSettings,
       currentBookSlug,
     }),
-  }, 300000);
+  }, 900000);
   return parseJsonResponse<ReferenceCompareResponse>(response);
 }
 
@@ -253,4 +259,59 @@ export async function searchOfficeReferences(query: string): Promise<OfficeSearc
   url.searchParams.set("q", query);
   const response = await fetchWithTimeout(url);
   return parseJsonResponse<OfficeSearchPayload>(response);
+}
+
+export type HistoryTimelineEvent = {
+  id?: number;
+  year: number;
+  reign: string;
+  reignYearText: string;
+  description: string;
+  category: string; // 皇室/政争/制度/军事/民变/外交/经济/灾异/文化/人物/其他
+  scale: number; // 1-5
+  hidden?: number;
+  sourceLine?: number;
+};
+export type HistoryTimelinePayload = {
+  total: number;
+  events: HistoryTimelineEvent[];
+  yearMin: number;
+  yearMax: number;
+};
+
+export const HISTORY_CATEGORIES = ["皇室","政争","制度","军事","民变","外交","经济","灾异","文化","人物","其他"] as const;
+export type HistoryCategory = typeof HISTORY_CATEGORIES[number];
+
+export async function fetchHistoryTimeline(opts: { from?: number; to?: number; reign?: string; minScale?: number; scales?: number[]; categories?: string[]; limit?: number } = {}): Promise<HistoryTimelinePayload> {
+  const url = new URL("/api/reference/history-timeline", window.location.origin);
+  if (opts.from != null) url.searchParams.set("from", String(opts.from));
+  if (opts.to != null) url.searchParams.set("to", String(opts.to));
+  if (opts.reign) url.searchParams.set("reign", opts.reign);
+  if (opts.minScale) url.searchParams.set("minScale", String(opts.minScale));
+  if (opts.scales && opts.scales.length > 0) url.searchParams.set("scales", opts.scales.join(","));
+  if (opts.categories && opts.categories.length > 0) url.searchParams.set("categories", opts.categories.join(","));
+  if (opts.limit) url.searchParams.set("limit", String(opts.limit));
+  const response = await fetchWithTimeout(url);
+  return parseJsonResponse<HistoryTimelinePayload>(response);
+}
+
+export async function fetchAllTimelineEvents(): Promise<{ events: HistoryTimelineEvent[] }> {
+  const response = await fetchWithTimeout(new URL("/api/timeline-events", window.location.origin));
+  return parseJsonResponse<{ events: HistoryTimelineEvent[] }>(response);
+}
+
+export async function patchTimelineEventApi(id: number, patch: Partial<HistoryTimelineEvent>): Promise<{ event: HistoryTimelineEvent }> {
+  const url = new URL(`/api/timeline-events/${id}`, window.location.origin);
+  const response = await fetchWithTimeout(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  return parseJsonResponse<{ event: HistoryTimelineEvent }>(response);
+}
+
+export async function deleteTimelineEventApi(id: number): Promise<{ deleted: number }> {
+  const url = new URL(`/api/timeline-events/${id}`, window.location.origin);
+  const response = await fetchWithTimeout(url, { method: "DELETE" });
+  return parseJsonResponse<{ deleted: number }>(response);
 }
