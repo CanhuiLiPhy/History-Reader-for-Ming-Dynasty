@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")"
 
 echo ""
-echo "  MingShiReader v0.2  |  Ming History AI Reader"
+echo "  MingShiReader v1.1  |  Ming History AI Reader"
 echo "  Starting..."
 echo ""
 
@@ -32,6 +32,11 @@ if [ ! -f "backend/.env" ]; then
     echo "[ERROR] backend/.env not found."
     echo "Copy backend/.env.example to backend/.env and fill in your API key."
     exit 1
+fi
+
+# 引导：把 git 里固化的 timeline 分类导入空 DB（首次启动用）
+if [ -f "backend/src/data/timeline-events.json" ] && [ -f "backend/.cache/library.sqlite" ]; then
+    node backend/scripts/load-timeline-from-json.mjs >/dev/null 2>&1 || true
 fi
 
 echo "[OK] Starting server..."

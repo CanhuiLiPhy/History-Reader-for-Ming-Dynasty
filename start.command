@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo ""
-echo "  MingShiReader v0.2  |  Ming History AI Reader"
+echo "  MingShiReader v1.1  |  Ming History AI Reader"
 echo "  Starting..."
 echo ""
 
@@ -40,6 +40,11 @@ fi
 
 if [ ! -f "backend/.env" ]; then
     cp "backend/.env.example" "backend/.env"
+fi
+
+# Bootstrap timeline classifications from packaged JSON
+if [ -f "backend/src/data/timeline-events.json" ]; then
+    "$NODE" backend/scripts/load-timeline-from-json.mjs >/dev/null 2>&1 || true
 fi
 
 # Open browser after 1s

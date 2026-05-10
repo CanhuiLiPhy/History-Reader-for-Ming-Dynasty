@@ -9,9 +9,18 @@
  * Manual edits: run any SQLite client and `UPDATE timeline_events SET ...`
  * — there is no in-memory cache, so changes show up on the next request.
  */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getDb } from "./library-db.js";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TIMELINE_JSON_PATH = path.join(__dirname, "..", "data", "timeline-events.json");
+
 export const ALL_CATEGORIES = ["皇室","政争","制度","军事","民变","外交","经济","灾异","文化","人物","其他"];
+
+let bootstrapDone = false;
 
 function ensureTable() {
   const db = getDb();
@@ -31,6 +40,34 @@ function ensureTable() {
     CREATE INDEX IF NOT EXISTS idx_timeline_category ON timeline_events(category);
     CREATE INDEX IF NOT EXISTS idx_timeline_scale ON timeline_events(scale);
   `);
+
+  // 首次启动若表为空，从打包随附的 JSON 引导分类数据。
+  if (!bootstrapDone) {
+    bootstrapDone = true;
+    const count = db.prepare("SELECT COUNT(*) AS c FROM timeline_events").get().c;
+    if (count === 0 && fs.existsSync(TIMELINE_JSON_PATH)) {
+      try {
+        const payload = JSON.parse(fs.readFileSync(TIMELINE_JSON_PATH, "utf8"));
+        const events = payload.events || [];
+        const insert = db.prepare(
+          `INSERT INTO timeline_events (id, year, reign, reign_year_text, description, category, scale, source_line, hidden)
+           VALUES (@id, @year, @reign, @reignYearText, @description, @category, @scale, @sourceLine, @hidden)`
+        );
+        const tx = db.transaction((rows) => {
+          for (const r of rows) insert.run({
+            id: r.id, year: r.year,
+            reign: r.reign || "", reignYearText: r.reignYearText || "",
+            description: r.description, category: r.category, scale: r.scale,
+            sourceLine: r.sourceLine || null, hidden: r.hidden ? 1 : 0,
+          });
+        });
+        tx(events);
+        console.log(`[timeline] 引导 ${events.length} 条分类数据 ← timeline-events.json`);
+      } catch (e) {
+        console.warn(`[timeline] 引导失败: ${e.message}`);
+      }
+    }
+  }
 }
 
 export function listAllTimelineEvents({ includeHidden = true } = {}) {

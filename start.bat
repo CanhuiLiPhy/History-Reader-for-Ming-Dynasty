@@ -1,11 +1,11 @@
 @echo off
 chcp 65001 >nul
-title Mingshi Reader AI v0.2
+title Mingshi Reader AI v1.1
 cd /d "%~dp0"
 
 echo.
 echo ========================================
-echo   Mingshi Reader AI v0.2
+echo   Mingshi Reader AI v1.1
 echo   Starting...
 echo ========================================
 echo.
@@ -126,6 +126,11 @@ echo.
 :: ============================================
 :: 5. Start server
 :: ============================================
+:: 引导：把 git 里固化的 timeline 分类导入空 DB（首次启动用）
+if exist "backend\src\data\timeline-events.json" (
+    "%NODE_EXE%" backend\scripts\load-timeline-from-json.mjs >nul 2>&1
+)
+
 echo ========================================
 echo   Starting server...
 echo   Access: http://127.0.0.1:3100
