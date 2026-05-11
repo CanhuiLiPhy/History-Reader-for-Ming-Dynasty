@@ -44,7 +44,7 @@ function resolvePaths() {
 
   // Writable data lives in extraResources (always outside asar).
   const dataRoot = isPackaged ? path.join(resources, "backend-data") : path.join(appRoot, "backend");
-  const mingshiEpub = path.join(dataRoot, "mingshi.epub");
+  const mingshiEpub = path.join(dataRoot, "books", "ming-shi.epub");
 
   return { isPackaged, appRoot, resources, unpackedRoot, backendEntry, frontendDist, dataRoot, mingshiEpub };
 }

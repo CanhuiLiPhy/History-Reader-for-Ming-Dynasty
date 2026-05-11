@@ -63,10 +63,6 @@
         "from": "backend/books",
         "to": "backend-data/books",
         "filter": ["*.epub"]
-      },
-      {
-        "from": "backend/mingshi.epub",
-        "to": "backend-data/mingshi.epub"
       }
     ],
     "afterPack": "./electron/build/afterPack.cjs",

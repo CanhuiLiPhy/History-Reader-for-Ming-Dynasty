@@ -38,7 +38,7 @@ export const FRONTEND_DIST = process.env.MINGSHI_FRONTEND_DIST
   : path.join(projectRoot, "frontend", "dist");
 export const BOOK_PATH = process.env.BOOK_PATH
   ? (path.isAbsolute(process.env.BOOK_PATH) ? process.env.BOOK_PATH : path.join(dataRoot, process.env.BOOK_PATH.replace(/^\.\//, "")))
-  : path.join(dataRoot, "mingshi.epub");
+  : path.join(BOOKS_DIR, "ming-shi.epub");
 export const PORT = Number.parseInt(process.env.PORT || "3100", 10);
 
 export const DEFAULT_AI_SETTINGS = {
