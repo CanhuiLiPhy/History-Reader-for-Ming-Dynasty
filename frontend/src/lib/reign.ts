@@ -756,7 +756,7 @@ type SelToken =
   | { kind: "month"; index: number; isLeap: boolean; monthText: string; monthOrdinal: number; ganzhi?: string }
   | { kind: "ganzhi"; index: number; ganzhi: string };
 
-function firstDateTokenInSelection(text: string): SelToken | null {
+function collectDateTokens(text: string): SelToken[] {
   const candidates: SelToken[] = [];
 
   // 1. Reign-anchored date phrase (most specific)
@@ -797,16 +797,108 @@ function firstDateTokenInSelection(text: string): SelToken | null {
     });
   }
 
-  // 4. Bare ganzhi (no month immediately before within the selection text)
+  // 4. Bare ganzhi
   for (const m of text.matchAll(GANZHI_RE)) {
     candidates.push({ kind: "ganzhi", index: m.index ?? 0, ganzhi: m[0] });
   }
 
+  return candidates;
+}
+
+// 把 chosen token 用同 text 内位置更早的 token 补齐 reign / month，返回最完整的 token。
+// 「最近」= index 离 chosen 最近且 < chosen.index 的那一个，所以先按 index 降序排。
+function completeTokenWithEarlier(chosen: SelToken, candidates: SelToken[]): SelToken {
+  const earlier = candidates
+    .filter((c) => c.index < chosen.index)
+    .sort((a, b) => b.index - a.index);
+  const nearestReign = earlier.find(
+    (c) => c.kind === "year" && c.reign,
+  ) as Extract<SelToken, { kind: "year" }> | undefined;
+  const nearestMonthBlock = earlier.find(
+    (c) =>
+      c.kind === "month" ||
+      (c.kind === "year" && c.monthOrdinal !== undefined),
+  );
+  const nearestMonth = nearestMonthBlock
+    ? {
+        isLeap: Boolean((nearestMonthBlock as { isLeap?: boolean }).isLeap),
+        monthText: (nearestMonthBlock as { monthText?: string }).monthText ?? "",
+        monthOrdinal: (nearestMonthBlock as { monthOrdinal?: number }).monthOrdinal ?? 0,
+      }
+    : null;
+
+  if (chosen.kind === "ganzhi") {
+    if (nearestReign && nearestMonth && nearestMonth.monthOrdinal) {
+      return {
+        kind: "year",
+        index: chosen.index,
+        reign: nearestReign.reign,
+        yearText: nearestReign.yearText,
+        isLeap: nearestMonth.isLeap,
+        monthText: nearestMonth.monthText,
+        monthOrdinal: nearestMonth.monthOrdinal,
+        ganzhi: chosen.ganzhi,
+      };
+    }
+    return chosen;
+  }
+  if (chosen.kind === "month") {
+    if (nearestReign) {
+      return {
+        kind: "year",
+        index: chosen.index,
+        reign: nearestReign.reign,
+        yearText: nearestReign.yearText,
+        isLeap: chosen.isLeap,
+        monthText: chosen.monthText,
+        monthOrdinal: chosen.monthOrdinal,
+        ganzhi: chosen.ganzhi,
+      };
+    }
+    return chosen;
+  }
+  return chosen;
+}
+
+// v1.2.1：选段内取「精度最高 + 同级最早」的 token，并用同选段内更早 token 补 reign/month。
+function firstDateTokenInSelection(text: string): SelToken | null {
+  const candidates = collectDateTokens(text);
   if (!candidates.length) return null;
-  // Prefer earliest index. On tie, more-specific kind wins (year > month > ganzhi).
-  const kindRank = { year: 0, month: 1, ganzhi: 2 };
-  candidates.sort((a, b) => a.index - b.index || kindRank[a.kind] - kindRank[b.kind]);
+  const levelOf = (t: SelToken): number => {
+    if (t.kind === "ganzhi") return 3;
+    if (t.kind === "month") return t.ganzhi ? 3 : 2;
+    return t.ganzhi ? 3 : t.monthOrdinal ? 2 : 1;
+  };
+  candidates.sort((a, b) => {
+    const la = levelOf(a);
+    const lb = levelOf(b);
+    if (la !== lb) return lb - la;
+    return a.index - b.index;
+  });
+  return completeTokenWithEarlier(candidates[0], candidates);
+}
+
+// v1.2.1：fallback —— 从「contextBefore + 选段」末尾向前找第一个时间 token，原样返回。
+// 用于选段内本身没有时间词时的兜底（如"寅，再敗元兵於蔣山"中"寅"被切开）。
+// 故意不在这里 completeTokenWithEarlier —— 调用方会把它还原成字符串，递归走主路径，
+// 这样和"用户直接勾画庚寅"完全等价。
+function lastDateTokenInText(text: string): SelToken | null {
+  const candidates = collectDateTokens(text);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.index - a.index);
   return candidates[0];
+}
+
+// 把 token 还原成字符串，让 resolveSelectionDate 当作"用户选了这串字"重新走主路径。
+function serializeToken(t: SelToken): string {
+  if (t.kind === "ganzhi") return t.ganzhi;
+  if (t.kind === "month") {
+    return `${t.isLeap ? "闰" : ""}${t.monthText}月${t.ganzhi ?? ""}`;
+  }
+  // year
+  const reign = t.reign ?? "";
+  const monthPart = t.monthOrdinal ? `${t.isLeap ? "闰" : ""}${t.monthText}月` : "";
+  return `${reign}${t.yearText}年${monthPart}${t.ganzhi ?? ""}`;
 }
 
 // Resolve the lunar/solar date for a (year, month, isLeap, ganzhi). If the
@@ -865,13 +957,29 @@ export function resolveSelectionDate(
   // resolveReignDateMatch.
   void _showEmperor;
   const token = firstDateTokenInSelection(selectionText);
-  if (!token) return null;
+
+  // v1.2.1：选段内没有任何时间词 —— 把「contextBefore + 选段」从末尾向前找第一个时间词，
+  // 然后把这个时间词当成"用户直接勾画了它"，递归走主路径。
+  // 比如"寅，再敗元兵於蔣山"，跨边界回溯到完整的"庚寅"，再当用户选"庚寅"递归 →
+  // 主路径的 ganzhi 分支会从新 contextBefore（截到"庚寅"之前）找 anchor / month。
+  if (!token) {
+    const fullText = contextBefore + selectionText;
+    const tail = lastDateTokenInText(fullText);
+    if (tail) {
+      const newSelection = serializeToken(tail);
+      const newContextBefore = fullText.slice(0, tail.index);
+      return resolveSelectionDate(newSelection, newContextBefore, mode, _showEmperor);
+    }
+    // 拼起来都找不到 —— 极端兜底：只有 reign 没有月份
+    const fallbackAnchor = lastAnchorBefore(contextBefore);
+    if (!fallbackAnchor) return null;
+    return resolveSelectionDate(`${fallbackAnchor.reign}${fallbackAnchor.yearText}年`, contextBefore, mode, _showEmperor);
+  }
 
   let anchor: Anchor | null = null;
   let monthInfo: { isLeap: boolean; ordinal: number; monthText: string } | null = null;
   let ganzhi = "";
 
-  // Resolve anchor (reign+year) and month based on token kind.
   if (token.kind === "year") {
     const reign = token.reign || lastAnchorBefore(contextBefore)?.reign || "";
     if (!reign) return null;
@@ -944,7 +1052,7 @@ export function resolveSelectionDate(
     reign: anchor.reign,
     emperor: anchor.emperor,
     rolledOver: rolledOver || undefined,
-    warning: token.kind !== "year" || !token.reign
+    warning: !token || token.kind !== "year" || !token.reign
       ? `选段未含完整年号，已用前文最近的「${anchor.reign}${anchor.yearText}年」作为参照`
       : undefined,
     reignYear: anchor.year,

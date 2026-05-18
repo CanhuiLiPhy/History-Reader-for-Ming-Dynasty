@@ -775,6 +775,7 @@ export function searchReferenceParagraphs({ keywords = [], excludeSlug = "ming-s
     if (rows.length) {
       return rows.map((row, index) => ({
         index: index + 1,
+        paragraphId: row.id,
         bookSlug: row.bookSlug,
         bookTitle: row.bookTitle,
         chapter: row.chapter,
@@ -810,6 +811,7 @@ export function searchReferenceParagraphs({ keywords = [], excludeSlug = "ming-s
 
   return rows.map((row, index) => ({
     index: index + 1,
+    paragraphId: row.id,
     bookSlug: row.bookSlug,
     bookTitle: row.bookTitle,
     chapter: row.chapter,
@@ -824,6 +826,38 @@ export function searchReferenceParagraphs({ keywords = [], excludeSlug = "ming-s
 
 export function deriveKeywordsFromText(text) {
   return localKeywordFallback(text);
+}
+
+/**
+ * Fetch full reference rows by paragraph_id. Used by hybrid retrieval to
+ * pull metadata for vec-only candidates that didn't show up in the FTS5
+ * keyword pass.
+ */
+export function fetchParagraphsByIds(ids, excludeSlug = "ming-shi") {
+  if (!ids || !ids.length) return [];
+  const db = getDb();
+  const uniq = Array.from(new Set(ids.filter((id) => Number.isFinite(id))));
+  if (!uniq.length) return [];
+  const placeholder = uniq.map(() => "?").join(",");
+  const rows = db.prepare(`
+    SELECT p.id, p.chapter, p.anchor, p.content, b.slug AS bookSlug, b.title AS bookTitle,
+           b.source_url AS sourceUrl
+    FROM paragraphs p JOIN books b ON b.id = p.book_id
+    WHERE p.id IN (${placeholder}) AND b.slug != ?
+  `).all(...uniq, excludeSlug);
+  return rows.map((row, index) => ({
+    index: index + 1,
+    paragraphId: row.id,
+    bookSlug: row.bookSlug,
+    bookTitle: row.bookTitle,
+    chapter: row.chapter,
+    anchor: row.anchor,
+    sourceUrl: row.sourceUrl,
+    sourceLink: /^https?:\/\//.test(row.anchor || "") ? row.anchor : row.sourceUrl,
+    snippet: (row.content || "").slice(0, 120),
+    content: row.content,
+    score: 0
+  }));
 }
 
 /**

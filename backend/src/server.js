@@ -10,6 +10,7 @@ import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, synthe
 import { initializeLibrary } from "./services/library-db.js";
 import { ensureSplitEpub } from "./services/epub-splitter.js";
 import { getReadableBooks, getReaderChapters, getReaderChapter } from "./services/library-reader.js";
+import { answerPersonConversation, answerFreeConversation, getPersonBiographies } from "./services/person-conversation.js";
 import { queryTimelineEvents, ALL_CATEGORIES, listAllTimelineEvents, patchTimelineEvent, deleteTimelineEvent, createTimelineEvent } from "./services/timeline-service.js";
 import {
   answerReadingQuestion,
@@ -23,8 +24,10 @@ import {
   geocodePlaces,
   lookupReadingReference,
   runCrossSourceComparison,
-  searchOfficeReferences
+  searchOfficeReferences,
+  filterRelevantReferences
 } from "./services/reference-service.js";
+import { searchByEmbedding, isAvailable as embeddingAvailable } from "./services/embedding-service.js";
 
 const app = express();
 
@@ -147,10 +150,11 @@ async function handleBookSearch(req, res, next) {
     //            空命中时自动回落到 fuzzy）
     // 兼容老前端的 "hybrid" → 视作 local。
     const rawMode = String(payload.mode || "local");
-    const mode = rawMode === "hybrid" ? "local" : rawMode;
+    // 兼容老 "ai" 模式 → 视作 "semantic"（v1.2 起 AI 意图检索升级为 embedding RAG）
+    const mode = rawMode === "hybrid" ? "local" : rawMode === "ai" ? "semantic" : rawMode;
     // Mode-specific defaults when frontend doesn't pass an explicit limit:
-    //   local 100 / fuzzy 50 / ai 80
-    const MODE_DEFAULT_LIMIT = { local: 100, fuzzy: 50, ai: 80 };
+    //   local 100 / fuzzy 50 / semantic 60
+    const MODE_DEFAULT_LIMIT = { local: 100, fuzzy: 50, ai: 80, semantic: 60 };
     const limit = payload.limit
       ? Number.parseInt(String(payload.limit), 10)
       : MODE_DEFAULT_LIMIT[mode] ?? 50;
@@ -197,7 +201,51 @@ async function handleBookSearch(req, res, next) {
     const useEpubSearch = singleSlug && singleHasEpub;
 
     let result;
-    if (mode === "fuzzy") {
+    if (mode === "semantic") {
+      // v1.2: embedding RAG 语义检索 + 小模型相关性过滤
+      if (!embeddingAvailable()) {
+        // 嵌入不可用 → 直接 fallback 到 fuzzy
+        result = await searchFuzzy(query, { limit, slugs });
+        aiExpansion = { note: "嵌入服务不可用，已退回到本地模糊检索。" };
+      } else {
+        const ranked = await searchByEmbedding(query, { limit, slugs });
+        // 小模型相关性过滤（>10 条时启用，避免空过滤把所有都剔了）
+        let filtered = ranked;
+        if (aiReady(aiSettings) && ranked.length > 10) {
+          try {
+            filtered = await filterRelevantReferences({
+              question: query,
+              selection: "",
+              references: ranked.slice(0, Math.min(50, ranked.length)),
+              aiSettings,
+            });
+            if (!filtered.length) filtered = ranked.slice(0, limit);
+          } catch {
+            filtered = ranked;
+          }
+        }
+        const final = filtered.slice(0, limit);
+        result = {
+          query,
+          expandedQueries: [],
+          total: final.length,
+          results: final.map((row, idx) => ({
+            id: `${row.bookSlug}-${row.paragraphId}`,
+            bookSlug: row.bookSlug,
+            bookTitle: row.bookTitle,
+            chapterId: String(idx),
+            chapterOrder: null,
+            chapterHref: row.anchor || "",
+            chapterTitle: row.chapter || "",
+            score: typeof row._distance === "number" ? Number((-(row._distance / 100)).toFixed(3)) : 0,
+            snippet: (row.content || "").slice(0, 240),
+            text: row.content || "",
+            years: [],
+          })),
+        };
+        aiExpansion = { note: `语义检索 (BGE 嵌入 → vec KNN${aiReady(aiSettings) ? " + 小模型过滤" : ""})。` };
+      }
+    } else if (mode === "fuzzy") {
       result = await searchFuzzy(query, { limit, slugs });
     } else if (mode === "ai") {
       // AI 模式：先做 local（带扩展词）；为空 → 自动回退 fuzzy。
@@ -534,6 +582,66 @@ app.post("/api/ai/person-chronology", async (req, res, next) => {
         chapterParagraphCount: s.chapterParagraphCount,
       })) : []
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 人物列传：列出该人物在 4 部纪传体（明史/石匮书后集/东林列传/罪惟录）
+// 中的列传切片。命中索引时返回详细切片；未命中返回 has=false。
+app.get("/api/person/biographies", async (req, res, next) => {
+  try {
+    const person = String(req.query.person || "").trim();
+    if (!person) {
+      res.status(400).json({ error: "缺少人物名 (?person=...)" });
+      return;
+    }
+    const { biographies, related } = await getPersonBiographies(person);
+    res.json({
+      person,
+      has: biographies.length > 0,
+      biographies,
+      related,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 多轮对话式人物问答。
+// Body: { person, mode: "core-person"|"open", messages: [{role, content}, ...], aiSettings }
+// 前端保管完整对话历史；后端每轮按当前最新问题重新解析知识库。
+// v1.2 自由对话：通用 RAG 多轮问答。前端 stateless 传完整 messages。
+app.post("/api/ai/free-conversation", async (req, res, next) => {
+  try {
+    const { messages = [], aiSettings: clientAi = {} } = req.body || {};
+    const aiSettings = resolveAiSettings(clientAi);
+    if (!Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json({ error: "messages 必须非空 (至少包含一条用户消息)。" });
+      return;
+    }
+    const result = await answerFreeConversation({ messages, aiSettings });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/ai/person-conversation", async (req, res, next) => {
+  try {
+    const {
+      person = "",
+      mode = "core-person",
+      messages = [],
+      aiSettings: clientAi = {},
+    } = req.body || {};
+    const aiSettings = resolveAiSettings(clientAi);
+    if (!Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json({ error: "messages 必须非空 (至少包含一条用户消息)。" });
+      return;
+    }
+    const result = await answerPersonConversation({ person, mode, messages, aiSettings });
+    res.json(result);
   } catch (error) {
     next(error);
   }

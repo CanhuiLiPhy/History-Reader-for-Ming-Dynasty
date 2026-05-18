@@ -12,7 +12,6 @@ import {
   Calculator,
   Download,
   FilePenLine,
-  GitBranch,
   History,
   Highlighter,
   Landmark,
@@ -41,6 +40,7 @@ import {
   patchTimelineEventApi,
   HISTORY_CATEGORIES,
   type HistoryTimelineEvent,
+  fetchPersonBiographies,
   fetchPersonChronology,
   fetchReaderChapters,
   fetchReaderChapter,
@@ -49,6 +49,8 @@ import {
   libraryEpubUrl,
   lookupReference,
   runAiAction,
+  runFreeConversation,
+  runPersonConversation,
   searchBook,
   searchOfficeReferences,
   synthesizeSpeech,
@@ -62,6 +64,8 @@ import type {
   AiSettings,
   BookMeta,
   ChronologyResponse,
+  ConversationMessage,
+  ConversationSource,
   CustomAction,
   DbReaderChaptersPayload,
   DbReaderChapterPayload,
@@ -72,6 +76,7 @@ import type {
   FamilyTreeNode,
   OfficialsPayload,
   OfficeSearchPayload,
+  PersonBiographiesResponse,
   ReadableBook,
   ReignConversionResponse,
   ReaderBookmark,
@@ -95,7 +100,7 @@ const defaultAiSettings: AiSettings = {
   // Match backend/src/config/defaults.js — keep the full DashScope list so
   // a fresh install (no persisted state, no /api/settings/defaults reachable)
   // still shows a useful set of models.
-  modelOptions: ["deepseek-v4-pro", "kimi-k2.6", "qwen3.6-max-preview", "MiniMax-M2.5", "qwen3.5-plus-2026-04-20"],
+  modelOptions: ["deepseek-v4-pro", "glm-4.7", "kimi-k2.6", "qwen3.6-max-preview"],
   smallModel: "deepseek-v4-flash",
   smallModelOptions: ["deepseek-v4-flash", "qwen3.6-flash", "qwen3.6-27b"],
   ttsBaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -106,11 +111,19 @@ const defaultAiSettings: AiSettings = {
   modelProviders: [],
 };
 
-const highlightPalette = [
-  { label: "金笺", color: "#efc24f" },
-  { label: "青玉", color: "#67b7a8" },
-  { label: "绛砂", color: "#d97c5b" },
-];
+// v1.2.1：勾画 5 选项合并到一个 select，每个 style code 对应 (kind, color)。
+// 颜色采用沉稳的深色（旧版 v1.2 的 Tailwind 浅色被反馈"太浅，只适合高亮"）：
+//   高亮三色：金笺 #efc24f、青玉 #67b7a8、绛纱 #d97c5b
+//   下划线、圈点：正红 #d4231b
+function resolveMarkStyle(style: "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle"): { kind: "highlight" | "underline" | "circle"; color: string; label: string } {
+  switch (style) {
+    case "h-gold":    return { kind: "highlight", color: "#efc24f", label: "高亮·金笺" };
+    case "h-jade":    return { kind: "highlight", color: "#67b7a8", label: "高亮·青玉" };
+    case "h-crimson": return { kind: "highlight", color: "#d97c5b", label: "高亮·绛纱" };
+    case "underline": return { kind: "underline", color: "#d4231b", label: "下划线（正红）" };
+    case "circle":    return { kind: "circle",    color: "#d4231b", label: "圈点（正红）" };
+  }
+}
 
 const CHAPTER_LOCATION_BREAK_SIZE = 650;
 const toTraditional = OpenCC.Converter({ from: "cn", to: "tw" });
@@ -118,7 +131,7 @@ const toTraditional = OpenCC.Converter({ from: "cn", to: "tw" });
 const sidebarTabs = [
   { key: "toc", label: "目录", icon: BookOpenText },
   { key: "search", label: "搜索", icon: Search },
-  { key: "notes", label: "笔记", icon: NotebookPen },
+  { key: "notes", label: "札记", icon: NotebookPen },
   { key: "bookmarks", label: "书签", icon: Bookmark },
   { key: "people", label: "资料", icon: LibraryBig },
   { key: "settings", label: "设置", icon: Settings2 },
@@ -170,6 +183,12 @@ type EpubLocationLike = {
 type EpubContentsLike = {
   window: Window;
   document: Document;
+  // Compute a CFI (Canonical Fragment Identifier) for a DOM node inside
+  // this section's iframe — used to navigate paginated EPUB to the exact
+  // column/page where the paragraph lives. Available on epub.js Contents
+  // class; typed as optional since some builds may lack it.
+  cfiFromNode?: (node: Node) => string;
+  cfiFromRange?: (range: Range) => string;
 };
 
 type EpubRenditionLike = {
@@ -328,17 +347,28 @@ function mergeAiSettings(defaults: DefaultsPayload | null, persisted: AiSettings
     persisted?.baseURL && persisted.baseURL !== LEGACY_DEFAULT_BASE_URL ? persisted.baseURL : base.baseURL;
   const persistedTtsBaseUrl =
     persisted?.ttsBaseURL && persisted.ttsBaseURL !== LEGACY_DEFAULT_BASE_URL ? persisted.ttsBaseURL : base.ttsBaseURL;
+  // v1.2.1：modelProviders 是新的单一事实源。长度 0 时回落到 base 默认（带 dev env key 的两条）。
+  const finalProviders = persisted?.modelProviders?.length ? persisted.modelProviders : (base.modelProviders ?? []);
+  // modelOptions / smallModelOptions 自动从 providers 派生（所有激活模型的并集）。
+  // providers 为空时（打包版首次启动 + 未持久化）回落到 base 静态列表，保证下拉不空。
+  const pool = [...new Set(finalProviders.flatMap((p) => p.models))];
+  const finalModelOptions = pool.length ? pool : (persisted?.modelOptions?.length ? persisted.modelOptions : base.modelOptions);
+  const finalSmallModelOptions = pool.length ? pool : (persisted?.smallModelOptions?.length ? persisted.smallModelOptions : base.smallModelOptions);
   return {
     ...base,
     ...persisted,
     baseURL: persistedBaseUrl,
     ttsBaseURL: persistedTtsBaseUrl,
-    model: persisted?.model || base.defaultModel || base.model || "deepseek-v4-pro",
-    modelOptions: persisted?.modelOptions?.length ? persisted.modelOptions : base.modelOptions,
-    smallModel: persisted?.smallModel || base.smallModel || "deepseek-v4-flash",
-    smallModelOptions: persisted?.smallModelOptions?.length ? persisted.smallModelOptions : base.smallModelOptions,
+    model: persisted?.model && finalModelOptions.includes(persisted.model)
+      ? persisted.model
+      : (base.defaultModel || base.model || finalModelOptions[0] || "deepseek-v4-pro"),
+    modelOptions: finalModelOptions,
+    smallModel: persisted?.smallModel && finalSmallModelOptions?.includes(persisted.smallModel)
+      ? persisted.smallModel
+      : (base.smallModel || finalSmallModelOptions?.[0] || "qwen3.6-flash-2026-04-16"),
+    smallModelOptions: finalSmallModelOptions,
     customActions: customActions.length ? customActions : persisted?.customActions?.length ? persisted.customActions : base.customActions,
-    modelProviders: persisted?.modelProviders ?? base.modelProviders ?? [],
+    modelProviders: finalProviders,
   };
 }
 
@@ -364,6 +394,27 @@ function App() {
   const currentCfiRef = useRef("");
   const currentHrefRef = useRef("");
   const pendingAnchorRef = useRef("");
+  // Set by navigateToSearchResult before a search-result click triggers
+  // chapter loading; consumed by the chapter-loaded effect to scroll to
+  // the exact paragraph and flash-highlight it.
+  const pendingSearchNavRef = useRef<{ paragraphId: number; text: string; attempts: number } | null>(null);
+  // v1.2: 标记模式撤销栈。每次打标（标记模式 / 普通工具栏的「标记」按钮）push 一条 [id...]
+  // Cmd+Z / Ctrl+Z 弹一条并把这些 id 从 highlights 里删掉。
+  const markUndoStackRef = useRef<string[][]>([]);
+  // v1.2.1 G1: handleCrossCompare 入口处 snapshot 的「原始选段」，给「保存为札记」按钮用。
+  // 必须在 clearSelection() 之前 snapshot，否则 selectionCfi / selectionText 会被清空。
+  // historicalAt / historicalYear 在 snapshot 时通过 resolveSelectionDate 一并算好，
+  // 这样保存的札记能挂到时间线对应位置（和正常 saveNote 行为一致）。
+  const compareAnchorRef = useRef<{
+    cfi: string;
+    text: string;
+    bookSlug: string;
+    historicalAt?: string;
+    historicalYear?: number;
+  } | null>(null);
+  // v1.2 标记模式 ref（rendition.on("selected") 闭包捕获用，React 状态更新它感知不到）
+  const markModeRef = useRef(false);
+  const markStyleRef = useRef<"h-gold" | "h-jade" | "h-crimson" | "underline" | "circle">("h-gold");
   const pendingLocationLabelRef = useRef("");
   const pendingLocationTargetRef = useRef("");
   const forcedChapterTargetRef = useRef("");
@@ -409,7 +460,11 @@ function App() {
   const [currentChapterIndex, setCurrentChapterIndex] = useState(0);
   const [locationsReady, setLocationsReady] = useState(false);
   const [selectionText, setSelectionText] = useState("");
-  const [highlightStyle, setHighlightStyle] = useState<{ kind: "highlight" | "underline" | "circle"; color: string }>({ kind: "highlight", color: "#efc24f" });
+  // 旧的 highlightStyle 在 v1.2 toolbar 精简后弹窗里已不暴露挑选；保留 state 以备
+  // 之后某处复用，不会进入 React 渲染路径。
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [_highlightStyle, _setHighlightStyle] = useState<{ kind: "highlight" | "underline" | "circle"; color: string }>({ kind: "highlight", color: "#efc24f" });
+  void _highlightStyle; void _setHighlightStyle;
   // Bumped after layout-changing events (sidebar collapse, etc.) so the
   // highlights effect re-runs and forces annotations to re-render after epub.js
   // has settled in its new dimensions.
@@ -441,7 +496,7 @@ function App() {
   useEffect(() => { selectionTextRef.current = selectionText; }, [selectionText]);
   useEffect(() => { selectionCfiRef.current = selectionCfi; }, [selectionCfi]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchMode, setSearchMode] = useState<"local" | "fuzzy" | "ai">("local");
+  const [searchMode, setSearchMode] = useState<"local" | "fuzzy" | "semantic">("local");
   const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -482,16 +537,52 @@ function App() {
   const [tlDraftMonth, setTlDraftMonth] = useState<string>("");
   const [tlDraftDay, setTlDraftDay] = useState<string>("");
   const [tlDraftScale, setTlDraftScale] = useState<number>(1);
-  const [tlDraftCategory, setTlDraftCategory] = useState<string>("我的笔记");
+  const [tlDraftCategory, setTlDraftCategory] = useState<string>("我的札记");
   const [tlDraftTitle, setTlDraftTitle] = useState<string>("");
+  // v1.2.1: 右侧直接提问输入框隐藏（被左栏 AI 对话取代）；setter 在 selection-based qa path 还可能用到。
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [questionDraft, setQuestionDraft] = useState("");
+  void setQuestionDraft;
   const [aiResponse, setAiResponse] = useState<AiActionResponse | null>(null);
   const [aiPanelTitle, setAiPanelTitle] = useState("选段助理");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
   const [personQuery, setPersonQuery] = useState("");
-  const [personChronology, setPersonChronology] = useState<ChronologyResponse | null>(null);
-  const [personLoading, setPersonLoading] = useState(false);
+  // 保留以备旧端点 /api/ai/person-chronology 兼容；UI 不再直接调用。
+  // Underscore prefix tells TS we know it's unused but want to keep around.
+  const [_personChronology, setPersonChronology] = useState<ChronologyResponse | null>(null);
+  const [_personLoading, setPersonLoading] = useState(false);
+  void _personChronology; void _personLoading;
+  // 重构后的 人物 panel：分「人物列传」「AI 对话」两个 tab。
+  const [personPanelTab, setPersonPanelTab] = useState<"biographies" | "conversation">("biographies");
+  const [personBiographies, setPersonBiographies] = useState<PersonBiographiesResponse | null>(null);
+  const [biographiesLoading, setBiographiesLoading] = useState(false);
+  const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationMode, setConversationMode] = useState<"core-person" | "open">("core-person");
+  const [conversationInput, setConversationInput] = useState("");
+  const [conversationSources, setConversationSources] = useState<ConversationSource[]>([]);
+  const [conversationSourceMode, setConversationSourceMode] = useState<string>("");
+  const [conversationError, setConversationError] = useState("");
+  const [conversationSourcesExpanded, setConversationSourcesExpanded] = useState(false);
+  // v1.2 自由对话（左侧资料 → AI 对话）：多轮 + 本地 history 自动存档。
+  type FreeChatHistory = {
+    id: string;
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    messages: ConversationMessage[];
+    sources: ConversationSource[];
+    sourceMode: string;
+  };
+  const [freeChats, setFreeChats] = useState<FreeChatHistory[]>([]);
+  const [activeFreeChatId, setActiveFreeChatId] = useState<string | null>(null);
+  const [freeChatInput, setFreeChatInput] = useState("");
+  const [freeChatLoading, setFreeChatLoading] = useState(false);
+  const [freeChatError, setFreeChatError] = useState("");
+  const [freeChatSourcesExpanded, setFreeChatSourcesExpanded] = useState(false);
+  // v1.2.1: AI 对话窗口里独立选模型（覆盖全局 defaultModel，只对此面板生效）
+  const [freeChatModel, setFreeChatModel] = useState<string>("");
   // Baidu Baike inline lookup: when set, the chronology panel renders an
   // iframe pointing at https://baike.baidu.com/item/<name> below the result
   // area. Stored separately from personQuery so the user can keep typing in
@@ -502,6 +593,10 @@ function App() {
   const [referenceCompare, setReferenceCompare] = useState<ReferenceCompareResponse | null>(null);
   const [lookupLoading, setLookupLoading] = useState(false);
   const [compareLoading, setCompareLoading] = useState(false);
+  // v1.2.1 G3: 「展开」按钮控制的弹窗。右侧栏窄，弹窗里渲染同一份 reportMarkdown。
+  const [compareExpandOpen, setCompareExpandOpen] = useState(false);
+  // v1.2.1: 左侧札记面板的「展开」弹窗。值为要展开的 note id，null 关闭。
+  const [noteExpandedFor, setNoteExpandedFor] = useState<string | null>(null);
   const [referenceError, setReferenceError] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [, setTimelineLoading] = useState(false);
@@ -516,7 +611,7 @@ function App() {
   const [reignLoading, setReignLoading] = useState(false);
   const [referenceFilter, setReferenceFilter] = useState("");
   // Officials panel sub-tabs (v0.3 extended data)
-  const [officialsTab, setOfficialsTab] = useState<"institutions" | "offices" | "chronology" | "princes">("institutions");
+  const [officialsTab, setOfficialsTab] = useState<"lineage" | "institutions" | "offices" | "chronology" | "princes">("lineage");
   const [officeRankFilter, setOfficeRankFilter] = useState("");
   const [chronologyFilter, setChronologyFilter] = useState("");
   const [openResourcePanel, setOpenResourcePanel] = useState<string | null>(null);
@@ -525,6 +620,19 @@ function App() {
   // The footer (page slider + status) follows this same flag.
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
+  // v1.2: 键盘翻页 — 默认关闭；开启后 ←/→ 翻页（在 input/textarea 聚焦时不触发）。
+  const [keyboardPagingEnabled, setKeyboardPagingEnabled] = useState(true);
+  // v1.2: 标记模式 — 默认关闭；开启后选段直接按当前 default 颜色/形态打标，不弹工具栏；Cmd+Z 撤销最近一次。
+  const [markModeEnabled, setMarkModeEnabled] = useState(false);
+  // v1.2.1: 默认勾画样式 合并为 5 选项（高亮 3 色 + 下划线 + 圈点）
+  // style code:
+  //   "h-gold"     高亮·金笺   #efc24f
+  //   "h-jade"     高亮·青玉   #67b7a8
+  //   "h-crimson"  高亮·绛纱   #d97c5b
+  //   "underline"  下划线·正红 #d4231b
+  //   "circle"     圈点·正红   #d4231b
+  type MarkStyle = "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle";
+  const [markStyle, setMarkStyle] = useState<MarkStyle>("h-gold");
   const [selectedTreeEmperor, setSelectedTreeEmperor] = useState<FamilyTreeNode | null>(null);
   const [readerLayout, setReaderLayout] = useState<"horizontal" | "vertical">("horizontal");
   const [scriptVariant, setScriptVariant] = useState<"simplified" | "traditional">("traditional");
@@ -596,6 +704,9 @@ function App() {
           savedDateDisplay,
           savedShowEmperor,
           savedUiScriptVariant,
+          savedKeyboardPaging,
+          savedMarkMode,
+          savedMarkStyle,
         ] =
           await Promise.all([
             fetchDefaults(),
@@ -621,6 +732,9 @@ function App() {
             readPersistedState<"gregorian" | "lunar" | "both">(storageKey("date-display"), "lunar"),
             readPersistedState<boolean>(storageKey("show-emperor"), false),
             readPersistedState<"simplified" | "traditional">(storageKey("ui-script-variant"), "traditional"),
+            readPersistedState<boolean>(storageKey("keyboard-paging-enabled"), true),
+            readPersistedState<boolean>(storageKey("mark-mode-enabled"), false),
+            readPersistedState<"h-gold" | "h-jade" | "h-crimson" | "underline" | "circle">(storageKey("mark-style"), "h-gold"),
           ]);
 
         if (cancelled) return;
@@ -708,6 +822,9 @@ function App() {
         setShowEmperor(savedShowEmperor);
         showEmperorRef.current = savedShowEmperor;
         setUiScriptVariant(savedUiScriptVariant);
+        setKeyboardPagingEnabled(savedKeyboardPaging);
+        setMarkModeEnabled(savedMarkMode);
+        setMarkStyle(savedMarkStyle);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -955,6 +1072,60 @@ function App() {
   // Skips: <input>/<textarea> values (carry user data we mustn't munge), the
   // EPUB iframe and the DB-reader host (have their own conversion paths),
   // and the year-annotation tooltips (data-note attribute already cooked).
+  // v1.2 persist 新加的 4 个开关。轻量，分开写 effect 避免一次写多个 key。
+  useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("keyboard-paging-enabled"), keyboardPagingEnabled); }, [keyboardPagingEnabled, hasLoadedLocalState]);
+  useEffect(() => { markModeRef.current = markModeEnabled; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-mode-enabled"), markModeEnabled); }, [markModeEnabled, hasLoadedLocalState]);
+  useEffect(() => { markStyleRef.current = markStyle; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-style"), markStyle); }, [markStyle, hasLoadedLocalState]);
+
+  // v1.2 Cmd/Ctrl+Z 撤销最近一次勾画（不论是否在标记模式都生效，只要有 stack）
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z" || e.shiftKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t) {
+        const tag = t.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (t.isContentEditable) return;
+      }
+      const last = markUndoStackRef.current.pop();
+      if (!last || !last.length) return;
+      e.preventDefault();
+      setHighlights((cur) => cur.filter((h) => !last.includes(h.id)));
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // v1.2 键盘翻页（设置开启时）：←/→ 翻页。在 input/textarea/contenteditable 聚焦时不触发。
+  useEffect(() => {
+    if (!keyboardPagingEnabled) return;
+    function onKeyDown(e: KeyboardEvent) {
+      // 排除 input 焦点（避免打字时误触）
+      const t = e.target as HTMLElement | null;
+      if (t) {
+        const tag = t.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (t.isContentEditable) return;
+      }
+      // 排除任何打开的 modal（确保不干扰其他键盘操作）
+      if (document.querySelector(".modal-backdrop")) return;
+      // 区分 DB-reader vs EPUB
+      const isDbReaderActive = readableBooks.find((b) => b.slug === currentBookSlug)?.hasEpub === false;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        if (isDbReaderActive) flipDbPage(-1);
+        else goPrevPage();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        if (isDbReaderActive) flipDbPage(1);
+        else goNextPage();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keyboardPagingEnabled, currentBookSlug, readableBooks]);
+
   useEffect(() => {
     if (!hasLoadedLocalState) return;
     void writePersistedState(storageKey("ui-script-variant"), uiScriptVariant);
@@ -1398,6 +1569,12 @@ function App() {
       }
     }
     setSelectionCfi(cfi);
+    // v1.2 标记模式：直接打标，不弹工具栏
+    if (markModeRef.current) {
+      applyMarkModeHighlight(cfi, text);
+      try { window.getSelection?.()?.removeAllRanges(); } catch { /* ignore */ }
+      return;
+    }
     setSelectionOverlay({ visible: true, top, left });
   }
 
@@ -1610,6 +1787,21 @@ function App() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarCollapsed, assistantCollapsed, currentBookSlug, readableBooks]);
+
+  // Consume pendingSearchNavRef after the chapter has rendered. Tries
+  // immediately, then once more after a short delay to cover the multi-
+  // column layout settle time for DB-reader and the iframe ready event
+  // for EPUB rendition.
+  useEffect(() => {
+    if (!pendingSearchNavRef.current) return;
+    if (scrollToSearchTarget()) return;
+    const t1 = window.setTimeout(() => { if (!scrollToSearchTarget()) {
+      const t2 = window.setTimeout(() => { scrollToSearchTarget(); }, 400);
+      (window as unknown as { __searchScrollT2?: number }).__searchScrollT2 = t2;
+    }}, 120);
+    return () => { window.clearTimeout(t1); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dbReaderChapter, dbReaderIndex, readerReady, currentBookSlug]);
 
   async function openLocation(target: string) {
     if (!renditionRef.current) return;
@@ -1838,6 +2030,16 @@ function App() {
         width: 0.36em;
         height: 0.36em;
       }
+      /* 搜索结果一键跳转：目标段落短暂高亮 — 与外层 App.css 同步。 */
+      @keyframes search-flash-fade {
+        0%   { background-color: rgba(212, 35, 27, 0.32); box-shadow: 0 0 0 4px rgba(212, 35, 27, 0.18); }
+        60%  { background-color: rgba(212, 35, 27, 0.18); box-shadow: 0 0 0 3px rgba(212, 35, 27, 0.10); }
+        100% { background-color: transparent; box-shadow: none; }
+      }
+      .search-flash {
+        animation: search-flash-fade 1.6s ease-out;
+        border-radius: 0.2em;
+      }
     `;
     type RenditionHooks = { hooks?: { content?: { register?: (cb: (contents: EpubContentsLike) => void) => void } } };
     const hooksHost = rendition as unknown as RenditionHooks;
@@ -1905,6 +2107,13 @@ function App() {
         selectionContentsRef.current = contents;
         setSelectionText(text);
         setSelectionCfi(cfiRange);
+        // v1.2 标记模式：直接打标，不弹工具栏
+        if (markModeRef.current) {
+          applyMarkModeHighlight(cfiRange, text);
+          // 清掉浏览器选区，不进入选段流程
+          try { selected.removeAllRanges(); } catch { /* ignore */ }
+          return;
+        }
         setSelectionOverlay({ visible: true, top, left });
       });
     });
@@ -2436,21 +2645,15 @@ function App() {
 
   function addSelectionHighlight(kind: "highlight" | "underline" | "circle", color: string) {
     if (!selectionCfi || !selectionText.trim()) return;
-    // Unanchored db-cfi (just `db:slug:idx`, 3 parts) means selection didn't
-    // resolve to any paragraph — can't render. Anchored single-paragraph
-    // (5 parts) and cross-paragraph `m`-form (8 parts) both save & render.
     if (selectionCfi.startsWith("db:") && selectionCfi.split(":").length < 5) {
       setAiError("无法定位选段所在段落，请重新选取。");
       clearSelection();
       return;
     }
-    // 累积模式：把所有 pinnedSegments + 当前段 各保存一条 highlight。
-    // 非累积：只保存当前一条。
     const allSegments = [
       ...pinnedSegments,
       { cfi: selectionCfi, text: selectionText },
     ].filter((s) => {
-      // 跳过未锚定 db-cfi（防呆）。
       if (!s.cfi || !s.text.trim()) return false;
       if (s.cfi.startsWith("db:") && s.cfi.split(":").length < 5) return false;
       return true;
@@ -2465,7 +2668,31 @@ function App() {
       createdAt: now,
     }));
     setHighlights((current) => [...items, ...current]);
+    // 记入撤销栈（标记模式 / 普通工具栏都收集，统一 Cmd+Z 撤销）
+    markUndoStackRef.current.push(items.map((it) => it.id));
+    if (markUndoStackRef.current.length > 50) markUndoStackRef.current.shift();
     clearSelection();
+  }
+
+  // 标记模式下：选段刚结束时直接打标，不弹工具栏。cfi/text 直接从参数取，
+  // 避免 React 状态未提交时拿到旧值；color/kind 从 ref 取，避免 rendition 闭包捕获过时值。
+  function applyMarkModeHighlight(cfi: string, text: string) {
+    if (!cfi || !text.trim()) return;
+    if (cfi.startsWith("db:") && cfi.split(":").length < 5) return;
+    const style = markStyleRef.current;
+    const { kind, color } = resolveMarkStyle(style);
+    const now = new Date().toISOString();
+    const item: ReaderHighlight = {
+      id: crypto.randomUUID(),
+      cfiRange: cfi,
+      text,
+      color,
+      kind,
+      createdAt: now,
+    };
+    setHighlights((current) => [item, ...current]);
+    markUndoStackRef.current.push([item.id]);
+    if (markUndoStackRef.current.length > 50) markUndoStackRef.current.shift();
   }
 
   // 隐藏当前选段下面那一组 action 按钮后，启动笔记弹窗的入口暂时没了；
@@ -2492,7 +2719,7 @@ function App() {
       setTlDraftMonth(n.manualMonth != null ? String(n.manualMonth) : "");
       setTlDraftDay(n.manualDay != null ? String(n.manualDay) : "");
       setTlDraftScale(n.timelineScale ?? 1);
-      setTlDraftCategory(n.timelineCategory ?? "我的笔记");
+      setTlDraftCategory(n.timelineCategory ?? "我的札记");
       setTlDraftTitle(n.timelineTitle ?? "");
     } else {
       // New note — try to auto-detect a year from the current selection so
@@ -2526,7 +2753,7 @@ function App() {
       setTlDraftMonth(detectedMonth);
       setTlDraftDay(detectedDay);
       setTlDraftScale(1);
-      setTlDraftCategory("我的笔记");
+      setTlDraftCategory("我的札记");
       setTlDraftTitle("");
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2543,7 +2770,7 @@ function App() {
       manualMonth: tlDraftMonth ? parseInt(tlDraftMonth, 10) : undefined,
       manualDay: tlDraftDay ? parseInt(tlDraftDay, 10) : undefined,
       timelineScale: tlDraftEnabled ? clamp(tlDraftScale, 1, 5) : undefined,
-      timelineCategory: tlDraftEnabled ? (tlDraftCategory || "我的笔记") : undefined,
+      timelineCategory: tlDraftEnabled ? (tlDraftCategory || "我的札记") : undefined,
       timelineTitle: tlDraftEnabled ? (tlDraftTitle.trim() || undefined) : undefined,
     };
 
@@ -2879,6 +3106,52 @@ function App() {
       return;
     }
 
+    // 在 clearSelection 之前把 cfi + text + 历史时间 snapshot 存起来，给「保存为札记」用
+    let snapshotHistoricalAt: string | undefined;
+    let snapshotHistoricalYear: number | undefined;
+    try {
+      let contextBefore = "";
+      const contents = selectionContentsRef.current;
+      if (contents) {
+        const sel = contents.window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        if (range) {
+          const before = contents.document.createRange();
+          before.setStart(contents.document.body, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      } else {
+        const sel = window.getSelection?.();
+        const range = sel?.rangeCount ? sel.getRangeAt(0) : null;
+        const host = document.querySelector(".db-reader-host");
+        if (range && host) {
+          const before = document.createRange();
+          before.setStart(host, 0);
+          before.setEnd(range.startContainer, range.startOffset);
+          contextBefore = before.toString();
+        }
+      }
+      const resolved = resolveSelectionDate(targetText, contextBefore, "lunar", false);
+      if (resolved) {
+        if (resolved.solarYear && resolved.solarMonth && resolved.solarDay) {
+          snapshotHistoricalAt = `${resolved.solarYear}-${String(resolved.solarMonth).padStart(2, "0")}-${String(resolved.solarDay).padStart(2, "0")}`;
+        } else {
+          snapshotHistoricalAt = resolved.phrase;
+        }
+        snapshotHistoricalYear = resolved.gregorianYear;
+      }
+    } catch {
+      // best-effort
+    }
+    compareAnchorRef.current = {
+      cfi: selectionCfi || "",
+      text: targetText.trim(),
+      bookSlug: currentBookSlug,
+      historicalAt: snapshotHistoricalAt,
+      historicalYear: snapshotHistoricalYear,
+    };
+
     try {
       setCompareLoading(true);
       setReferenceError("");
@@ -2894,6 +3167,47 @@ function App() {
     } finally {
       setCompareLoading(false);
     }
+  }
+
+  // v1.2.1 G1: 把当前 referenceCompare 报告保存为一条 ReaderNote。
+  // 选段位置/text/书籍 来自 handleCrossCompare 入口处 snapshot 的 compareAnchorRef。
+  function saveCompareAsNote() {
+    const anchor = compareAnchorRef.current;
+    if (!anchor || !anchor.cfi || !anchor.text.trim()) {
+      setReferenceError("无法保存：未找到原始选段位置。请先重新选段做一次比对。");
+      return;
+    }
+    if (!referenceCompare?.reportMarkdown) {
+      setReferenceError("当前没有比对报告可保存。");
+      return;
+    }
+    const usedSourceList = (referenceCompare.contexts || []).map((c) => `《${c.bookTitle}》${c.chapter}`).filter((s, i, a) => a.indexOf(s) === i);
+    const usedSourcesNote = usedSourceList.length
+      ? `\n\n---\n\n**比对所用史料**：${usedSourceList.slice(0, 8).join(" / ")}${usedSourceList.length > 8 ? " 等" : ""}`
+      : "";
+    const noteContent = `【史料交叉比对】\n\n${referenceCompare.reportMarkdown.trim()}${usedSourcesNote}`;
+    const now = new Date().toISOString();
+    // v1.2.1：史料比对类札记，timelineTitle 默认 = 勾画文段（最多 40 字，时间线上只显这一行）
+    const autoTitle = anchor.text.trim().slice(0, 40);
+    const newNote: ReaderNote = {
+      id: crypto.randomUUID(),
+      cfiRange: anchor.cfi,
+      text: anchor.text,
+      note: noteContent,
+      createdAt: now,
+      historicalAt: anchor.historicalAt,
+      historicalYear: anchor.historicalYear,
+      bookSlug: anchor.bookSlug,
+      // v1.2.1：默认进时间线，让用户保存后立刻能在「历史时间线」面板看到。
+      // 不想看到可手动在札记面板「从时间线隐藏」。
+      inTimeline: true,
+      timelineTitle: autoTitle,
+      timelineCategory: "史料比对",
+      timelineScale: 3,
+    };
+    setNotes((cur) => [newNote, ...cur]);
+    // 显式反馈
+    setAiPanelTitle("已保存为札记");
   }
 
   async function openSourceViewer(slug: string, chapter: string, snippet: string) {
@@ -3301,26 +3615,341 @@ function App() {
     }
   }
 
-  // 点搜索结果：跨书时先 switchBook 再跳章节；同本书直接跳。
-  async function navigateToSearchResult(result: SearchResult) {
-    const targetSlug = result.bookSlug;
-    if (targetSlug && targetSlug !== currentBookSlug) {
-      await switchBook(targetSlug);
+  // Try to scroll to + flash-highlight the paragraph recorded in
+  // pendingSearchNavRef. Called from the chapter-loaded effects below.
+  // Returns true once the target was found and consumed; false if the
+  // chapter rendered but the target paragraph wasn't located yet (effects
+  // will retry on the next render).
+  function scrollToSearchTarget(): boolean {
+    const target = pendingSearchNavRef.current;
+    if (!target) return false;
+
+    // DB-reader path: query the rendered <p data-paragraph-id="N">
+    // Note: 多栏布局未必已 settle。如果 offsetLeft 还 = 0，先把段落 id
+    // 写进 dbAnchorParaRef，column-recompute useEffect 触发时会按它对齐；
+    // 同时仍尝试主动 scrollTo，以应对 effect 已经跑过的场景。
+    const dbHost = dbReaderHostRef.current;
+    if (dbHost) {
+      const el = dbHost.querySelector<HTMLElement>(`[data-paragraph-id="${target.paragraphId}"]`);
+      console.info("[searchNav] DB-reader attempt: dbHost=present, paragraphId=" + target.paragraphId + ", el=" + (el ? "FOUND" : "MISSING"));
+      if (el) {
+        const cw = dbHost.clientWidth;
+        dbAnchorParaRef.current = String(target.paragraphId);
+        console.info("[searchNav] DB-reader matched: cw=" + cw + ", offsetLeft=" + el.offsetLeft + ", scrollWidth=" + dbHost.scrollWidth);
+        if (cw > 0 && el.offsetLeft > 0) {
+          const targetPage = Math.floor(el.offsetLeft / cw);
+          dbHost.scrollTo({ left: targetPage * cw, behavior: "smooth" });
+          dbTargetPageRef.current = targetPage;
+          el.classList.add("search-flash");
+          setTimeout(() => el.classList.remove("search-flash"), 1600);
+          console.info("[searchNav] DB-reader scrolled to page " + targetPage);
+          pendingSearchNavRef.current = null;
+          return true;
+        }
+        // 找到段落但 layout 没 settle — 加 flash，但不清 ref，让后续重试再 scroll
+        console.info("[searchNav] DB-reader layout not settled, will retry");
+        el.classList.add("search-flash");
+        setTimeout(() => el.classList.remove("search-flash"), 1600);
+      }
+    } else {
+      // 仅 EPUB path 时才打这条；DB-reader 没渲染的时候 dbHost 自然是 null
+      // — 不一定是 bug。
     }
-    // EPUB 类（hasEpub）的 anchor 即 chapterHref，直接 openLocation；
-    // DB-only 类用 chapterOrder 调 loadDbReaderChapter。
+
+    // EPUB path: 找到段落 → 算 CFI → rendition.display(cfi) 跳到分栏页
+    const rendition = renditionRef.current as unknown as EpubRenditionLike & { currentLocation?: () => unknown };
+    if (rendition && rendition.getContents) {
+      const contentsList = rendition.getContents() || [];
+      // iframe 内容可能被 OpenCC 转成繁体，DB 原始文本通常是简体 → 双路 needle 匹配。
+      // 同时只比 CJK 字符（去掉所有标点、空白、英数），避免因「，」/「，」、「·」/「‧」差异 false miss。
+      const onlyCjk = (s: string) => (s || "").replace(/[^一-鿿㐀-䶿]/g, "");
+      const needleSimp = onlyCjk(target.text).slice(0, 18);
+      const needleTrad = toTraditional(needleSimp);
+      console.info("[searchNav] EPUB attempt", { contentsCount: contentsList.length, needleSimp, needleTrad, attempt: target.attempts });
+      if (needleSimp.length >= 6 && contentsList.length > 0) {
+        for (const contents of contentsList) {
+          const doc = contents.document;
+          if (!doc) continue;
+          const blocks = doc.querySelectorAll<HTMLElement>("p, div, li, h1, h2, h3, h4, h5, h6, blockquote, span");
+          let foundEl: HTMLElement | null = null;
+          for (const el of Array.from(blocks)) {
+            const txt = onlyCjk(el.textContent || "");
+            if (txt.includes(needleSimp) || (needleTrad !== needleSimp && txt.includes(needleTrad))) {
+              foundEl = el; break;
+            }
+          }
+          if (!foundEl) {
+            // 调试：打印这个 contents 文档前 30 块的文本前缀，看实际 iframe 内容
+            const sample = Array.from(blocks).slice(0, 5).map((b) => onlyCjk(b.textContent || "").slice(0, 20));
+            console.info("[searchNav] EPUB no match (totalBlocks=" + blocks.length + ", sample blocks=", sample, ")");
+            continue;
+          }
+          const el = foundEl;
+          console.info("[searchNav] EPUB matched", el.tagName, "text=", (el.textContent || "").slice(0, 30));
+
+          let cfi: string | null = null;
+          try {
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            if (typeof contents.cfiFromRange === "function") {
+              cfi = contents.cfiFromRange(range) || null;
+            }
+          } catch (e) {
+            console.warn("[searchNav] cfiFromRange threw", e);
+          }
+          if (!cfi && typeof contents.cfiFromNode === "function") {
+            try { cfi = contents.cfiFromNode(el) || null; } catch (e) {
+              console.warn("[searchNav] cfiFromNode threw", e);
+            }
+          }
+          console.info("[searchNav] computed cfi:", cfi ? cfi.slice(0, 100) : "(null)");
+
+          el.classList.add("search-flash");
+          window.setTimeout(() => el.classList.remove("search-flash"), 1600);
+
+          if (cfi) {
+            rendition.display(cfi).then(() => {
+              console.info("[searchNav] display(cfi) resolved");
+              el.classList.add("search-flash");
+              window.setTimeout(() => el.classList.remove("search-flash"), 1600);
+              pendingSearchNavRef.current = null;
+            }).catch((err: unknown) => {
+              console.warn("[searchNav] display(cfi) failed:", err);
+              const tmpId = "mingshi-search-target-anchor";
+              el.id = tmpId;
+              const loc = rendition.currentLocation?.() as { start?: { href?: string } } | null;
+              const href = loc?.start?.href || pendingLocationTargetRef.current || forcedChapterTargetRef.current;
+              console.info("[searchNav] fallback anchor approach href=", href);
+              if (href) {
+                rendition.display(`${href}#${tmpId}`).finally(() => {
+                  pendingSearchNavRef.current = null;
+                });
+              } else {
+                pendingSearchNavRef.current = null;
+              }
+            });
+            return true;
+          }
+
+          console.info("[searchNav] no cfi computed, trying scrollIntoView");
+          try { el.scrollIntoView({ block: "start" }); } catch { /* ignore */ }
+          pendingSearchNavRef.current = null;
+          return true;
+        }
+      } else if (needleSimp.length < 6) {
+        console.info("[searchNav] needle too short (<6), can't text-match");
+      } else if (contentsList.length === 0) {
+        console.info("[searchNav] contentsList empty — rendition not ready");
+      }
+    } else if (!rendition) {
+      console.info("[searchNav] no rendition (DB-reader path likely already returned, or both readers missing)");
+    }
+
+    target.attempts += 1;
+    if (target.attempts > 10) {
+      console.warn("[searchNav] giving up after 10 attempts");
+      pendingSearchNavRef.current = null;
+    }
+    return false;
+  }
+
+  // 点搜索结果：跨书时先 switchBook 再跳章节；同本书直接跳。
+  // 跳转到具体段落用 pendingSearchNavRef：chapter 加载完成后会被消费。
+  async function navigateToSearchResult(result: SearchResult) {
+    // 解析 paragraph_id：result.id 格式为 `${bookSlug}-${paragraph_id}`
+    const lastDash = (result.id || "").lastIndexOf("-");
+    const paragraphId = lastDash >= 0 ? parseInt(result.id.slice(lastDash + 1), 10) : NaN;
+    if (Number.isFinite(paragraphId)) {
+      pendingSearchNavRef.current = {
+        paragraphId,
+        text: result.text || (result.snippet || "").replace(/<[^>]+>/g, ""),
+        attempts: 0,
+      };
+    }
+
+    const targetSlug = result.bookSlug;
     const targetBook = readableBooks.find((b) => b.slug === (targetSlug || currentBookSlug));
+    const needsBookSwitch = !!targetSlug && targetSlug !== currentBookSlug;
+
+    if (needsBookSwitch) {
+      await switchBook(targetSlug);
+      // 跨书跳转 EPUB 必须在 switchBook 之后再设 initialLocationRef，
+      // 因为 switchBook 内部会读 last-location:<slug> 并写入这个 ref，
+      // 在它之前赋值会被覆盖掉，导致 rendition init 仍然用上次保存位置 →
+      // 用户表现就是「第一次点跳到上次的章节，第二次才跳到目标章节」。
+      if (targetBook?.hasEpub && result.chapterHref) {
+        initialLocationRef.current = result.chapterHref;
+      }
+    }
+
+    // 同本书：手动触发章节加载（跨书时 switchBook 已处理 EPUB；
+    // DB-reader 跨书只加载了 chapter 0，目标章节 != 0 时这里补一次）
     if (targetBook?.hasEpub === false && typeof result.chapterOrder === "number") {
-      // 等下一个 frame 让 dbReaderChapters 完成 fetch（switchBook 内部已 await meta）
       requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
-    } else if (result.chapterHref) {
+    } else if (result.chapterHref && !needsBookSwitch) {
       void openLocation(result.chapterHref);
     } else if (typeof result.chapterOrder === "number") {
       requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
     }
+
+    // 兜底：当跳转目标是同书同章节（state deps 不变），effect 不会再 fire，
+    // 这里直接定时重试几次。每次成功后 scrollToSearchTarget 内部会清掉 ref。
+    if (Number.isFinite(paragraphId)) {
+      window.setTimeout(() => scrollToSearchTarget(), 200);
+      window.setTimeout(() => scrollToSearchTarget(), 700);
+      window.setTimeout(() => scrollToSearchTarget(), 1500);
+      window.setTimeout(() => scrollToSearchTarget(), 3000);
+    }
   }
 
-  async function loadPersonChronology(useAi: boolean) {
+  // v1.2 自由对话：load + save history。本地 localStorage 一份，最多保留 50 个会话。
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void readPersistedState<FreeChatHistory[]>(storageKey("free-chats"), []).then((list) => {
+      setFreeChats(Array.isArray(list) ? list : []);
+    });
+  }, [hasLoadedLocalState]);
+
+  useEffect(() => {
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("free-chats"), freeChats.slice(0, 50));
+  }, [freeChats, hasLoadedLocalState]);
+
+  function newFreeChat() {
+    const id = (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : `chat-${Date.now()}`;
+    setActiveFreeChatId(id);
+    setFreeChatInput("");
+    setFreeChatError("");
+    setFreeChatSourcesExpanded(false);
+  }
+
+  function deleteFreeChat(id: string) {
+    setFreeChats((cur) => cur.filter((c) => c.id !== id));
+    if (activeFreeChatId === id) setActiveFreeChatId(null);
+  }
+
+  function renameFreeChat(id: string, title: string) {
+    setFreeChats((cur) => cur.map((c) => c.id === id ? { ...c, title, updatedAt: new Date().toISOString() } : c));
+  }
+
+  async function sendFreeChatMessage() {
+    const text = freeChatInput.trim();
+    if (!text) return;
+    let chat = freeChats.find((c) => c.id === activeFreeChatId);
+    // 没有 active session 时自动开新对话
+    let id = activeFreeChatId;
+    if (!chat || !id) {
+      id = (typeof crypto !== "undefined" && "randomUUID" in crypto) ? crypto.randomUUID() : `chat-${Date.now()}`;
+      chat = {
+        id,
+        title: text.slice(0, 30) || "新对话",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messages: [],
+        sources: [],
+        sourceMode: "",
+      };
+      setActiveFreeChatId(id);
+    }
+    const userMsg: ConversationMessage = { role: "user", content: text };
+    const newHistory: ConversationMessage[] = [...chat.messages, userMsg];
+    const updated: FreeChatHistory = { ...chat, messages: newHistory, updatedAt: new Date().toISOString() };
+    setFreeChats((cur) => {
+      const i = cur.findIndex((c) => c.id === id);
+      if (i >= 0) return cur.map((c, idx) => idx === i ? updated : c);
+      return [updated, ...cur];
+    });
+    setFreeChatInput("");
+    setFreeChatError("");
+    setFreeChatLoading(true);
+    try {
+      // 若 freeChatModel 非空，覆盖 defaultModel；否则用全局默认
+      const settingsForChat = freeChatModel
+        ? { ...aiSettings, defaultModel: freeChatModel }
+        : aiSettings;
+      const resp = await runFreeConversation({ messages: newHistory, aiSettings: settingsForChat });
+      const finalMessages = [...newHistory, { role: "assistant" as const, content: resp.assistant }];
+      setFreeChats((cur) => cur.map((c) => c.id === id
+        ? {
+            ...c,
+            messages: finalMessages,
+            sources: resp.sources || [],
+            sourceMode: resp.sourceMode || "",
+            updatedAt: new Date().toISOString(),
+            // 第一轮自动用首问的前 30 字当标题（如果还没改过）
+            title: c.title === "新对话" || !c.title
+              ? (finalMessages[0]?.content?.slice(0, 30) || "新对话")
+              : c.title,
+          }
+        : c
+      ));
+    } catch (error) {
+      setFreeChatError(error instanceof Error ? error.message : "AI 对话失败。");
+      setFreeChats((cur) => cur.map((c) => c.id === id ? { ...c, messages: chat!.messages } : c));
+      setFreeChatInput(text);
+    } finally {
+      setFreeChatLoading(false);
+    }
+  }
+
+  // 人物列传：从传记索引中拉取该人物在 4 部纪传体的全部列传切片。
+  async function loadPersonBiographies() {
+    const q = personQuery.trim();
+    if (!q) return;
+    try {
+      setBiographiesLoading(true);
+      setConversationError("");
+      const data = await fetchPersonBiographies(q);
+      setPersonBiographies(data);
+    } catch (error) {
+      setConversationError(error instanceof Error ? error.message : "人物列传加载失败。");
+    } finally {
+      setBiographiesLoading(false);
+    }
+  }
+
+  // AI 对话：发出一轮提问，前端保管 messages 历史，后端 stateless。
+  async function sendConversationMessage() {
+    const text = conversationInput.trim();
+    const person = personQuery.trim();
+    if (!text) return;
+    const userMsg: ConversationMessage = { role: "user", content: text };
+    const newHistory: ConversationMessage[] = [...conversationMessages, userMsg];
+    setConversationMessages(newHistory);
+    setConversationInput("");
+    setConversationError("");
+    setConversationLoading(true);
+    try {
+      const resp = await runPersonConversation({
+        person,
+        mode: conversationMode,
+        messages: newHistory,
+        aiSettings,
+      });
+      setConversationMessages([...newHistory, { role: "assistant", content: resp.assistant }]);
+      setConversationSources(resp.sources || []);
+      setConversationSourceMode(resp.sourceMode || "");
+    } catch (error) {
+      setConversationError(error instanceof Error ? error.message : "AI 对话失败。");
+      // 把刚加的用户消息撤回，便于用户重试
+      setConversationMessages(conversationMessages);
+      setConversationInput(text);
+    } finally {
+      setConversationLoading(false);
+    }
+  }
+
+  function resetConversation() {
+    setConversationMessages([]);
+    setConversationSources([]);
+    setConversationSourceMode("");
+    setConversationInput("");
+    setConversationError("");
+  }
+
+  // Legacy chronology entry — UI 不再使用，仅保留以备旧 API 调用。
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async function _loadPersonChronology(useAi: boolean) {
     if (!personQuery.trim()) return;
     try {
       setPersonLoading(true);
@@ -3331,11 +3960,12 @@ function App() {
         setPersonChronology(response);
       });
     } catch (error) {
-      setAiError(error instanceof Error ? error.message : "人物编年加载失败。");
+      setAiError(error instanceof Error ? error.message : "人物志加载失败。");
     } finally {
       setPersonLoading(false);
     }
   }
+  void _loadPersonChronology;
 
   async function speakText(sourceText: string) {
     if (!sourceText.trim()) return;
@@ -3399,7 +4029,7 @@ function App() {
 
   function exportNotes() {
     const lines = [
-      `# ${meta?.metadata.title || "明史"}阅读笔记`,
+      `# ${meta?.metadata.title || "明史"}阅读札记`,
       "",
       `导出时间：${new Date().toLocaleString("zh-CN")}`,
       "",
@@ -3408,13 +4038,13 @@ function App() {
         "",
         `原文：${note.text}`,
         "",
-        `笔记：${note.note}`,
+        `札记：${note.note}`,
         "",
         `位置：${note.cfiRange}`,
         "",
       ]),
     ];
-    downloadTextFile("明史-阅读笔记.md", lines.join("\n"));
+    downloadTextFile("明史-阅读札记.md", lines.join("\n"));
   }
 
   function exportBookmarks() {
@@ -3583,7 +4213,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.1</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.2.1</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -3678,10 +4308,10 @@ function App() {
                   placeholder={'输入关键词、句子，或用模糊意图搜索，例如\u300c朱元璋少年经历\u300d\u300c海禁相关记载\u300d'}
                 />
                 <div className="inline-actions">
-                  <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as "local" | "fuzzy" | "ai")} className="select-input">
+                  <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as "local" | "fuzzy" | "semantic")} className="select-input">
                     <option value="local">本地检索</option>
                     <option value="fuzzy">模糊检索</option>
-                    <option value="ai">AI 意图检索</option>
+                    <option value="semantic">语义检索（RAG）</option>
                   </select>
                   <label style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", fontSize: "0.78rem" }}>
                     最多
@@ -3792,7 +4422,7 @@ function App() {
             <div className="panel-scroll">
               <div className="panel-headline">
                 <FilePenLine size={18} />
-                <span>随手笔记</span>
+                <span>随笔札记</span>
                 <div className="header-actions">
                   <button type="button" className="ghost-button compact-button" onClick={exportNotes} disabled={!notes.length}>
                     <Download size={15} />
@@ -3804,8 +4434,8 @@ function App() {
                 <label className="field-label">
                   排序
                   <select className="select-input" value={notesSort} onChange={(e) => setNotesSort(e.target.value as typeof notesSort)}>
-                    <option value="created-desc">按记笔记时间（新→旧）</option>
-                    <option value="created-asc">按记笔记时间（旧→新）</option>
+                    <option value="created-desc">按札记时间（新→旧）</option>
+                    <option value="created-asc">按札记时间（旧→新）</option>
                     <option value="historical-asc">按历史时间（早→晚）</option>
                     <option value="historical-desc">按历史时间（晚→早）</option>
                     <option value="book">按书目分组</option>
@@ -3836,7 +4466,7 @@ function App() {
                     style={{ flex: 1, minWidth: "8rem" }}
                     value={notesCreatedMin}
                     onChange={(e) => setNotesCreatedMin(e.target.value)}
-                    title="记笔记时间下限"
+                    title="札记时间下限"
                   />
                   <input
                     type="date"
@@ -3844,7 +4474,7 @@ function App() {
                     style={{ flex: 1, minWidth: "8rem" }}
                     value={notesCreatedMax}
                     onChange={(e) => setNotesCreatedMax(e.target.value)}
-                    title="记笔记时间上限"
+                    title="札记时间上限"
                   />
                 </div>
               </div>
@@ -3878,7 +4508,7 @@ function App() {
                     list = [...list].sort((a, b) => (a.bookSlug || "").localeCompare(b.bookSlug || "") || b.createdAt.localeCompare(a.createdAt));
                   }
 
-                  if (list.length === 0) return <div className="empty-state">先在正文里选段，再点"记笔记"。</div>;
+                  if (list.length === 0) return <div className="empty-state">先在正文里选段，再点"札记"。</div>;
                   // For "book" sort, render group headers
                   const groupedByBook = notesSort === "book";
                   const out: React.ReactNode[] = [];
@@ -3894,12 +4524,18 @@ function App() {
                       );
                     }
                     const isExpanded = expandedNoteId === note.id;
-                    const preview = note.note.length > 30 ? note.note.slice(0, 30) + "…" : note.note;
+                    // 「史料交叉比对」生成的札记 note 是一整段 Markdown（含 ## 标题、表格、加粗等），
+                    // 直接当纯文本渲染会一团乱。识别后用 renderMarkdown 渲染。
+                    const isCrossCompareNote = note.note.startsWith("【史料交叉比对】");
+                    const previewSource = isCrossCompareNote
+                      ? note.note.replace(/^【史料交叉比对】\s*/, "").replace(/[#*`>|\-]/g, " ").replace(/\s+/g, " ").trim()
+                      : note.note;
+                    const preview = previewSource.length > 30 ? previewSource.slice(0, 30) + "…" : previewSource;
                     out.push(
                       <div key={note.id} className="result-card static-card">
                         <button type="button" className="note-summary-row" onClick={() => setExpandedNoteId(isExpanded ? null : note.id)}>
                           <span className="note-time">{formatTime(note.createdAt)}</span>
-                          <span className="note-preview">{preview}</span>
+                          <span className="note-preview">{isCrossCompareNote ? `【交叉比对】${preview}` : preview}</span>
                           <span className="note-expand-icon">{isExpanded ? "▾" : "▸"}</span>
                         </button>
                         {note.historicalAt && (
@@ -3909,10 +4545,25 @@ function App() {
                         )}
                         {isExpanded && (
                           <div className="note-detail">
-                            <div className="result-snippet">{note.text}</div>
-                            <div className="note-body">{note.note}</div>
+                            <div className="note-source-block">
+                              <div className="note-source-label">原选段 · 勾画位置</div>
+                              <div className="note-source-text">{note.text || "（未记录原选段位置）"}</div>
+                            </div>
+                            <div className="note-content-frame">
+                              {isCrossCompareNote ? (
+                                <div
+                                  className="markdown-body note-md-compact"
+                                  dangerouslySetInnerHTML={{ __html: renderMarkdown(note.note.replace(/^【史料交叉比对】\s*/, "")) }}
+                                />
+                              ) : (
+                                <div className="note-body">{note.note}</div>
+                              )}
+                            </div>
                             <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.3rem" }}>
                               <button type="button" className="ghost-button" onClick={() => openLocation(note.cfiRange)}>回到原文</button>
+                              {isCrossCompareNote && (
+                                <button type="button" className="ghost-button" onClick={() => setNoteExpandedFor(note.id)}>展开</button>
+                              )}
                               <button type="button" className="ghost-button" onClick={() => { setEditingNoteId(note.id); setNoteDraft(note.note); setNoteComposerOpen(true); }}>编辑</button>
                               {/* 一键切换 在时间线显示，无需进 编辑 弹窗 */}
                               <button
@@ -3992,21 +4643,21 @@ function App() {
                 <span>辅助资料</span>
               </div>
               <div className="resource-button-list">
+                <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("free-chat")}>
+                  <Search size={16} />
+                  <span>AI 对话</span>
+                </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("chronology")}>
                   <UserRound size={16} />
-                  <span>人物编年</span>
+                  <span>人物志</span>
                 </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("reign")}>
                   <Calculator size={16} />
                   <span>年号换算</span>
                 </button>
-                <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("familytree")}>
-                  <GitBranch size={16} />
-                  <span>主支谱系</span>
-                </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("officials")}>
                   <Landmark size={16} />
-                  <span>职官检索</span>
+                  <span>职官/世系</span>
                 </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("map")}>
                   <MapPinned size={16} />
@@ -4173,6 +4824,26 @@ function App() {
                   <input type="checkbox" checked={showEmperor} onChange={(e) => setShowEmperor(e.target.checked)} />
                   <span>气泡 / 模态显示在位皇帝（如 明英宗朱祁镇）</span>
                 </label>
+                <label className="toggle-row">
+                  <input type="checkbox" checked={keyboardPagingEnabled} onChange={(e) => setKeyboardPagingEnabled(e.target.checked)} />
+                  <span>键盘 ← → 翻页（默认关；开后阅读区无需手动点边缘）</span>
+                </label>
+                <div className="field-label" style={{ borderTop: "1px solid var(--ui-panel-border)", paddingTop: "0.5rem", marginTop: "0.3rem" }}>
+                  <strong style={{ fontSize: "0.85rem" }}>标记模式（v1.2）</strong>
+                  <div className="muted-text" style={{ fontSize: "0.72rem", marginTop: "0.2rem" }}>
+                    在页头工具栏点「标记」按钮启用后，选段结束直接按下方配色 / 形态打标，不再弹工具栏。Cmd/Ctrl+Z 撤销最近一次。
+                  </div>
+                </div>
+                <label className="field-label">
+                  默认勾画样式
+                  <select className="select-input" value={markStyle} onChange={(e) => setMarkStyle(e.target.value as "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle")}>
+                    <option value="h-gold">高亮 · 金笺（深黄）</option>
+                    <option value="h-jade">高亮 · 青玉（深绿）</option>
+                    <option value="h-crimson">高亮 · 绛纱（深红）</option>
+                    <option value="underline">下划线（正红）</option>
+                    <option value="circle">圈点（正红字下圆点）</option>
+                  </select>
+                </label>
                 <label className="field-label">
                   字色（留空则跟随主题）
                   <div className="inline-actions">
@@ -4253,6 +4924,16 @@ function App() {
                 <button type="button" className="ghost-button" onClick={createBookmark}>
                   <Bookmark size={16} />
                   书签
+                </button>
+                <button
+                  type="button"
+                  className={`ghost-button ${markModeEnabled ? "is-active-mode" : ""}`}
+                  onClick={() => setMarkModeEnabled((v) => !v)}
+                  title="标记模式（v1.2）：开启后选段直接按默认配色打标，Cmd+Z 撤销。颜色/形态在设置 → 默认勾画 里调。"
+                  style={markModeEnabled ? { background: "rgba(212, 35, 27, 0.15)", borderColor: "rgba(212, 35, 27, 0.4)" } : undefined}
+                >
+                  <Highlighter size={16} />
+                  {markModeEnabled ? "标记中" : "标记"}
                 </button>
               </div>
             </>
@@ -4342,7 +5023,7 @@ function App() {
               {/* 「保留」累积开关 — 默认关；开启后新选段不替换旧选段，而是追加。
                   用以解决 EPUB / DB-reader 跨页跨章选段无法被一次 OS-level
                   selection 覆盖的问题。开关关掉 / 「清空」按钮 都会清光 buffer。 */}
-              <label className="toggle-row" style={{ marginLeft: "auto", fontSize: "0.72rem", gap: "0.3rem" }} title="开启后新选段不清空旧选段，而是接在后面；AI/笔记/勾画等动作对累积后的整段生效。关掉或点清空才会重置。">
+              <label className="toggle-row" style={{ marginLeft: "auto", fontSize: "0.72rem", gap: "0.3rem" }} title="开启后新选段不清空旧选段，而是接在后面；AI/札记/勾画等动作对累积后的整段生效。关掉或点清空才会重置。">
                 <input
                   type="checkbox"
                   checked={accumulateMode}
@@ -4380,36 +5061,19 @@ function App() {
                 ? (pinnedSegments.length > 0
                     ? <div style={{ borderLeft: "2px solid #d4231b", paddingLeft: "0.5rem" }}><span className="muted-text" style={{ fontSize: "0.78rem", opacity: 0.7 }}>#{pinnedSegments.length + 1}（最新）</span><div>{selectionText}</div></div>
                     : selectionText)
-                : "在正文中选中一段内容后，可在悬浮工具栏中一键翻译、标音、解释、做笔记或进行史料比对。"}
+                : "在正文中选中一段内容后，可在悬浮工具栏中一键翻译、标音、解释、做札记或进行史料比对。"}
             </div>
             {/*
               v1.0 起隐藏「当前选段」卡片下方的 7 个 action 按钮（现代文 /
-              读音 / 解释 / 百科 / 史料比对 / AI 句读 / 记笔记）—— 它们与
+              读音 / 解释 / 百科 / 史料比对 / AI 句读 / 札记）—— 它们与
               悬浮选段工具栏（在 selection-overlay.visible 时显示）的入口
               重复，而工具栏本来就贴着选段位置弹出，更顺手。自定义 AI 操作
               的 secondary-button 同此理，跟着隐藏。
             */}
           </div>
 
-          <div className="question-box">
-            <label className="field-label">
-              直接提问
-              <textarea
-                className="text-input tall"
-                value={questionDraft}
-                onChange={(event) => setQuestionDraft(event.target.value)}
-                placeholder="例如：这段到底在讲什么？相关人物是谁？若不看选段，直接回答'土木之变的转折点是什么'也可以。"
-              />
-            </label>
-            <button
-              type="button"
-              className="primary-button full-width"
-              onClick={() => void requestAiAction("qa")}
-              disabled={aiLoading || !questionDraft.trim()}
-            >
-              {aiLoading ? "AI 思考中…" : "开始问答"}
-            </button>
-          </div>
+          {/* v1.2.1：右侧「直接提问」已被左侧「资料 → AI 对话」面板取代（多轮 + 本地存档 + 模型自选）。
+              输入框 / 按钮隐藏，相关后端端点 /api/ai/action?type=qa 保留以备 selection-based 问答场景。 */}
 
           {aiError && <div className="error-box">{aiError}</div>}
           {referenceError && <div className="error-box">{referenceError}</div>}
@@ -4519,6 +5183,26 @@ function App() {
             <div className="panel-headline small">
               <LibraryBig size={16} />
               <span>史料交叉比对</span>
+              {referenceCompare?.reportMarkdown && !compareLoading && (
+                <div className="header-actions">
+                  <button
+                    type="button"
+                    className="ghost-button compact-button"
+                    onClick={saveCompareAsNote}
+                    title="把当前比对报告保存为一条札记，锚定到原始选段"
+                  >
+                    札记
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button compact-button"
+                    onClick={() => setCompareExpandOpen(true)}
+                    title="在弹窗中展开查看完整报告"
+                  >
+                    展开
+                  </button>
+                </div>
+              )}
             </div>
             <div className="tag-row">
               {referenceCompare?.keywords?.map((keyword) => (
@@ -4563,7 +5247,7 @@ function App() {
           <div className="note-input-panel">
             <div className="panel-headline small">
               <NotebookPen size={16} />
-              <span>记笔记</span>
+              <span>随笔札记</span>
             </div>
             {selectionText.trim() && <div className="muted-text" style={{ fontSize: "0.75rem" }}>选段：{selectionText.slice(0, 40)}{selectionText.length > 40 ? "…" : ""}</div>}
             <textarea
@@ -4571,7 +5255,7 @@ function App() {
               className="text-input"
               value={noteDraft}
               onChange={(e) => setNoteDraft(e.target.value)}
-              placeholder={selectionText.trim() ? "为选中的文段写笔记…" : "先在正文中选段，再写笔记"}
+              placeholder={selectionText.trim() ? "为选中的文段写札记…" : "先在正文中选段，再写札记"}
               rows={2}
             />
             <button
@@ -4581,7 +5265,7 @@ function App() {
               onClick={saveNote}
               style={{ alignSelf: "flex-end" }}
             >
-              保存笔记
+              保存札记
             </button>
           </div>
 
@@ -4632,31 +5316,24 @@ function App() {
           <button type="button" className="toolbar-mini close-mini" onClick={clearSelection} title="关闭">
             <X size={14} />
           </button>
-          <div className="mark-group">
-            <div className="mark-style-picker">
-              {highlightPalette.map((item) => (
-                <button key={item.label} type="button" className={`color-pick ${highlightStyle.kind === "highlight" && highlightStyle.color === item.color ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "highlight", color: item.color })} title={item.label}>
-                  <span className="color-dot" style={{ backgroundColor: item.color }} />
-                </button>
-              ))}
-              <button type="button" className={`color-pick ${highlightStyle.kind === "underline" ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "underline", color: "#d4231b" })} title="下划线（正红）">
-                <span className="underline-icon">U</span>
-              </button>
-              <button type="button" className={`color-pick ${highlightStyle.kind === "circle" ? "is-active" : ""}`} onClick={() => setHighlightStyle({ kind: "circle", color: "#d4231b" })} title="圈点（正红 · 古文勾画法）">
-                <span className="circle-icon">⠿</span>
-              </button>
-            </div>
-            <button type="button" className="toolbar-mini" onClick={() => addSelectionHighlight(highlightStyle.kind, highlightStyle.color)}>
-              <Highlighter size={14} />
-              标记
-            </button>
-          </div>
+          {/* v1.2 toolbar 精简：颜色 / 形态选择移到设置面板的"默认勾画"，弹窗里只剩一个「标记」按钮。 */}
+          <button
+            type="button"
+            className="toolbar-mini"
+            onClick={() => {
+              const { kind, color } = resolveMarkStyle(markStyle);
+              addSelectionHighlight(kind, color);
+            }}
+          >
+            <Highlighter size={14} />
+            标记
+          </button>
           {selectionHighlight && (
             <button type="button" className="toolbar-mini danger-mini" onClick={() => { removeHighlight(selectionHighlight); clearSelection(); }}>
               删除勾画
             </button>
           )}
-          <button type="button" className="toolbar-mini" onClick={() => { setAssistantCollapsed(false); noteInputRef.current?.focus(); }}>笔记</button>
+          <button type="button" className="toolbar-mini" onClick={() => { setAssistantCollapsed(false); noteInputRef.current?.focus(); }}>札记</button>
           <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("pronounce")} disabled={aiLoading}>读音</button>
           <button type="button" className="toolbar-mini" onClick={() => void handleResolveSelectionDate()}>识别日期</button>
           <button type="button" className="toolbar-mini" onClick={() => void handleReferenceLookup()} disabled={lookupLoading}>百科</button>
@@ -4679,10 +5356,11 @@ function App() {
           <div className="modal-card resource-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">
-                {openResourcePanel === "chronology" && "人物编年"}
+                {openResourcePanel === "chronology" && "人物志"}
                 {openResourcePanel === "reign" && "年号 / 公元换算"}
+                {openResourcePanel === "free-chat" && "AI 对话"}
                 {openResourcePanel === "familytree" && "主支三代谱系"}
-                {openResourcePanel === "officials" && "职官制度与检索"}
+                {openResourcePanel === "officials" && "职官/世系"}
                 {openResourcePanel === "map" && "古今地名地图"}
                 {openResourcePanel === "history-timeline" && "历史时间线"}
                 {openResourcePanel === "custom-actions" && "自定义 AI 操作"}
@@ -4692,20 +5370,13 @@ function App() {
 
             {openResourcePanel === "chronology" && (
               <div className="stack-gap">
-                <div className="muted-text">输入人物名，检索《明史》编年与 AI 整理。</div>
                 <input
                   className="text-input"
                   value={personQuery}
                   onChange={(event) => setPersonQuery(event.target.value)}
-                  placeholder="如 朱元璋、王守仁、张居正"
+                  placeholder="人物名 如 张居正、袁崇焕、王守仁"
                 />
                 <div className="inline-actions">
-                  <button type="button" className="primary-button" onClick={() => void loadPersonChronology(false)} disabled={personLoading}>
-                    本地整理
-                  </button>
-                  <button type="button" className="secondary-button" onClick={() => void loadPersonChronology(true)} disabled={personLoading}>
-                    {personLoading ? "AI 编年中…" : "AI 编年"}
-                  </button>
                   <button
                     type="button"
                     className="ghost-button"
@@ -4716,22 +5387,231 @@ function App() {
                     百度百科
                   </button>
                 </div>
-                {aiError && <div className="error-box">{aiError}</div>}
-                {personLoading && <div className="muted-text">检索《明史》并请 AI 整理中，通常 30–60 秒…</div>}
-                {personChronology?.summary && (
-                  <div
-                    className="answer-card markdown-body"
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(personChronology.summary) }}
-                  />
-                )}
-                <div className="result-list compact">
-                  {personChronology?.items.slice(0, 8).map((item) => (
-                    <button key={item.id} type="button" className="result-card" onClick={() => { openLocation(item.chapterHref); setOpenResourcePanel(null); }}>
-                      <div className="result-title">{item.chapterTitle}</div>
-                      <div className="result-snippet">{item.snippet}</div>
-                    </button>
-                  ))}
+
+                <div className="officials-tabs">
+                  <button
+                    type="button"
+                    className={`tab-button ${personPanelTab === "biographies" ? "is-active" : ""}`}
+                    onClick={() => setPersonPanelTab("biographies")}
+                  >人物列传</button>
+                  <button
+                    type="button"
+                    className={`tab-button ${personPanelTab === "conversation" ? "is-active" : ""}`}
+                    onClick={() => setPersonPanelTab("conversation")}
+                  >AI 对话</button>
                 </div>
+
+                {personPanelTab === "biographies" && (
+                  <div className="stack-gap">
+                    <div className="muted-text">在《明史》《石匮书后集》《东林列传》《罪惟录》4 部纪传体的传记索引中查找此人的列传切片（共 776 位人物入库）。</div>
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => void loadPersonBiographies()}
+                        disabled={biographiesLoading || !personQuery.trim()}
+                      >
+                        {biographiesLoading ? "查询中…" : "查询列传"}
+                      </button>
+                    </div>
+                    {conversationError && personPanelTab === "biographies" && <div className="error-box">{conversationError}</div>}
+                    {personBiographies && !personBiographies.has && (
+                      <div className="muted-text" style={{ padding: "0.6rem 0" }}>
+                        传记索引中没有「{personBiographies.person}」。可改用「AI 对话」 tab 让模型基于嵌入检索的相关史料回答。
+                      </div>
+                    )}
+                    {personBiographies?.has && (
+                      <div className="result-list compact">
+                        {personBiographies.biographies.map((bio, i) => (
+                          <div key={`${bio.bookSlug}-${i}`} className="result-card static-card">
+                            <div className="result-title">《{bio.bookTitle}》{bio.chapterLabel}</div>
+                            <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+                              共 {bio.paragraphCount} 段（章节内 #{bio.sliceFromIndex + 1}–#{bio.sliceToIndex} / 全章 {bio.chapterParagraphCount} 段）
+                            </div>
+                            <div className="result-snippet" style={{ marginTop: "0.4rem", whiteSpace: "pre-wrap" }}>
+                              {bio.paragraphs.slice(0, 3).join("\n")}
+                              {bio.paragraphs.length > 3 && (
+                                <span className="muted-text"> … </span>
+                              )}
+                            </div>
+                            {bio.anchor && (
+                              <div className="inline-actions" style={{ marginTop: "0.3rem" }}>
+                                <button
+                                  type="button"
+                                  className="ghost-button compact-button"
+                                  onClick={() => { openLocation(bio.anchor); setOpenResourcePanel(null); }}
+                                >
+                                  跳转到原书章节
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {personBiographies && personBiographies.related && personBiographies.related.length > 0 && (
+                      <div className="stack-gap" style={{ marginTop: "0.6rem" }}>
+                        <div className="muted-text" style={{ fontSize: "0.82rem" }}>
+                          ▶ 其他史料中提及此人的段落（嵌入检索 + 人名实际命中过滤，共 {personBiographies.related.length} 条）
+                        </div>
+                        <div className="result-list compact">
+                          {personBiographies.related.map((r, i) => (
+                            <div key={`rel-${i}`} className="result-card static-card">
+                              <div className="result-title">《{r.bookTitle}》{r.chapter}</div>
+                              <div className="result-snippet" style={{ marginTop: "0.3rem", whiteSpace: "pre-wrap" }}>{r.snippet}</div>
+                              {r.anchor && (
+                                <div className="inline-actions" style={{ marginTop: "0.3rem" }}>
+                                  <button
+                                    type="button"
+                                    className="ghost-button compact-button"
+                                    onClick={() => { openLocation(r.anchor!); setOpenResourcePanel(null); }}
+                                  >
+                                    跳转原书
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {personPanelTab === "conversation" && (
+                  <div className="stack-gap">
+                    <div className="inline-actions" style={{ flexWrap: "wrap", gap: "0.4rem", alignItems: "center" }}>
+                      <label className="muted-text" style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                        <input
+                          type="radio"
+                          name="conv-mode"
+                          checked={conversationMode === "core-person"}
+                          onChange={() => setConversationMode("core-person")}
+                        />
+                        核心人物模式
+                      </label>
+                      <label className="muted-text" style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                        <input
+                          type="radio"
+                          name="conv-mode"
+                          checked={conversationMode === "open"}
+                          onChange={() => setConversationMode("open")}
+                        />
+                        开放对话
+                      </label>
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={resetConversation}
+                        disabled={conversationMessages.length === 0}
+                      >
+                        清空对话
+                      </button>
+                    </div>
+                    <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+                      {conversationMode === "core-person"
+                        ? `选定核心人物「${personQuery.trim() || "（未指定）"}」。若该人物在传记索引中，则以其列传为主要知识库；否则按嵌入检索补充。`
+                        : "开放模式：每轮基于当前问题做嵌入检索，不限于核心人物。"}
+                    </div>
+
+                    {conversationMessages.length > 0 && (
+                      <div className="stack-gap" style={{ maxHeight: "50vh", overflowY: "auto", border: "1px solid var(--ui-panel-border)", borderRadius: "0.4rem", padding: "0.6rem", background: "var(--ui-panel-bg)" }}>
+                        {conversationMessages.map((m, i) => (
+                          <div
+                            key={i}
+                            className={m.role === "user" ? "answer-card" : "answer-card markdown-body"}
+                            style={{
+                              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                              background: m.role === "user" ? "rgba(212, 35, 27, 0.08)" : "transparent",
+                              border: m.role === "user" ? "1px solid rgba(212, 35, 27, 0.2)" : "1px solid var(--ui-panel-border)",
+                              borderRadius: "0.4rem",
+                              padding: "0.5rem 0.7rem",
+                              whiteSpace: m.role === "user" ? "pre-wrap" : undefined,
+                            }}
+                            dangerouslySetInnerHTML={m.role === "assistant" ? { __html: renderMarkdown(m.content) } : undefined}
+                          >
+                            {m.role === "user" ? m.content : null}
+                          </div>
+                        ))}
+                        {conversationLoading && (
+                          <div className="muted-text">AI 正在思考…（5-15 秒）</div>
+                        )}
+                      </div>
+                    )}
+
+                    {conversationSources.length > 0 && (
+                      <div className="stack-gap" style={{ border: "1px solid var(--ui-panel-border)", borderRadius: "0.4rem", padding: "0.5rem" }}>
+                        <div
+                          className="inline-actions"
+                          style={{ justifyContent: "space-between", cursor: "pointer" }}
+                          onClick={() => setConversationSourcesExpanded(!conversationSourcesExpanded)}
+                        >
+                          <span className="muted-text">
+                            本轮知识库来源：{conversationSourceMode === "biography" ? "传记索引"
+                              : conversationSourceMode === "embedding" ? "嵌入检索"
+                              : conversationSourceMode === "fts5" ? "全文检索" : "无"}（{conversationSources.length} 条）
+                          </span>
+                          <span className="muted-text">{conversationSourcesExpanded ? "收起 ▲" : "展开 ▼"}</span>
+                        </div>
+                        {conversationSourcesExpanded && (
+                          <div className="result-list compact" style={{ marginTop: "0.4rem" }}>
+                            {conversationSources.map((s, i) => (
+                              <div key={i} className="result-card static-card">
+                                <div className="result-title">[片段#{s.index ?? i + 1}] 《{s.bookTitle}》{s.chapter}</div>
+                                <div className="result-snippet" style={{ whiteSpace: "pre-wrap" }}>
+                                  {s.text.slice(0, 240)}{s.text.length > 240 ? "…" : ""}
+                                </div>
+                                {s.anchor && (
+                                  <div className="inline-actions" style={{ marginTop: "0.3rem" }}>
+                                    <button
+                                      type="button"
+                                      className="ghost-button compact-button"
+                                      onClick={() => { openLocation(s.anchor!); setOpenResourcePanel(null); }}
+                                    >
+                                      跳转原书
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {conversationError && personPanelTab === "conversation" && <div className="error-box">{conversationError}</div>}
+
+                    <textarea
+                      className="text-input"
+                      value={conversationInput}
+                      onChange={(e) => setConversationInput(e.target.value)}
+                      placeholder={
+                        conversationMessages.length === 0
+                          ? `第一轮提问，如：「张居正改革的主要内容是什么？」/「袁崇焕为什么被诛？」`
+                          : "继续追问…"
+                      }
+                      rows={3}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                          void sendConversationMessage();
+                        }
+                      }}
+                    />
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => void sendConversationMessage()}
+                        disabled={conversationLoading || !conversationInput.trim()}
+                      >
+                        {conversationLoading ? "思考中…" : conversationMessages.length === 0 ? "开始对话" : "继续问"}
+                      </button>
+                      <span className="muted-text" style={{ fontSize: "0.72rem" }}>⌘/Ctrl + Enter 快捷发送</span>
+                    </div>
+                  </div>
+                )}
+
                 {baikeQuery && (
                   <div className="stack-gap" style={{ marginTop: "0.6rem" }}>
                     <div className="inline-actions" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: "0.4rem" }}>
@@ -4754,9 +5634,6 @@ function App() {
                         </button>
                       </div>
                     </div>
-                    <div className="muted-text" style={{ fontSize: "0.74rem", marginTop: "-0.4rem" }}>
-                      若下方嵌入页空白或被反第三方 cookie 拦截，请用「新窗口打开」按钮在浏览器外部访问。
-                    </div>
                     <iframe
                       key={baikeQuery}
                       src={`https://baike.baidu.com/item/${encodeURIComponent(baikeQuery)}`}
@@ -4769,6 +5646,179 @@ function App() {
                 )}
               </div>
             )}
+
+            {openResourcePanel === "free-chat" && (() => {
+              const activeChat = freeChats.find((c) => c.id === activeFreeChatId) || null;
+              return (
+                <div className="stack-gap" style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: "0.8rem", maxHeight: "70vh" }}>
+                  {/* 左：会话列表 — flex 列：顶部 button+model（auto 高），下方 history（flex:1 撑满） */}
+                  <div style={{ display: "flex", flexDirection: "column", borderRight: "1px solid var(--ui-panel-border)", paddingRight: "0.6rem", overflow: "hidden", height: "100%" }}>
+                    {/* button + model 紧贴在一起 */}
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.15rem", flexShrink: 0 }}>
+                      <button
+                        type="button"
+                        className="new-chat-btn"
+                        onClick={newFreeChat}
+                        title="新建对话"
+                      >+ 新建对话</button>
+                      <label className="muted-text" style={{ display: "flex", flexDirection: "column", gap: "0.1rem", fontSize: "0.74rem" }}>
+                        <span>模型</span>
+                        <select
+                          className="select-input"
+                          style={{ fontSize: "0.78rem", padding: "0.25rem 0.4rem" }}
+                          value={freeChatModel || aiSettings.defaultModel || aiSettings.model || ""}
+                          onChange={(e) => setFreeChatModel(e.target.value)}
+                        >
+                          {(aiSettings.modelOptions || [])
+                            .concat(
+                              aiSettings.defaultModel && !aiSettings.modelOptions?.includes(aiSettings.defaultModel)
+                                ? [aiSettings.defaultModel]
+                                : []
+                            )
+                            .map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                        </select>
+                      </label>
+                    </div>
+                    {/* history 撑满剩余高度，内部 scroll；与上方 button+model 块紧贴 */}
+                    <div style={{ flex: 1, minHeight: 0, overflowY: "auto", marginTop: "0.4rem", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+                    {freeChats.length === 0 && (
+                      <div className="muted-text" style={{ fontSize: "0.78rem", padding: "0.3rem 0" }}>
+                        还没有对话。开新对话开始问。
+                      </div>
+                    )}
+                    {freeChats
+                      .slice()
+                      .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""))
+                      .map((c) => (
+                        <div
+                          key={c.id}
+                          className={`result-card ${activeFreeChatId === c.id ? "static-card" : ""}`}
+                          style={{ cursor: "pointer", padding: "0.4rem 0.5rem", borderColor: activeFreeChatId === c.id ? "rgba(212, 35, 27, 0.4)" : undefined, background: activeFreeChatId === c.id ? "rgba(212, 35, 27, 0.05)" : undefined }}
+                          onClick={() => setActiveFreeChatId(c.id)}
+                        >
+                          <div className="result-title" style={{ fontSize: "0.84rem" }}>{c.title || "新对话"}</div>
+                          <div className="muted-text" style={{ fontSize: "0.7rem" }}>
+                            {c.messages.length} 条 · {new Date(c.updatedAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                          </div>
+                          <div className="inline-actions" style={{ marginTop: "0.2rem", gap: "0.2rem" }}>
+                            <button
+                              type="button"
+                              className="ghost-button compact-button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const next = window.prompt("重命名对话", c.title);
+                                if (next !== null) renameFreeChat(c.id, next.trim() || "新对话");
+                              }}
+                              style={{ fontSize: "0.7rem", padding: "0.1rem 0.4rem" }}
+                            >重命名</button>
+                            <button
+                              type="button"
+                              className="ghost-button compact-button"
+                              onClick={(e) => { e.stopPropagation(); if (window.confirm(`删除「${c.title}」？此操作不可撤销。`)) deleteFreeChat(c.id); }}
+                              style={{ fontSize: "0.7rem", padding: "0.1rem 0.4rem", color: "#d4231b" }}
+                            >删除</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 右：消息流 + 输入 */}
+                  <div className="stack-gap" style={{ display: "flex", flexDirection: "column", minHeight: "60vh" }}>
+                    {activeChat && activeChat.messages.length > 0 && (
+                      <div className="stack-gap" style={{ flex: 1, overflowY: "auto", border: "1px solid var(--ui-panel-border)", borderRadius: "0.4rem", padding: "0.6rem", background: "var(--ui-panel-bg)" }}>
+                        {activeChat.messages.map((m, i) => (
+                          <div
+                            key={i}
+                            className={m.role === "user" ? "answer-card" : "answer-card markdown-body"}
+                            style={{
+                              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                              background: m.role === "user" ? "rgba(212, 35, 27, 0.08)" : "transparent",
+                              border: m.role === "user" ? "1px solid rgba(212, 35, 27, 0.2)" : "1px solid var(--ui-panel-border)",
+                              borderRadius: "0.4rem",
+                              padding: "0.5rem 0.7rem",
+                              whiteSpace: m.role === "user" ? "pre-wrap" : undefined,
+                            }}
+                            dangerouslySetInnerHTML={m.role === "assistant" ? { __html: renderMarkdown(m.content) } : undefined}
+                          >
+                            {m.role === "user" ? m.content : null}
+                          </div>
+                        ))}
+                        {freeChatLoading && <div className="muted-text">AI 正在思考…（5-15 秒）</div>}
+                      </div>
+                    )}
+
+                    {activeChat && activeChat.sources.length > 0 && (
+                      <div className="stack-gap" style={{ border: "1px solid var(--ui-panel-border)", borderRadius: "0.4rem", padding: "0.5rem" }}>
+                        <div
+                          className="inline-actions"
+                          style={{ justifyContent: "space-between", cursor: "pointer" }}
+                          onClick={() => setFreeChatSourcesExpanded(!freeChatSourcesExpanded)}
+                        >
+                          <span className="muted-text">
+                            上轮检索来源：{activeChat.sourceMode === "embedding" ? "嵌入检索" : activeChat.sourceMode === "fts5" ? "全文检索" : activeChat.sourceMode}（{activeChat.sources.length} 条）
+                          </span>
+                          <span className="muted-text">{freeChatSourcesExpanded ? "收起 ▲" : "展开 ▼"}</span>
+                        </div>
+                        {freeChatSourcesExpanded && (
+                          <div className="result-list compact" style={{ marginTop: "0.4rem" }}>
+                            {activeChat.sources.map((s, i) => (
+                              <div key={i} className="result-card static-card">
+                                <div className="result-title">[#{s.index ?? i + 1}] 《{s.bookTitle}》{s.chapter}</div>
+                                <div className="result-snippet" style={{ whiteSpace: "pre-wrap" }}>
+                                  {s.text.slice(0, 220)}{s.text.length > 220 ? "…" : ""}
+                                </div>
+                                {s.anchor && (
+                                  <div className="inline-actions" style={{ marginTop: "0.3rem" }}>
+                                    <button
+                                      type="button"
+                                      className="ghost-button compact-button"
+                                      onClick={() => { openLocation(s.anchor!); setOpenResourcePanel(null); }}
+                                    >跳转原书</button>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {freeChatError && <div className="error-box">{freeChatError}</div>}
+
+                    <textarea
+                      className="text-input"
+                      value={freeChatInput}
+                      onChange={(e) => setFreeChatInput(e.target.value)}
+                      placeholder={
+                        !activeChat || activeChat.messages.length === 0
+                          ? "提个问题，如「明朝初期的卫所制度是怎么运作的？」「张居正改革废除了哪些苛政？」"
+                          : "继续追问…"
+                      }
+                      rows={3}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                          void sendFreeChatMessage();
+                        }
+                      }}
+                    />
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => void sendFreeChatMessage()}
+                        disabled={freeChatLoading || !freeChatInput.trim()}
+                      >
+                        {freeChatLoading ? "思考中…" : "发送"}
+                      </button>
+                      <span className="muted-text" style={{ fontSize: "0.72rem" }}>⌘/Ctrl+Enter 快捷发送 · 历史记录自动存到本地</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
 
             {openResourcePanel === "reign" && (
               <div className="stack-gap">
@@ -4796,46 +5846,11 @@ function App() {
               </div>
             )}
 
-            {openResourcePanel === "familytree" && (
-              <div className="dynasty-tree-container">
-                {selectedTreeEmperor ? (
-                  <div className="emperor-detail-card">
-                    <button type="button" className="ghost-button compact-button" onClick={() => setSelectedTreeEmperor(null)}>
-                      &larr; 返回世系图
-                    </button>
-                    <h3>{selectedTreeEmperor.seq ? `(${selectedTreeEmperor.seq}) ` : ""}{selectedTreeEmperor.name}</h3>
-                    <div className="emperor-detail-meta">
-                      {selectedTreeEmperor.isEmperor && <span className="soft-tag emperor-tag">皇帝</span>}
-                      {selectedTreeEmperor.reign && <span className="soft-tag">在位 {selectedTreeEmperor.reign}</span>}
-                      {selectedTreeEmperor.life && <span className="soft-tag">生卒 {selectedTreeEmperor.life}</span>}
-                      <span className="soft-tag">{selectedTreeEmperor.relation}</span>
-                    </div>
-                    <p className="emperor-detail-summary">{selectedTreeEmperor.summary || "暂无简介。"}</p>
-                    {(() => {
-                      const profile = emperorsData?.list.find((entry) => entry.id === selectedTreeEmperor.id);
-                      if (!profile) return null;
-                      return (
-                        <div className="detail-grid">
-                          <div className="detail-item"><strong>庙号</strong><span>{profile.templeName}</span></div>
-                          <div className="detail-item"><strong>谥号</strong><span>{profile.posthumousTitle}</span></div>
-                          <div className="detail-item"><strong>年号</strong><span>{profile.reignTitles?.join(" / ")}</span></div>
-                          <div className="detail-item"><strong>生卒</strong><span>{profile.birthYear ?? "不详"} - {profile.deathYear ?? "不详"}</span></div>
-                          {profile.father && <div className="detail-item"><strong>父</strong><span>{profile.father}</span></div>}
-                          {profile.mother && <div className="detail-item"><strong>母</strong><span>{profile.mother}</span></div>}
-                        </div>
-                      );
-                    })()}
-                  </div>
-                ) : (
-                  <DynastyTree node={emperorsData?.familyTree} onSelect={setSelectedTreeEmperor} />
-                )}
-              </div>
-            )}
-
             {openResourcePanel === "officials" && (
               <div className="stack-gap">
                 <div className="officials-tabs">
                   {([
+                    ["lineage", `世系`],
                     ["institutions", `官署（${officialsData?.institutions.length ?? 0}）`],
                     ["offices", `官职（${officialsData?.offices?.length ?? 0}）`],
                     ["chronology", `历任（${officialsData?.chronology?.length ?? 0}）`],
@@ -4851,6 +5866,42 @@ function App() {
                     </button>
                   ))}
                 </div>
+
+                {officialsTab === "lineage" && (
+                  <div className="dynasty-tree-container">
+                    {selectedTreeEmperor ? (
+                      <div className="emperor-detail-card">
+                        <button type="button" className="ghost-button compact-button" onClick={() => setSelectedTreeEmperor(null)}>
+                          &larr; 返回世系图
+                        </button>
+                        <h3>{selectedTreeEmperor.seq ? `(${selectedTreeEmperor.seq}) ` : ""}{selectedTreeEmperor.name}</h3>
+                        <div className="emperor-detail-meta">
+                          {selectedTreeEmperor.isEmperor && <span className="soft-tag emperor-tag">皇帝</span>}
+                          {selectedTreeEmperor.reign && <span className="soft-tag">在位 {selectedTreeEmperor.reign}</span>}
+                          {selectedTreeEmperor.life && <span className="soft-tag">生卒 {selectedTreeEmperor.life}</span>}
+                          <span className="soft-tag">{selectedTreeEmperor.relation}</span>
+                        </div>
+                        <p className="emperor-detail-summary">{selectedTreeEmperor.summary || "暂无简介。"}</p>
+                        {(() => {
+                          const profile = emperorsData?.list.find((entry) => entry.id === selectedTreeEmperor.id);
+                          if (!profile) return null;
+                          return (
+                            <div className="detail-grid">
+                              <div className="detail-item"><strong>庙号</strong><span>{profile.templeName}</span></div>
+                              <div className="detail-item"><strong>谥号</strong><span>{profile.posthumousTitle}</span></div>
+                              <div className="detail-item"><strong>年号</strong><span>{profile.reignTitles?.join(" / ")}</span></div>
+                              <div className="detail-item"><strong>生卒</strong><span>{profile.birthYear ?? "不详"} - {profile.deathYear ?? "不详"}</span></div>
+                              {profile.father && <div className="detail-item"><strong>父</strong><span>{profile.father}</span></div>}
+                              {profile.mother && <div className="detail-item"><strong>母</strong><span>{profile.mother}</span></div>}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ) : (
+                      <DynastyTree node={emperorsData?.familyTree} onSelect={setSelectedTreeEmperor} />
+                    )}
+                  </div>
+                )}
 
                 {officialsTab === "institutions" && (
                   <>
@@ -5075,6 +6126,7 @@ function App() {
               <HistoryTimelinePanel
                 notes={notes}
                 readableBooks={readableBooks}
+                onNoteOpenModal={(n) => setNoteExpandedFor(n.id)}
                 onNoteClick={(n) => {
                   // Jump to the chapter at the note's saved CFI. If the note
                   // belongs to a different book, switch first; otherwise
@@ -5130,122 +6182,65 @@ function App() {
         <div className="modal-backdrop" onClick={() => setApiConfigOpen(false)}>
           <div className="modal-card resource-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <span className="modal-title">自定义 API 配置</span>
-              <button type="button" className="ghost-button compact-button" onClick={() => setApiConfigOpen(false)}>关闭</button>
-            </div>
-            <div className="stack-gap">
-              <label className="field-label">
-                预设供应商（选择后自动填 Base URL + 常用模型名；不会覆盖已填的 API Key）
-                <select
-                  className="select-input"
-                  value=""
-                  onChange={(e) => {
-                    const key = e.target.value;
-                    if (!key) return;
-                    const presets: Record<string, Partial<typeof aiSettings>> = {
-                      dashscope: {
-                        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                        modelOptions: ["deepseek-v4-pro", "kimi-k2.6", "qwen3.6-max-preview", "MiniMax-M2.5", "qwen3.5-plus-2026-04-20"],
-                        model: "deepseek-v4-pro",
-                        smallModelOptions: ["deepseek-v4-flash", "qwen3.6-flash", "qwen3.6-27b"],
-                        smallModel: "deepseek-v4-flash",
-                        ttsBaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                        ttsModel: "qwen3-tts-flash",
-                      },
-                      ark: {
-                        baseURL: "https://ark.cn-beijing.volces.com/api/v3",
-                        modelOptions: ["doubao-1-5-pro-32k-250115", "doubao-1-5-pro-256k-250115"],
-                        model: "doubao-1-5-pro-32k-250115",
-                        smallModelOptions: ["doubao-1-5-lite-32k-250115"],
-                        smallModel: "doubao-1-5-lite-32k-250115",
-                      },
-                      deepseek: {
-                        baseURL: "https://api.deepseek.com/v1",
-                        modelOptions: ["deepseek-chat", "deepseek-reasoner"],
-                        model: "deepseek-chat",
-                        smallModelOptions: ["deepseek-chat"],
-                        smallModel: "deepseek-chat",
-                      },
-                      moonshot: {
-                        baseURL: "https://api.moonshot.cn/v1",
-                        modelOptions: ["kimi-k2-0905-preview", "moonshot-v1-32k"],
-                        model: "kimi-k2-0905-preview",
-                        smallModelOptions: ["moonshot-v1-8k"],
-                        smallModel: "moonshot-v1-8k",
-                      },
-                      anthropic: {
-                        // Native /v1/messages endpoint. Anthropic provides an
-                        // OpenAI-compat shim at /v1 for the chat-completions
-                        // shape; works for most clients.
-                        baseURL: "https://api.anthropic.com/v1",
-                        modelOptions: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
-                        model: "claude-sonnet-4-5",
-                        smallModelOptions: ["claude-haiku-4-5"],
-                        smallModel: "claude-haiku-4-5",
-                      },
-                      google: {
-                        // Gemini's OpenAI-compatible endpoint
-                        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
-                        modelOptions: ["gemini-2.5-pro", "gemini-2.5-flash"],
-                        model: "gemini-2.5-pro",
-                        smallModelOptions: ["gemini-2.5-flash-lite", "gemini-2.5-flash"],
-                        smallModel: "gemini-2.5-flash",
-                      },
-                      openai: {
-                        baseURL: "https://api.openai.com/v1",
-                        modelOptions: ["gpt-5", "gpt-5-mini", "gpt-4.1"],
-                        model: "gpt-5",
-                        smallModelOptions: ["gpt-5-mini", "gpt-4.1-mini"],
-                        smallModel: "gpt-5-mini",
-                      },
-                      openrouter: {
-                        baseURL: "https://openrouter.ai/api/v1",
-                        // OpenRouter routes use `provider/model-name` slugs.
-                        modelOptions: [
-                          "anthropic/claude-sonnet-4.5",
-                          "openai/gpt-5",
-                          "google/gemini-2.5-pro",
-                          "deepseek/deepseek-v3.2-exp",
-                        ],
-                        model: "anthropic/claude-sonnet-4.5",
-                        smallModelOptions: ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"],
-                        smallModel: "anthropic/claude-haiku-4.5",
-                      },
-                      minimax: {
-                        baseURL: "https://api.minimax.io/v1",
-                        modelOptions: ["MiniMax-M2", "MiniMax-Text-01", "abab6.5s-chat"],
-                        model: "MiniMax-M2",
-                        smallModelOptions: ["abab6.5s-chat"],
-                        smallModel: "abab6.5s-chat",
-                      },
-                    };
-                    const next = presets[key];
-                    if (next) setAiSettings((c) => ({ ...c, ...next }));
+              <span className="modal-title">API 配置</span>
+              <div className="header-actions">
+                <button
+                  type="button"
+                  className="ghost-button compact-button"
+                  title="拉取后端 /api/settings/defaults，覆盖当前 API Key 列表。dev 期会拿到由 .env 注入的默认两条；打包版若 .env 为空则列表为空。"
+                  onClick={async () => {
+                    if (!confirm("从后端拉取默认 API 配置覆盖当前列表？\n（dev 期会恢复 DeepSeek 官方 + 百炼默认；打包版会清空让你重新填）")) return;
+                    try {
+                      const d = await fetchDefaults();
+                      const baseProviders = d.ai.modelProviders || [];
+                      setAiSettings((c) => {
+                        const pool = [...new Set(baseProviders.flatMap((p) => p.models))];
+                        const top = baseProviders[0];
+                        return {
+                          ...c,
+                          modelProviders: baseProviders,
+                          modelOptions: pool.length ? pool : c.modelOptions,
+                          smallModelOptions: pool.length ? pool : c.smallModelOptions,
+                          model: pool.includes(c.model) ? c.model : (d.ai.defaultModel || pool[0] || c.model),
+                          smallModel: pool.includes(c.smallModel || "") ? c.smallModel : (d.ai.smallModel || pool[0] || c.smallModel),
+                          baseURL: top ? top.baseURL : c.baseURL,
+                          apiKey: top ? top.apiKey : c.apiKey,
+                        };
+                      });
+                    } catch (err) {
+                      alert("拉取后端默认失败：" + (err as Error)?.message);
+                    }
                   }}
                 >
-                  <option value="">— 选择预设 —</option>
-                  <option value="dashscope">百炼 (阿里云 DashScope)</option>
-                  <option value="ark">火山引擎 (Volcengine Ark)</option>
-                  <option value="deepseek">DeepSeek</option>
-                  <option value="moonshot">Kimi (Moonshot)</option>
-                  <option value="anthropic">Anthropic Claude</option>
-                  <option value="google">Google Gemini</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="openrouter">OpenRouter（聚合）</option>
-                  <option value="minimax">MiniMax</option>
-                </select>
-              </label>
-              <div className="muted-text" style={{ fontSize: "0.72rem" }}>
-                填好后还要在下方填入对应平台的 API Key（部分海外平台国内访问需自备网络）。火山引擎自定义模型须用 endpoint ID（ep-xxx）。
+                  恢复后端默认
+                </button>
+                <button type="button" className="ghost-button compact-button" onClick={() => setApiConfigOpen(false)}>关闭</button>
               </div>
-              <label className="field-label">
-                OpenAI 兼容 Base URL
-                <input className="text-input" value={aiSettings.baseURL} onChange={(e) => setAiSettings((c) => ({ ...c, baseURL: e.target.value }))} />
-              </label>
-              <label className="field-label">
-                API Key
-                <input className="text-input" type="password" value={aiSettings.apiKey} onChange={(e) => setAiSettings((c) => ({ ...c, apiKey: e.target.value }))} />
-              </label>
+            </div>
+            <div className="stack-gap">
+              {/* v1.2.1：API Key 列表式管理 —— 取代旧的「顶部单 baseURL/apiKey + 多 provider 补充」结构。
+                  每条 API Key = 一个 (baseURL, apiKey, 激活模型列表) 三元组；列表顺序 = 调用优先级。 */}
+              <ApiKeyListEditor
+                providers={aiSettings.modelProviders || []}
+                onChange={(next) => {
+                  // 1) 写入 providers；2) 同步主/小模型池（自动派生）+ baseURL/apiKey 兼容老字段（用第一条）。
+                  const pool = uniqueValues(next.flatMap((p) => p.models));
+                  setAiSettings((c) => {
+                    const top = next[0];
+                    return {
+                      ...c,
+                      modelProviders: next,
+                      modelOptions: pool.length ? pool : c.modelOptions,
+                      smallModelOptions: pool.length ? pool : c.smallModelOptions,
+                      model: pool.includes(c.model) ? c.model : (pool[0] || c.model),
+                      smallModel: pool.includes(c.smallModel || "") ? c.smallModel : (pool[0] || c.smallModel),
+                      // 兼容老调用链：把"优先使用"那条同步到顶层 baseURL/apiKey
+                      baseURL: top ? top.baseURL : c.baseURL,
+                      apiKey: top ? top.apiKey : c.apiKey,
+                    };
+                  });
+                }}
+              />
               <div className="divider" />
               <div className="muted-text" style={{ fontSize: "0.78rem" }}>
                 TTS（朗读）单独配置 — 多数平台不提供 TTS，常用百炼 qwen3-tts。如果与上面同账号同平台，TTS Base URL / Key 留空即可继承。
@@ -5262,37 +6257,80 @@ function App() {
                 TTS 模型
                 <input className="text-input" value={aiSettings.ttsModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsModel: e.target.value }))} placeholder="qwen3-tts-flash / gpt-4o-mini-tts 等" />
               </label>
-              <div className="divider" />
-              <ModelListEditor
-                label="主模型列表（勾选的模型将出现在设置页下拉框中）"
-                selected={aiSettings.modelOptions}
-                onChange={(opts) => setAiSettings((c) => ({ ...c, modelOptions: opts, model: opts.includes(c.model) ? c.model : (opts[0] || c.model) }))}
-              />
-              <ModelListEditor
-                label="小模型列表"
-                selected={aiSettings.smallModelOptions || []}
-                onChange={(opts) => setAiSettings((c) => ({ ...c, smallModelOptions: opts, smallModel: opts.includes(c.smallModel || "") ? c.smallModel : (opts[0] || c.smallModel) }))}
-              />
-              <ModelProviderEditor
-                providers={aiSettings.modelProviders || []}
-                onChange={(next) => setAiSettings((c) => ({ ...c, modelProviders: next }))}
-                onAddModelToPool={(modelName, pool) => setAiSettings((c) => {
-                  if (pool === "large") {
-                    if (c.modelOptions.includes(modelName)) return c;
-                    return { ...c, modelOptions: [...c.modelOptions, modelName] };
-                  }
-                  const small = c.smallModelOptions || [];
-                  if (small.includes(modelName)) return c;
-                  return { ...c, smallModelOptions: [...small, modelName] };
-                })}
-              />
-              <div className="muted-text" style={{ fontSize: "0.75rem" }}>
-                勾选的模型会出现在设置页的主模型/小模型下拉框中。点"保存设置并刷新页面"后生效。
+              <div className="muted-text" style={{ fontSize: "0.72rem" }}>
+                修改后点"保存设置并刷新页面"生效。
               </div>
             </div>
           </div>
         </div>
       )}
+
+      {compareExpandOpen && referenceCompare?.reportMarkdown && (
+        <div className="modal-backdrop" onClick={() => setCompareExpandOpen(false)}>
+          <div className="modal-card compare-expand-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">史料交叉比对</span>
+              <div className="header-actions">
+                <button
+                  type="button"
+                  className="ghost-button compact-button"
+                  onClick={saveCompareAsNote}
+                  title="把当前比对报告保存为一条札记"
+                >
+                  札记
+                </button>
+                <button type="button" className="ghost-button compact-button" onClick={() => setCompareExpandOpen(false)}>关闭</button>
+              </div>
+            </div>
+            <div
+              className="compare-expand-body markdown-body"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(referenceCompare.reportMarkdown) }}
+            />
+          </div>
+        </div>
+      )}
+
+      {noteExpandedFor && (() => {
+        const noteData = notes.find((n) => n.id === noteExpandedFor);
+        if (!noteData) return null;
+        const isCC = noteData.note.startsWith("【史料交叉比对】");
+        const md = isCC ? noteData.note.replace(/^【史料交叉比对】\s*/, "") : noteData.note;
+        return (
+          <div className="modal-backdrop" onClick={() => setNoteExpandedFor(null)}>
+            <div className="modal-card compare-expand-modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <span className="modal-title">札记 · {isCC ? "史料交叉比对" : "随笔"}</span>
+                <div className="header-actions">
+                  <button type="button" className="ghost-button compact-button" onClick={() => { setOpenResourcePanel(null); openLocation(noteData.cfiRange); setNoteExpandedFor(null); }}>
+                    回到原文
+                  </button>
+                  <button type="button" className="ghost-button compact-button" onClick={() => { setEditingNoteId(noteData.id); setNoteDraft(noteData.note); setNoteComposerOpen(true); setNoteExpandedFor(null); }}>
+                    编辑
+                  </button>
+                  <button type="button" className="ghost-button compact-button" onClick={() => setNoteExpandedFor(null)}>关闭</button>
+                </div>
+              </div>
+              <div className="compare-expand-body">
+                <div className="note-source-block" style={{ marginBottom: "1rem" }}>
+                  <div className="note-source-label">原选段 · 勾画位置</div>
+                  <div className="note-source-text">{noteData.text || "（未记录原选段位置）"}</div>
+                  {noteData.timelineTitle && (
+                    <div style={{ marginTop: "0.4rem", fontWeight: 600, color: "#603d1b" }}>标题：{noteData.timelineTitle}</div>
+                  )}
+                  {noteData.historicalAt && (
+                    <div className="muted-text" style={{ fontSize: "0.78rem", marginTop: "0.3rem" }}>史时：{noteData.historicalAt}</div>
+                  )}
+                </div>
+                {isCC ? (
+                  <div className="markdown-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(md) }} />
+                ) : (
+                  <div className="note-body" style={{ whiteSpace: "pre-wrap" }}>{md}</div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {sourceViewer && (
         <div className="modal-backdrop" onClick={() => setSourceViewer(null)}>
@@ -5354,7 +6392,7 @@ function App() {
           <div className="modal-card" style={{ maxWidth: "36rem" }}>
             <div className="panel-headline">
               <NotebookPen size={18} />
-              <span>{editingNoteId ? "编辑笔记" : "添加笔记"}</span>
+              <span>{editingNoteId ? "编辑札记" : "添加札记"}</span>
             </div>
             {!editingNoteId && <div className="selection-body">{selectionText}</div>}
             {editingNoteId && <div className="muted-text">{notes.find((n) => n.id === editingNoteId)?.text?.slice(0, 60)}…</div>}
@@ -5368,7 +6406,7 @@ function App() {
               历史时间线集成：用户可以勾选把这条笔记加进 历史时间线 panel。
               年/月/日 默认填的是从选段及其上下文自动检测出来的时间（基于
               resolveSelectionDate 的年号→公历换算），允许手工覆盖。
-              重要度 1-5 与官方事件 scale 对齐，类别默认"我的笔记"（暖橙色）。
+              重要度 1-5 与官方事件 scale 对齐，类别默认"我的札记"（暖橙色）。
             */}
             <details className="prince-section" open={tlDraftEnabled}>
               <summary style={{ cursor: "pointer" }}>
@@ -5442,7 +6480,7 @@ function App() {
                       value={tlDraftCategory}
                       onChange={(e) => setTlDraftCategory(e.target.value)}
                     >
-                      <option value="我的笔记">我的笔记</option>
+                      <option value="我的札记">我的笔记</option>
                       {HISTORY_CATEGORIES.map((c) => (
                         <option key={c} value={c}>{c}</option>
                       ))}
@@ -5489,7 +6527,7 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v1.1（2026-05-09）— 石匱書本紀卷1-17 &amp; 石匱書後集卷1-63 OCR &amp; 粗點校。詳見 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
+              <p><strong>版本：</strong>v1.2.1（2026-05-12）— UI 收紧：勾画 5 选项合并、AI 对话面板瘦身、笔记改名「札记」、人物编年改名「人物志」；提供 Plus / Lite 两个安装包（Lite 不含 embedding，体积小一半）。詳見 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
               <p><strong>使用说明：</strong></p>
               <ul>
                 <li>首次进入软件请打开右上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
@@ -5499,7 +6537,7 @@ function App() {
               <p><strong>主要功能：</strong></p>
               <ul>
                 <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对</li>
-                <li>职官检索 / 人物编年 / 皇帝世系 / 年号公元换算 / 古今地名地图</li>
+                <li>职官 / 世系 / 人物志 / 年号公元换算 / 古今地名地图</li>
                 <li>农历⇄公历精确换算（含干支日）；选段「识别日期」按钮自动追溯前文上下文</li>
                 <li>4 套阅读主题、10 款字体（界面/正文独立可选）、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
                 <li>自定义 AI 供应商（URL + Key + 模型组）— 不同模型用不同家的 key</li>
@@ -5559,171 +6597,199 @@ function App() {
   );
 }
 
-function ModelProviderEditor({ providers, onChange, onAddModelToPool }: {
+// v1.2.1：API Key 列表 + 新增/编辑弹窗。
+// 列表顺序 = 调用优先级（first match wins），可上移/下移调整。
+// 单击条目打开编辑弹窗；编辑表单字段：简称、预设供应商、Base URL、Key（密码）、激活的模型名。
+type PresetProviderKey =
+  | "dashscope" | "ark" | "deepseek" | "moonshot" | "anthropic"
+  | "google" | "openai" | "openrouter" | "minimax";
+type PresetSpec = { label: string; baseURL: string; suggestedModels: string[] };
+const API_PRESETS: Record<PresetProviderKey, PresetSpec> = {
+  dashscope: { label: "百炼 (阿里云 DashScope)", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", suggestedModels: ["deepseek-v4-pro", "qwen3.6-flash-2026-04-16", "kimi-k2.6", "qwen3.6-max-preview"] },
+  ark: { label: "火山引擎 (Volcengine Ark)", baseURL: "https://ark.cn-beijing.volces.com/api/v3", suggestedModels: ["doubao-1-5-pro-32k-250115"] },
+  deepseek: { label: "DeepSeek 官方", baseURL: "https://api.deepseek.com/v1", suggestedModels: ["deepseek-v4-pro", "deepseek-v4-flash"] },
+  moonshot: { label: "Kimi (Moonshot)", baseURL: "https://api.moonshot.cn/v1", suggestedModels: ["kimi-k2-0905-preview", "moonshot-v1-32k"] },
+  anthropic: { label: "Anthropic Claude", baseURL: "https://api.anthropic.com/v1", suggestedModels: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"] },
+  google: { label: "Google Gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", suggestedModels: ["gemini-2.5-pro", "gemini-2.5-flash"] },
+  openai: { label: "OpenAI", baseURL: "https://api.openai.com/v1", suggestedModels: ["gpt-5", "gpt-5-mini"] },
+  openrouter: { label: "OpenRouter（聚合）", baseURL: "https://openrouter.ai/api/v1", suggestedModels: ["anthropic/claude-sonnet-4.5", "openai/gpt-5"] },
+  minimax: { label: "MiniMax", baseURL: "https://api.minimax.io/v1", suggestedModels: ["MiniMax-M2", "abab6.5s-chat"] },
+};
+
+function ApiKeyListEditor({ providers, onChange }: {
   providers: import("./types").ModelProvider[];
   onChange: (next: import("./types").ModelProvider[]) => void;
-  onAddModelToPool: (modelName: string, pool: "large" | "small") => void;
 }) {
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // editingIdx: -1 = 新增，>=0 = 编辑现有第 i 条，null = 关闭
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
+  const [draft, setDraft] = useState<import("./types").ModelProvider | null>(null);
+  const [modelDraft, setModelDraft] = useState("");
 
-  const newId = () => `prov-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-
-  const addProvider = () => {
-    onChange([...providers, { id: newId(), baseURL: "", apiKey: "", models: [] }]);
+  const openNew = () => {
+    setEditingIdx(-1);
+    setDraft({ id: `prov-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, alias: "", presetProvider: "", baseURL: "", apiKey: "", models: [] });
+    setModelDraft("");
   };
-
-  const updateProvider = (id: string, patch: Partial<import("./types").ModelProvider>) => {
-    onChange(providers.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const openEdit = (idx: number) => {
+    setEditingIdx(idx);
+    setDraft({ ...providers[idx] });
+    setModelDraft("");
   };
+  const close = () => { setEditingIdx(null); setDraft(null); setModelDraft(""); };
 
-  const removeProvider = (id: string) => {
-    onChange(providers.filter((p) => p.id !== id));
-  };
-
-  // Add model M to provider P as either a large- or small-model. Per spec:
-  // (a) if M already lives in another provider, remove it from there
-  //     (newest add wins);
-  // (b) sync M to the corresponding top-level modelOptions / smallModelOptions
-  //     so it shows up in the settings dropdown automatically.
-  const addModelAs = (id: string, pool: "large" | "small") => {
-    const draft = (drafts[id] || "").trim();
+  const commitDraft = () => {
     if (!draft) return;
-    const next = providers.map((p) => {
-      if (p.id === id) {
-        return p.models.includes(draft) ? p : { ...p, models: [...p.models, draft] };
-      }
-      return p.models.includes(draft) ? { ...p, models: p.models.filter((m) => m !== draft) } : p;
-    });
-    onChange(next);
-    onAddModelToPool(draft, pool);
-    setDrafts((d) => ({ ...d, [id]: "" }));
+    if (editingIdx === -1) onChange([...providers, draft]);
+    else if (editingIdx !== null && editingIdx >= 0) onChange(providers.map((p, i) => (i === editingIdx ? draft : p)));
+    close();
   };
 
-  const removeModel = (id: string, model: string) => {
-    onChange(providers.map((p) => (p.id === id ? { ...p, models: p.models.filter((m) => m !== model) } : p)));
+  const removeAt = (idx: number) => {
+    if (!confirm(`删除「${providers[idx].alias || providers[idx].baseURL || "未命名"}」？`)) return;
+    onChange(providers.filter((_, i) => i !== idx));
+  };
+  const move = (idx: number, dir: -1 | 1) => {
+    const target = idx + dir;
+    if (target < 0 || target >= providers.length) return;
+    const next = [...providers];
+    [next[idx], next[target]] = [next[target], next[idx]];
+    onChange(next);
+  };
+
+  const applyPreset = (key: PresetProviderKey | "") => {
+    if (!draft) return;
+    if (!key) { setDraft({ ...draft, presetProvider: "" }); return; }
+    const preset = API_PRESETS[key];
+    setDraft({
+      ...draft,
+      presetProvider: key,
+      alias: draft.alias || preset.label,
+      baseURL: draft.baseURL || preset.baseURL,
+      models: draft.models.length ? draft.models : preset.suggestedModels,
+    });
+  };
+
+  const addModelToDraft = () => {
+    if (!draft) return;
+    const name = modelDraft.trim();
+    if (!name || draft.models.includes(name)) return;
+    setDraft({ ...draft, models: [...draft.models, name] });
+    setModelDraft("");
+  };
+  const removeModelFromDraft = (m: string) => {
+    if (!draft) return;
+    setDraft({ ...draft, models: draft.models.filter((x) => x !== m) });
   };
 
   return (
-    <div className="model-list-editor">
-      <div className="field-label">自定义供应商（可选 — 让特定模型使用不同的 Base URL / API Key）</div>
+    <>
+      <div className="field-label" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span>已加载的 API Key（顺序 = 调用优先级；同模型出现多次时取第一条）</span>
+        <button type="button" className="ghost-button compact-button" onClick={openNew}>+ 新增 API Key</button>
+      </div>
       {providers.length === 0 && (
-        <div className="muted-text" style={{ fontSize: "0.78rem", marginBottom: "0.5rem" }}>
-          未配置。所有模型默认走顶部的「Base URL + API Key」。
+        <div className="muted-text" style={{ fontSize: "0.78rem" }}>
+          未加载任何 API Key。点「+ 新增 API Key」添加；至少一条后所有 AI 功能可用。
         </div>
       )}
-      {providers.map((p) => (
-        <div key={p.id} className="provider-row" style={{
-          border: "1px solid var(--ui-panel-border)",
-          borderRadius: "0.6rem",
-          padding: "0.65rem 0.75rem",
-          marginBottom: "0.5rem",
-          display: "grid",
-          gap: "0.4rem",
-        }}>
-          <input
-            className="text-input"
-            value={p.baseURL}
-            placeholder="Base URL（如 https://ark.cn-beijing.volces.com/api/v3）"
-            onChange={(e) => updateProvider(p.id, { baseURL: e.target.value })}
-          />
-          <input
-            className="text-input"
-            type="password"
-            value={p.apiKey}
-            placeholder="API Key"
-            onChange={(e) => updateProvider(p.id, { apiKey: e.target.value })}
-          />
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem" }}>
-            {p.models.map((m) => (
-              <span key={m} style={{
-                background: "rgba(110, 66, 23, 0.1)",
-                color: "var(--ui-text)",
-                borderRadius: "0.4rem",
-                padding: "0.18rem 0.55rem",
-                fontSize: "0.78rem",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "0.35rem",
-              }}>
-                {m}
-                <button type="button" onClick={() => removeModel(p.id, m)} style={{
-                  background: "transparent", border: "none", cursor: "pointer",
-                  color: "inherit", fontSize: "0.9rem", lineHeight: 1, padding: 0,
-                }}>×</button>
-              </span>
-            ))}
-          </div>
-          <div className="custom-model-input" style={{ flexWrap: "wrap" }}>
-            <input
-              className="text-input"
-              value={drafts[p.id] || ""}
-              placeholder="模型名"
-              onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addModelAs(p.id, "large"); } }}
-            />
-            <button type="button" className="ghost-button compact-button" onClick={() => addModelAs(p.id, "large")}>+ 主模型</button>
-            <button type="button" className="ghost-button compact-button" onClick={() => addModelAs(p.id, "small")}>+ 小模型</button>
-            <button type="button" className="ghost-button compact-button" onClick={() => removeProvider(p.id)}>删除供应商</button>
-          </div>
-          <div className="muted-text" style={{ fontSize: "0.7rem" }}>
-            添加后会自动写入上面对应的「主模型/小模型列表」并勾选。
+      <div style={{ display: "grid", gap: "0.4rem" }}>
+        {providers.map((p, i) => {
+          const masked = p.apiKey ? `${p.apiKey.slice(0, 6)}…${p.apiKey.slice(-4)}` : "（未填）";
+          return (
+            <div
+              key={p.id}
+              className="result-card static-card"
+              style={{ padding: "0.65rem 0.75rem", cursor: "pointer" }}
+              onClick={() => openEdit(i)}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.3rem" }}>
+                <strong style={{ color: "#603d1b" }}>{p.alias || p.baseURL || "未命名"}</strong>
+                {i === 0 && (
+                  <span style={{ background: "#c0903022", color: "#8a5a1d", fontSize: "0.68rem", padding: "0.1rem 0.4rem", borderRadius: "0.3rem", border: "1px solid #c0903055" }}>优先</span>
+                )}
+                <span className="muted-text" style={{ fontSize: "0.7rem" }}>{p.baseURL}</span>
+                <span className="muted-text" style={{ fontSize: "0.7rem", marginLeft: "auto" }}>Key {masked}</span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.25rem", marginBottom: "0.3rem" }}>
+                {p.models.length === 0 && <span className="muted-text" style={{ fontSize: "0.7rem" }}>未激活任何模型</span>}
+                {p.models.map((m) => (
+                  <span key={m} style={{ background: "rgba(110,66,23,0.08)", borderRadius: "0.35rem", padding: "0.1rem 0.4rem", fontSize: "0.72rem" }}>{m}</span>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: "0.3rem" }} onClick={(e) => e.stopPropagation()}>
+                <button type="button" className="ghost-button compact-button" disabled={i === 0} onClick={() => move(i, -1)} title="上移（提高优先级）">↑</button>
+                <button type="button" className="ghost-button compact-button" disabled={i === providers.length - 1} onClick={() => move(i, 1)} title="下移">↓</button>
+                <button type="button" className="ghost-button compact-button" onClick={() => openEdit(i)}>编辑</button>
+                <button type="button" className="ghost-button compact-button danger" onClick={() => removeAt(i)}>删除</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {editingIdx !== null && draft && (
+        <div className="modal-backdrop" onClick={close} style={{ zIndex: 1100 }}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "32rem" }}>
+            <div className="modal-header">
+              <span className="modal-title">{editingIdx === -1 ? "新增 API Key" : "编辑 API Key"}</span>
+              <button type="button" className="ghost-button compact-button" onClick={close}>关闭</button>
+            </div>
+            <div className="stack-gap">
+              <label className="field-label">
+                简称
+                <input className="text-input" value={draft.alias || ""} placeholder="例如：DeepSeek 官方 / 百炼主账号" onChange={(e) => setDraft({ ...draft, alias: e.target.value })} />
+              </label>
+              <label className="field-label">
+                预设供应商（可选，选中后自动填 Base URL 与建议模型，不会覆盖你已填的字段）
+                <select className="select-input" value={draft.presetProvider || ""} onChange={(e) => applyPreset(e.target.value as PresetProviderKey | "")}>
+                  <option value="">— 完全自定义 —</option>
+                  {Object.entries(API_PRESETS).map(([k, v]) => (<option key={k} value={k}>{v.label}</option>))}
+                </select>
+              </label>
+              <label className="field-label">
+                Base URL（OpenAI 兼容）
+                <input className="text-input" value={draft.baseURL} placeholder="https://api.example.com/v1" onChange={(e) => setDraft({ ...draft, baseURL: e.target.value })} />
+              </label>
+              <label className="field-label">
+                API Key
+                <input className="text-input" type="password" value={draft.apiKey} placeholder="sk-..." onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })} />
+              </label>
+              <div className="field-label">
+                <span>激活模型（这些模型名将出现在「主模型 / 小模型」下拉里）</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem", marginTop: "0.3rem" }}>
+                  {draft.models.length === 0 && <span className="muted-text" style={{ fontSize: "0.74rem" }}>未添加任何模型</span>}
+                  {draft.models.map((m) => (
+                    <span key={m} style={{ background: "rgba(110,66,23,0.1)", borderRadius: "0.35rem", padding: "0.15rem 0.5rem", fontSize: "0.76rem", display: "inline-flex", alignItems: "center", gap: "0.3rem" }}>
+                      {m}
+                      <button type="button" onClick={() => removeModelFromDraft(m)} style={{ background: "transparent", border: "none", cursor: "pointer", color: "inherit", fontSize: "0.9rem", lineHeight: 1, padding: 0 }}>×</button>
+                    </span>
+                  ))}
+                </div>
+                <div className="custom-model-input" style={{ marginTop: "0.3rem", display: "flex", gap: "0.3rem" }}>
+                  <input
+                    className="text-input"
+                    value={modelDraft}
+                    placeholder="模型名（如 deepseek-v4-pro）"
+                    onChange={(e) => setModelDraft(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addModelToDraft(); } }}
+                  />
+                  <button type="button" className="ghost-button compact-button" onClick={addModelToDraft}>+ 添加</button>
+                </div>
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.4rem" }}>
+                <button type="button" className="ghost-button" onClick={close}>取消</button>
+                <button type="button" className="primary-button" onClick={commitDraft} disabled={!draft.baseURL.trim() || !draft.apiKey.trim()}>
+                  {editingIdx === -1 ? "添加" : "保存"}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
-      ))}
-      <button type="button" className="ghost-button compact-button" onClick={addProvider}>+ 添加供应商</button>
-    </div>
+      )}
+    </>
   );
 }
 
-function ModelListEditor({ label, selected, onChange }: {
-  label: string;
-  selected: string[];
-  onChange: (opts: string[]) => void;
-}) {
-  const [customInput, setCustomInput] = useState("");
-  const allModels = [...new Set([...ALL_BUILTIN_MODELS, ...selected])];
-
-  const toggle = (model: string) => {
-    if (selected.includes(model)) {
-      onChange(selected.filter(m => m !== model));
-    } else {
-      onChange([...selected, model]);
-    }
-  };
-
-  const addCustom = () => {
-    const name = customInput.trim();
-    if (!name) return;
-    if (!selected.includes(name)) onChange([...selected, name]);
-    setCustomInput("");
-  };
-
-  return (
-    <div className="model-list-editor">
-      <div className="field-label">{label}</div>
-      <div className="model-checkbox-list">
-        {allModels.map(m => (
-          <label key={m} className="toggle-row compact">
-            <input type="checkbox" checked={selected.includes(m)} onChange={() => toggle(m)} />
-            <span>{m}</span>
-          </label>
-        ))}
-      </div>
-      <div className="custom-model-input">
-        <input className="text-input" value={customInput} onChange={e => setCustomInput(e.target.value)} placeholder="添加自定义模型名" onKeyDown={e => { if (e.key === "Enter") addCustom(); }} />
-        <button type="button" className="ghost-button compact-button" onClick={addCustom}>添加</button>
-      </div>
-    </div>
-  );
-}
-
-const ALL_BUILTIN_MODELS = [
-  "deepseek-v4-pro", "deepseek-v4-flash",
-  "qwen3.5-plus", "qwen3.6-max-preview", "qwen3.6-flash", "qwen3.6-27b",
-  "kimi-k2.6", "MiniMax-M2.5",
-  "Doubao-Seed-2.0-pro", "Doubao-Seed-2.0-mini", "Doubao-Seed-2.0-lite",
-  "Doubao-1.5-pro-32k", "Doubao-Seed-1.8", "GLM-4.7",
-];
 
 
 
@@ -5867,7 +6933,17 @@ const CATEGORY_COLORS: Record<string, string> = {
   我的笔记: "#d97a3a",
 };
 
-function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: ReaderNote[]; readableBooks: ReadableBook[]; onNoteClick?: (note: ReaderNote) => void }) {
+function HistoryTimelinePanel({
+  notes,
+  readableBooks,
+  onNoteClick,
+  onNoteOpenModal,
+}: {
+  notes: ReaderNote[];
+  readableBooks: ReadableBook[];
+  onNoteClick?: (note: ReaderNote) => void;
+  onNoteOpenModal?: (note: ReaderNote) => void;
+}) {
   // Two interchangeable input modes:
   //   "center" — pick a center year and a ± halfRange (good for "show me a
   //              decade around this year")
@@ -5877,7 +6953,9 @@ function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: Re
   const [mode, setMode] = useState<"center" | "range" | "reign">("range");
   const [centerYear, setCenterYear] = useState<number>(1500);
   const [halfRange, setHalfRange] = useState<number>(40);
-  const [rangeFrom, setRangeFrom] = useState<number>(1368);
+  // v1.2.1：默认从 1340 开始，覆盖元末至正年间（明史太祖纪一记的事件，
+  //          至正元年=1341 起；之前固定 1368 会把元末札记挡在范围外）。
+  const [rangeFrom, setRangeFrom] = useState<number>(1340);
   const [rangeTo, setRangeTo] = useState<number>(1644);
   const [selectedReign, setSelectedReign] = useState<string>("");
   // Importance filter — multi-select. Empty = no restriction (all 5 levels shown).
@@ -6179,9 +7257,12 @@ function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: Re
               <div
                 key={`e-${i}`}
                 className="ht-row"
-                onClick={() => recenterOn(e.year)}
-                onDoubleClick={(ev) => { ev.stopPropagation(); if (e.id) setEditingEventId(e.id); }}
-                title="双击编辑此事件"
+                onClick={() => {
+                  // v1.2.1：单击 → 打开事件查看/编辑弹窗（可改 title/时间/重要性 + 史料比对 + embedding 检索相关史料）
+                  if (e.id) setEditingEventId(e.id);
+                  else recenterOn(e.year);
+                }}
+                title="单击查看/编辑事件并检索相关史料"
               >
                 <div className="ht-axis">
                   <span className="ht-year">{e.year}</span>
@@ -6217,15 +7298,14 @@ function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: Re
           const n = item.data;
           const bookTitle = readableBooks.find((b) => b.slug === n.bookSlug)?.title || n.bookSlug;
           const noteScale = clamp(n.timelineScale ?? 1, 1, 5);
-          const noteCategory = n.timelineCategory ?? "我的笔记";
-          const noteColor = CATEGORY_COLORS[noteCategory] ?? CATEGORY_COLORS["我的笔记"] ?? "#d97a3a";
+          const noteCategory = n.timelineCategory ?? "我的札记";
+          const noteColor = CATEGORY_COLORS[noteCategory] ?? CATEGORY_COLORS["我的札记"] ?? "#d97a3a";
           const displayTitle = (n.timelineTitle && n.timelineTitle.trim()) || (n.note || "").slice(0, 20);
-          // Click semantics: when an onNoteClick handler is provided we
-          // navigate to the note (jump back to the chapter at the note's
-          // CFI). Otherwise just recenter the timeline window — useful when
-          // the panel is used in read-only mode.
+          // v1.2.1 点击 = 打开"札记 viewer/editor"弹窗（onNoteOpenModal）。
+          // 没传时退回旧行为 onNoteClick（跳回原文）或 recenter。
           const handleNoteClick = () => {
-            if (onNoteClick) onNoteClick(n);
+            if (onNoteOpenModal) onNoteOpenModal(n);
+            else if (onNoteClick) onNoteClick(n);
             else recenterOn(item.year);
           };
           // Also display the resolved date (manual override > auto-detect)
@@ -6270,8 +7350,14 @@ function HistoryTimelinePanel({ notes, readableBooks, onNoteClick }: { notes: Re
                   <span className="ht-scale" style={{ color: noteColor }}>★{noteScale}</span>
                 </div>
                 <div style={{ fontWeight: 600 }}>{displayTitle}</div>
-                {n.note && n.note !== displayTitle && <div className="muted-text" style={{ fontSize: "0.78rem" }}>{n.note}</div>}
-                <div className="muted-text" style={{ fontSize: "0.7rem" }}>选段：{n.text.slice(0, 40)}{n.text.length > 40 ? "…" : ""}</div>
+                {/* v1.2.1：「有 timelineTitle 的札记只显标题」—— 没 timelineTitle 时仍 fallback 显 note 副内容 + 选段，
+                    避免没标题的札记在时间线上没信息。 */}
+                {!n.timelineTitle?.trim() && n.note && n.note !== displayTitle && (
+                  <div className="muted-text" style={{ fontSize: "0.78rem" }}>{n.note.slice(0, 60)}{n.note.length > 60 ? "…" : ""}</div>
+                )}
+                {!n.timelineTitle?.trim() && (
+                  <div className="muted-text" style={{ fontSize: "0.7rem" }}>选段：{n.text.slice(0, 40)}{n.text.length > 40 ? "…" : ""}</div>
+                )}
               </div>
             </div>
           );
@@ -6309,6 +7395,10 @@ function TimelineEventEditModal({
   const [comparing, setComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState<string | null>(null);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
+  // v1.2.1: embedding 史料检索
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
+  const [evidenceHits, setEvidenceHits] = useState<SearchResult[] | null>(null);
 
   useEffect(() => {
     if (!initial) {
@@ -6444,16 +7534,59 @@ function TimelineEventEditModal({
             <button type="button" className="primary-button" onClick={save} disabled={saving}>
               {saving ? "保存中…" : "保存改动"}
             </button>
-            <button type="button" className="secondary-button" onClick={runCompare} disabled={comparing}>
-              {comparing ? "比对中…" : "史料比对"}
+            <button type="button" className="secondary-button" onClick={runCompare} disabled={comparing} title="调 AI 跨书比对生成报告">
+              {comparing ? "比对中…" : "AI 史料比对"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={evidenceLoading}
+              title="用事件描述做 embedding 相似度检索，列出本地史料里最接近的段落（无需 AI）"
+              onClick={async () => {
+                setEvidenceLoading(true);
+                setEvidenceError(null);
+                setEvidenceHits(null);
+                try {
+                  // semantic search via the existing /api/book/search?mode=semantic endpoint.
+                  // aiSettings 字段后端在 semantic 路径下不会用，传空对象即可。
+                  const res = await searchBook(draft.description, "semantic", {} as AiSettings, 12);
+                  setEvidenceHits(res.results || []);
+                } catch (err) {
+                  setEvidenceError((err as Error)?.message || "检索失败");
+                } finally {
+                  setEvidenceLoading(false);
+                }
+              }}
+            >
+              {evidenceLoading ? "检索中…" : "相关史料 (embedding)"}
             </button>
           </div>
 
           {(comparisonResult || comparisonError) && (
             <div style={{ marginTop: "0.6rem", padding: "0.6rem", background: "rgba(110,66,23,0.04)", borderRadius: "0.4rem", maxHeight: "20rem", overflowY: "auto" }}>
-              <div style={{ fontSize: "0.74rem", color: "var(--text-muted, #6f6557)", marginBottom: "0.3rem" }}>史料比对结果：</div>
+              <div style={{ fontSize: "0.74rem", color: "var(--text-muted, #6f6557)", marginBottom: "0.3rem" }}>AI 史料比对结果：</div>
               {comparisonError && <div style={{ color: "#c8262d" }}>{comparisonError}</div>}
               {comparisonResult && <div style={{ whiteSpace: "pre-wrap", fontSize: "0.8rem", lineHeight: 1.5 }}>{comparisonResult}</div>}
+            </div>
+          )}
+
+          {(evidenceHits || evidenceError) && (
+            <div style={{ marginTop: "0.6rem", padding: "0.6rem", background: "rgba(110,66,23,0.04)", borderRadius: "0.4rem", maxHeight: "24rem", overflowY: "auto" }}>
+              <div style={{ fontSize: "0.74rem", color: "var(--text-muted, #6f6557)", marginBottom: "0.3rem" }}>
+                相关史料（embedding 相似度，{evidenceHits?.length ?? 0} 条）：
+              </div>
+              {evidenceError && <div style={{ color: "#c8262d" }}>{evidenceError}</div>}
+              {evidenceHits && evidenceHits.length === 0 && <div className="muted-text">无命中段落。</div>}
+              {evidenceHits && evidenceHits.map((h, i) => (
+                <div key={`${h.bookSlug ?? "?"}-${h.id ?? i}`} style={{ marginBottom: "0.5rem", padding: "0.4rem 0.5rem", background: "rgba(255,252,248,0.7)", borderRadius: "0.4rem", border: "1px solid rgba(119,80,41,0.1)" }}>
+                  <div style={{ fontSize: "0.72rem", fontWeight: 600, color: "#603d1b" }}>
+                    《{h.bookTitle ?? "?"}》· {h.chapterTitle}
+                  </div>
+                  <div style={{ fontSize: "0.8rem", lineHeight: 1.55, marginTop: "0.2rem", whiteSpace: "pre-wrap" }}>
+                    {h.snippet || h.text || ""}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </div>

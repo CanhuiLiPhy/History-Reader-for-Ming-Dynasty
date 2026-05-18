@@ -139,8 +139,13 @@ export type CustomAction = {
 
 export type ModelProvider = {
   id: string;
+  // v1.2.1：简称（用户自定义短名，列表里显示），可空但建议填
+  alias?: string;
+  // 预设供应商 key（"dashscope" / "deepseek" / "ark" / ...），可空表示完全自定义
+  presetProvider?: string;
   baseURL: string;
   apiKey: string;
+  // 该 provider 激活的模型名列表 —— 这些会被合并进主/小模型下拉
   models: string[];
 };
 
@@ -299,6 +304,55 @@ export type ReferenceCompareResponse = {
   keywords: string[];
   contexts: ReferenceCompareContext[];
   reportMarkdown: string;
+  model?: string;
+};
+
+export type PersonBiographySlice = {
+  bookSlug: string;
+  bookTitle: string;
+  chapterLabel: string;
+  anchor: string;
+  paragraphs: string[];
+  paragraphCount: number;
+  sliceFromIndex: number;
+  sliceToIndex: number;
+  chapterParagraphCount: number;
+};
+
+export type PersonRelatedSnippet = {
+  paragraphId?: number;
+  bookSlug: string;
+  bookTitle: string;
+  chapter: string;
+  anchor?: string;
+  snippet: string;
+};
+
+export type PersonBiographiesResponse = {
+  person: string;
+  has: boolean;
+  biographies: PersonBiographySlice[];
+  related: PersonRelatedSnippet[];
+};
+
+export type ConversationMessage = { role: "user" | "assistant"; content: string };
+
+export type ConversationSource = {
+  paragraphId?: number;
+  bookSlug?: string;
+  bookTitle: string;
+  chapter: string;
+  anchor?: string;
+  text: string;
+  biographical?: boolean;
+  index?: number;
+};
+
+export type PersonConversationResponse = {
+  assistant: string;
+  sources: ConversationSource[];
+  sourceMode: "biography" | "embedding" | "fts5" | "empty";
+  sourceNote?: string;
   model?: string;
 };
 

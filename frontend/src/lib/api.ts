@@ -3,6 +3,7 @@ import type {
   AiSettings,
   BookMeta,
   ChronologyResponse,
+  ConversationMessage,
   CustomAction,
   DefaultsPayload,
   DbReaderChaptersPayload,
@@ -12,6 +13,8 @@ import type {
   GeographyPayload,
   OfficialsPayload,
   OfficeSearchPayload,
+  PersonBiographiesResponse,
+  PersonConversationResponse,
   ReadableBook,
   ReignConversionResponse,
   ReferenceCompareResponse,
@@ -89,7 +92,7 @@ export function libraryEpubUrl(slug: string): string {
 
 export async function searchBook(
   query: string,
-  mode: "local" | "fuzzy" | "ai",
+  mode: "local" | "fuzzy" | "semantic" | "ai",
   aiSettings: AiSettings,
   limit = 50,
   slugs?: string[],
@@ -128,6 +131,40 @@ export async function fetchAiChronology(person: string, aiSettings: AiSettings):
     }),
   }, 600000);
   return parseJsonResponse<ChronologyResponse>(response);
+}
+
+export async function fetchPersonBiographies(person: string): Promise<PersonBiographiesResponse> {
+  const url = new URL("/api/person/biographies", window.location.origin);
+  url.searchParams.set("person", person);
+  const response = await fetchWithTimeout(url);
+  return parseJsonResponse<PersonBiographiesResponse>(response);
+}
+
+export async function runPersonConversation(payload: {
+  person: string;
+  mode: "core-person" | "open";
+  messages: ConversationMessage[];
+  aiSettings: AiSettings;
+}): Promise<PersonConversationResponse> {
+  const response = await fetchWithTimeout("/api/ai/person-conversation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 600000);
+  return parseJsonResponse<PersonConversationResponse>(response);
+}
+
+// v1.2: 自由对话 — 通用 RAG 多轮问答
+export async function runFreeConversation(payload: {
+  messages: ConversationMessage[];
+  aiSettings: AiSettings;
+}): Promise<PersonConversationResponse> {
+  const response = await fetchWithTimeout("/api/ai/free-conversation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, 600000);
+  return parseJsonResponse<PersonConversationResponse>(response);
 }
 
 export async function runAiAction(payload: {

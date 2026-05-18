@@ -159,7 +159,7 @@ function namesFromZuiweiluFirstPara(label, firstPara) {
   // 章节是 "明书列传卷之X" / "致命諸臣傳中" 等。人名串塞在首段
   // 例如 "郝景春子鳴鷺楊道選陳宜朱邦聞鄒逢吉王良鑑 阮之錫石惟壇 唐啟泰 徐日泰"
   // 这种粘连的最难解析；先做简单版：按空白切分，过滤 2-4 字段。粘连段落保留首位
-  if (!/明书列传卷之|諸臣傳|諸臣传|致命/.test(label)) return [];
+  if (!/明书列传卷之|明書列傳卷之|諸臣傳|諸臣传|致命/.test(label)) return [];
   if (!firstPara) return [];
   // 取首段（去掉常见前缀注释类内容）
   const head = firstPara.slice(0, 200);
@@ -174,6 +174,40 @@ function namesFromZuiweiluFirstPara(label, firstPara) {
     if (seen.has(c)) continue;
     seen.add(c);
     out.push(c);
+  }
+  return out;
+}
+
+// 通用「掃章內各段找傳記首段」抓人名 — 用于多人合传里被 title 漏掉的人。
+// 識別「X字Y」「X，字Y」「X號Y」「X諱Y」「X，江/福/某地人」等傳記首段標誌。
+// 排除單章只有 1-2 段（多半是闕、總論之類）+ 已被 title 收錄的名字。
+function namesFromParagraphScan(allParagraphs, alreadyHave = new Set()) {
+  const out = [];
+  const seen = new Set(alreadyHave);
+  // 候選的傳記首段識別模式（贪婪取段首前 2-4 字當人名）
+  const PATTERNS = [
+    /^([一-鿿]{2,4})字[一-鿿]/,                        // X字Y...
+    /^([一-鿿]{2,4})，字[一-鿿]/,                       // X，字Y...
+    /^([一-鿿]{2,4})號[一-鿿]/,                        // X號Y...
+    /^([一-鿿]{2,4})，號[一-鿿]/,                       // X，號Y...
+    /^([一-鿿]{2,4})諱[一-鿿]/,                        // X諱Y...
+  ];
+  for (const para of allParagraphs) {
+    if (!para || para.length < 8) continue;
+    // 段首 30 字以内开始扫，避免段落末尾偶尔出现的相似模式
+    const head = para.slice(0, 30);
+    for (const pat of PATTERNS) {
+      const m = head.match(pat);
+      if (!m) continue;
+      const name = trimRelationSuffix(m[1]);
+      if (name.length < 2 || name.length > 4) break;
+      if (seen.has(name)) break;
+      // 排除常见非人名词（守令、节度等）
+      if (/^(臣)/.test(name)) break;
+      seen.add(name);
+      out.push(name);
+      break;
+    }
   }
   return out;
 }
@@ -221,6 +255,31 @@ for (const parser of PARSERS) {
       `).get(book.id, ch.chapter, ch.chapter_order)?.content || "";
       names = parser.fromFirst(ch.chapter, firstPara);
     }
+
+    // 全章段落扫描 fallback：
+    //  - 石匱書後集 / 罪惟錄 的合傳常把多人塞一章但 title 只列首名或仅列姓
+    //    例：「萬楊郭揭詹會陳胡傅徐列傳」、「朱大典列傳附吳邦瑭、何武」
+    //  - 明史 列傳 title 已含全部人名，但對「卷後附傳」也可能漏；
+    //  - 東林列傳 title 是「東林列傳卷N」一律無人名，全靠這條兜底。
+    //
+    // 只在章节包含「列傳/列传」字眼且至少有 5 段時才扫，避免把總論章
+    // 当成传记。结果与 title 提取出的名字合并去重，保持原始顺序。
+    const looksLikeBio = /列[傳传]/.test(ch.chapter);
+    if (looksLikeBio) {
+      const paragraphs = db.prepare(`
+        SELECT content FROM paragraphs
+        WHERE book_id = ? AND chapter = ? AND chapter_order = ?
+        ORDER BY id
+      `).all(book.id, ch.chapter, ch.chapter_order).map((r) => r.content || "");
+      if (paragraphs.length >= 5) {
+        const already = new Set(names);
+        const extra = namesFromParagraphScan(paragraphs, already);
+        if (extra.length > 0) {
+          names = [...names, ...extra];
+        }
+      }
+    }
+
     if (names.length === 0) continue;
 
     bookHits++;

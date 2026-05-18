@@ -980,12 +980,18 @@ g.reader-circle line {
 .assistant-panel {
   min-height: 0;
   padding: 1rem;
+  /* v1.2.1: 防止内嵌的 markdown 表格 / 长行撑爆 320px 左栏 */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .panel-scroll {
   height: 100%;
   overflow: auto;
   padding-right: 0.2rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .panel-headline {
@@ -995,6 +1001,15 @@ g.reader-circle line {
   font-weight: 700;
   color: #69421f;
   margin-bottom: 0.9rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.panel-headline > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel-headline.small {
@@ -1130,6 +1145,10 @@ g.reader-circle line {
   border: 1px solid rgba(113, 73, 28, 0.1);
   background: rgba(255, 252, 248, 0.88);
   padding: 0.9rem;
+  /* v1.2.1: 防止内嵌 markdown 表格/长 token 撑爆卡片，连带挤变形上方工具栏 */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .result-card {
@@ -1165,6 +1184,10 @@ g.reader-circle line {
   color: #433427;
   line-height: 1.72;
   white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .note-input-panel {
@@ -1220,8 +1243,115 @@ g.reader-circle line {
 
 .note-detail {
   padding: 0.4rem 0 0;
-  display: grid;
-  gap: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  max-width: 100%;
+  /* contain: layout/size 让 detail 是一个独立布局根 —— 子内容无论多宽都不能影响外部 */
+  contain: layout style;
+  overflow: hidden;
+}
+
+/* v1.2.1: 札记原选段块 —— 「勾画位置」清晰显示 */
+.note-source-block {
+  background: rgba(239, 194, 79, 0.1);
+  border-left: 3px solid #c08930;
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.4rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.note-source-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #8a5a1d;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.25rem;
+}
+
+.note-source-text {
+  font-family: "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif;
+  font-size: 0.92rem;
+  line-height: 1.65;
+  color: #2c1c11;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* note-content-frame: 用 width: 0 + 100% trick 强制子内容 wrap 到父宽度 */
+.note-content-frame {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.note-md-compact {
+  font-size: 0.85rem;
+  line-height: 1.62;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.note-md-compact h1,
+.note-md-compact h2,
+.note-md-compact h3,
+.note-md-compact h4 {
+  font-size: 0.92rem;
+  margin: 0.6rem 0 0.3rem;
+}
+
+.note-md-compact p,
+.note-md-compact ul,
+.note-md-compact ol {
+  margin: 0.35rem 0;
+}
+
+/* 左栏窄，表格直接转成块级两列堆叠样式，比横滚更易读 */
+.note-md-compact table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: 0.78rem;
+  border-collapse: collapse;
+}
+
+.note-md-compact table thead {
+  display: none;
+}
+
+.note-md-compact table tr {
+  display: block;
+  border: 1px solid rgba(119, 80, 41, 0.15);
+  border-radius: 0.4rem;
+  padding: 0.3rem 0.4rem;
+  margin: 0.3rem 0;
+  background: rgba(255, 252, 248, 0.7);
+}
+
+.note-md-compact table td {
+  display: block;
+  border: none;
+  padding: 0.15rem 0;
+  font-size: 0.78rem;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.note-md-compact pre,
+.note-md-compact code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-width: 100%;
 }
 
 .stack-gap.compact {
@@ -1374,6 +1504,32 @@ g.reader-circle line {
   align-content: start;
   gap: 0.75rem;
   min-height: 0;
+  /* v1.2.1: 防止 markdown 表格 / 长 token 撑爆右侧栏 */
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* v1.2.1: 右栏 markdown 报告内置表格、长行强制不溢出 */
+.answer-panel .markdown-body,
+.annotation-panel .markdown-body {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  word-break: break-word;
+}
+
+.answer-panel .markdown-body table,
+.annotation-panel .markdown-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: 0.86rem;
+}
+
+.answer-panel .markdown-body pre,
+.answer-panel .markdown-body code {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .selection-card,
@@ -1454,6 +1610,11 @@ g.reader-circle line {
 .markdown-body {
   color: #433427;
   line-height: 1.78;
+  /* v1.2.1: 默认就强制不溢出，无论嵌在哪里 */
+  max-width: 100%;
+  min-width: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .markdown-body h1,
@@ -1658,6 +1819,26 @@ g.reader-circle line {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0.5rem;
+}
+
+/* v1.2.1 G3: 史料交叉比对「展开」弹窗。比 source-viewer 更宽，markdown 排版舒展。 */
+.compare-expand-modal {
+  width: min(64rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 4rem);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.compare-expand-body {
+  overflow-y: auto;
+  max-height: 75vh;
+  padding: 1rem 1.4rem;
+  background: rgba(255, 252, 246, 0.6);
+  border-radius: 0.6rem;
+  border: 1px solid rgba(130, 88, 40, 0.1);
+  font-size: 0.98rem;
+  line-height: 1.85;
 }
 
 .source-viewer-body {
@@ -2186,4 +2367,41 @@ g.reader-circle line {
   .timeline-list {
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   }
+}
+
+/* 搜索结果一键跳转后，目标段落短暂高亮 ~1.6s 提示用户落点。
+   .search-flash 同步注入到 EPUB iframe 内（LAYOUT_OVERRIDE_CSS）。 */
+@keyframes search-flash-fade {
+  0%   { background-color: rgba(212, 35, 27, 0.32); box-shadow: 0 0 0 4px rgba(212, 35, 27, 0.18); }
+  60%  { background-color: rgba(212, 35, 27, 0.18); box-shadow: 0 0 0 3px rgba(212, 35, 27, 0.10); }
+  100% { background-color: transparent; box-shadow: none; }
+}
+.search-flash {
+  animation: search-flash-fade 1.6s ease-out;
+  border-radius: 0.2em;
+}
+
+/* v1.2.1: AI 对话 / 新建对话 按钮 — 横向窄条按钮，绝对固定 22px 高。 */
+.new-chat-btn {
+  display: block !important;
+  width: 100% !important;
+  padding: 16px 10px !important;
+  font-size: 14px !important;
+  line-height: 1.2 !important;
+  min-height: 0 !important;
+  height: 60px !important;
+  max-height: 60px !important;
+  border-radius: 6px !important;
+  border: 1px solid var(--ui-panel-border, rgba(0,0,0,0.12)) !important;
+  background: rgba(220, 200, 154, 0.08);
+  color: var(--ui-text, inherit);
+  cursor: pointer;
+  font-family: inherit;
+  margin-bottom: 0 !important;
+  text-align: center;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+.new-chat-btn:hover {
+  background: rgba(220, 200, 154, 0.16);
 }

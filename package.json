@@ -2,7 +2,7 @@
   "name": "mingshi-reader-ai",
   "productName": "明史阅读器",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.1",
   "description": "Interactive Ming History AI reader built from EPUB with local persistence and OpenAI-compatible AI services.",
   "main": "electron/main.cjs",
   "scripts": {
@@ -19,6 +19,8 @@
     "electron:start": "wait-on tcp:3100 && electron electron/main.cjs",
     "electron:integrated": "electron electron/main.cjs",
     "dist:mac": "npm --prefix frontend run build && electron-builder --mac --x64 --arm64",
+    "dist:mac:plus": "npm --prefix frontend run build && electron-builder --mac --arm64",
+    "dist:mac:lite": "npm --prefix frontend run build && electron-builder --mac --arm64 --config electron-builder.lite.config.cjs",
     "dist:win": "npm --prefix frontend run build && electron-builder --win --x64",
     "dist": "npm --prefix frontend run build && electron-builder -mwl"
   },
@@ -56,8 +58,29 @@
         "to": "backend-data/.cache",
         "filter": [
           "library.sqlite",
-          "split-*.epub"
+          "split-*.epub",
+          "paragraphs-vec-int8.sqlite"
         ]
+      },
+      {
+        "from": "backend/.cache/sqlite-vec-extensions",
+        "to": "backend-data/.cache/sqlite-vec-extensions",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "backend/scripts",
+        "to": "backend-data/scripts",
+        "filter": ["embed_query.py"]
+      },
+      {
+        "from": "backend/python-runtime",
+        "to": "backend-data/python-runtime",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "backend/fastembed-cache",
+        "to": "backend-data/fastembed-cache",
+        "filter": ["**/*"]
       },
       {
         "from": "backend/books",

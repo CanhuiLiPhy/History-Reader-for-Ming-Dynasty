@@ -37,6 +37,12 @@ frontend/public/fonts/*.woff*
 # === 内置 Node 运行时（用户自己装；不入仓库） ===
 runtime/
 
+# === v1.2 embedding 资产：体积大、可重建，不入仓库 ===
+# python-build-standalone 解压目录（~259MB），由打包脚本下载
+backend/python-runtime/
+# fastembed BGE-small-zh-v1.5 ONNX 缓存（~91MB），首次启动自动下载
+backend/fastembed-cache/
+
 # === 发布包 ===
 *.zip
 *.tar.gz

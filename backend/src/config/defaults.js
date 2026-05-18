@@ -18,7 +18,7 @@ const dataRoot = process.env.MINGSHI_DATA_ROOT
   ? path.resolve(process.env.MINGSHI_DATA_ROOT)
   : backendRoot;
 
-const modelOptions = (process.env.AI_MODEL_OPTIONS || "deepseek-v4-pro,kimi-k2.6,qwen3.6-max-preview,MiniMax-M2.5,qwen3.5-plus-2026-04-20")
+const modelOptions = (process.env.AI_MODEL_OPTIONS || "deepseek-v4-pro,glm-4.7,kimi-k2.6,qwen3.6-max-preview")
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
@@ -41,8 +41,38 @@ export const BOOK_PATH = process.env.BOOK_PATH
   : path.join(BOOKS_DIR, "ming-shi.epub");
 export const PORT = Number.parseInt(process.env.PORT || "3100", 10);
 
+// v1.2.1：默认 API Key 列表（dev 期 env 注入 → 前端首次启动看到；打包版 env 为空 → 列表为空，用户在设置里手动加）。
+// 列表顺序 = 调用优先级（ai-service.resolveProviderForModel first-match-wins）。
+// 第一条：DeepSeek 官方（只激活 deepseek-v4-pro，作为最优先大模型）。
+// 第二条：百炼（其他所有模型，小模型 qwen3.6-flash-2026-04-16 等）。
+const baseURL = process.env.AI_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const modelProviders = [];
+if (process.env.AI_DEEPSEEK_PRO_API_KEY) {
+  modelProviders.push({
+    id: "default-deepseek",
+    alias: "DeepSeek 官方",
+    presetProvider: "deepseek",
+    baseURL: process.env.AI_DEEPSEEK_PRO_BASE_URL || "https://api.deepseek.com/v1",
+    apiKey: process.env.AI_DEEPSEEK_PRO_API_KEY,
+    models: ["deepseek-v4-pro"],
+  });
+}
+if (process.env.AI_API_KEY) {
+  // 把百炼主 key 也作为一条 provider 放进列表；激活模型 = AI_MODEL_OPTIONS ∪ AI_SMALL_MODEL_OPTIONS 去掉
+  // 已被前面 deepseek 官方独占的 deepseek-v4-pro。
+  const bailianModels = [...new Set([...modelOptions, ...smallModelOptions])].filter((m) => m !== "deepseek-v4-pro");
+  modelProviders.push({
+    id: "default-dashscope",
+    alias: "百炼 (DashScope)",
+    presetProvider: "dashscope",
+    baseURL,
+    apiKey: process.env.AI_API_KEY,
+    models: bailianModels,
+  });
+}
+
 export const DEFAULT_AI_SETTINGS = {
-  baseURL: process.env.AI_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  baseURL,
   apiKey: process.env.AI_API_KEY || "",
   defaultModel: process.env.AI_DEFAULT_MODEL || modelOptions[0] || "deepseek-v4-pro",
   modelOptions,
@@ -53,6 +83,7 @@ export const DEFAULT_AI_SETTINGS = {
   ttsModel: process.env.AI_TTS_MODEL || "qwen3-tts-flash",
   ttsVoice: process.env.AI_TTS_VOICE || "Cherry",
   systemPrompt: READER_AGENT_SYSTEM.trim(),
+  modelProviders,
   customActions: DEFAULT_CUSTOM_ACTIONS
 };
 

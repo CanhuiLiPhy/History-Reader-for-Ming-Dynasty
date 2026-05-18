@@ -1004,7 +1004,19 @@ export function lookupBiographicalReferences(personQuery) {
   const idx = loadBiographyIndex();
   const name = (personQuery || "").trim();
   if (!name) return null;
-  const entries = idx.index?.[name];
+  // 索引 key 全是简体；用户输入可能繁体 (張居正 / 劉基) — 用 expandSimpTradVariants
+  // 把查询展成简繁两种形式，按命中数取第一个非空结果。
+  const variants = expandSimpTradVariants(name);
+  let entries = null;
+  let canonicalName = name;
+  for (const v of variants) {
+    const found = idx.index?.[v];
+    if (found && found.length) {
+      entries = found;
+      canonicalName = v;
+      break;
+    }
+  }
   if (!entries || !entries.length) return null;
 
   // We need the list of every person in each chapter (to know where the
@@ -1024,7 +1036,7 @@ export function lookupBiographicalReferences(personQuery) {
   for (const e of entries) {
     const key = `${e.bookSlug}#${e.chapterOrder}`;
     const orderedNames = (personsInChapter.get(key) || []).map((x) => x.name);
-    const slice = extractPersonSlice(db, e, name, orderedNames);
+    const slice = extractPersonSlice(db, e, canonicalName, orderedNames);
     if (slice) slices.push(slice);
   }
   return slices.length ? slices : null;

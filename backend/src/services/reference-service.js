@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { convertMingYearTerm, explainReignTerm, extractYearMentions, MING_REIGNS } from "../data/reign-map.js";
 import {
   deriveKeywordsFromText,
+  fetchParagraphsByIds,
   getBookCatalogForAI,
   getLibraryOverview,
   getSourceManifest,
@@ -13,6 +14,10 @@ import {
 import { getContextSnippets, searchBook } from "./book-service.js";
 import { aiReady, getActionPrompt, runPromptTemplate, runStructuredJsonPrompt } from "./ai-service.js";
 import { searchWeb } from "./web-search-service.js";
+import {
+  isAvailable as embeddingAvailable,
+  vectorSearch
+} from "./embedding-service.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -766,14 +771,18 @@ function buildReferenceSearchPlan(data = {}) {
     keywords: unique(data.keywords || []).slice(0, 10),
     timeHints: unique(data.timeHints || []).slice(0, 6),
     webQuery: String(data.webQuery || "").trim(),
-    note: String(data.note || data.coreEventSummary || "").trim()
+    note: String(data.note || data.coreEventSummary || "").trim(),
+    // Natural-language text used by embedding-service to run vector KNN
+    // search and RRF-fuse with FTS5 candidates. Empty → embedding step
+    // skipped (FTS5-only fallback, identical to pre-v1.2 behavior).
+    embeddingQuery: String(data.embeddingQuery || "").trim()
   };
 }
 
 // Drop reference contexts that the AI judges irrelevant to the question.
 // One small-model call returning a JSON array of "kept" indices. Cheaper than
 // asking the main QA model to filter inline (which is unreliable to parse).
-async function filterRelevantReferences({ question, selection, references, aiSettings }) {
+export async function filterRelevantReferences({ question, selection, references, aiSettings }) {
   if (!references.length || !aiReady(aiSettings)) return references;
   // For tiny questions and tiny reference sets, skip the filter — overhead
   // would be larger than the benefit.
@@ -806,12 +815,17 @@ async function filterRelevantReferences({ question, selection, references, aiSet
 }
 
 async function buildQuestionPlan({ selection, question, bookContext, aiSettings }) {
+  // 喂给 embedding KNN 的自然语句：优先用问题 + 选段拼接（如果有），
+  // 否则单独用其中一个。比纯关键词更能命中语义近邻。
+  const embeddingQuery = [question, selection].filter((s) => s && s.trim()).join("\n").slice(0, 1000);
+
   if (!aiReady(aiSettings)) {
     return buildReferenceSearchPlan({
       selectionRelevant: Boolean(selection.trim()),
       needWebSearch: !selection.trim(),
       keywords: deriveKeywordsFromText(`${question} ${selection}`),
       webQuery: question || selection,
+      embeddingQuery,
       note: "AI 未启用，使用本地关键词回退。"
     });
   }
@@ -829,13 +843,14 @@ async function buildQuestionPlan({ selection, question, bookContext, aiSettings 
       maxTokens: 500,
       modelStrategy: "small"
     });
-    return buildReferenceSearchPlan(plan.data);
+    return buildReferenceSearchPlan({ ...plan.data, embeddingQuery });
   } catch {
     return buildReferenceSearchPlan({
       selectionRelevant: Boolean(selection.trim()),
       needWebSearch: !selection.trim(),
       keywords: deriveKeywordsFromText(`${question} ${selection}`),
-      webQuery: question || selection
+      webQuery: question || selection,
+      embeddingQuery
     });
   }
 }
@@ -849,86 +864,122 @@ async function buildQuestionPlan({ selection, question, bookContext, aiSettings 
 async function collectReferenceContexts(plan, limit = 10, aiSettings = null, tokenTracker = null, excludeSlug = "ming-shi") {
   const T0 = Date.now();
   const tlog = (label) => console.log(`[collectRefs] +${((Date.now()-T0)/1000).toFixed(1)}s ${label}`);
-  const SEARCH_LIMIT = 200; // fetch many candidates per batch
+  const SEARCH_LIMIT = 200;
 
-  // Step 1: AI-guided book scoping
+  // FAST PATH: embedding 可用 + 有自然语言查询 → 完全跳过 AI 选书 + FTS5 关键词检索 + 启发式打分。
+  // vec KNN 已经在全 22 本书库做语义近邻搜索，比 LLM「选书 → 关键词 OR 匹配」更准更省。
+  // 失败时 (vec 返 0 或 sidecar 挂) 才走 SLOW PATH 兜底。
+  let scored = [];
   let bookSlugs = [];
-  if (aiReady(aiSettings)) {
+  const useEmbeddingFastPath = plan.embeddingQuery && embeddingAvailable() && plan.embeddingQuery.length >= 2;
+  let embeddingPathSucceeded = false;
+
+  if (useEmbeddingFastPath) {
     try {
-      tlog("STEP 2.1 AI book scoping (small model)...");
-      const catalog = getBookCatalogForAI(excludeSlug);
-      const searchHint = [
-        plan.people.length ? `人物：${plan.people.join("、")}` : "",
-        plan.events.length ? `事件：${plan.events.join("、")}` : "",
-        plan.keywords.length ? `关键词：${plan.keywords.join("、")}` : "",
-        plan.timeHints.length ? `时间：${plan.timeHints.join("、")}` : "",
-      ].filter(Boolean).join("；");
-
-      const scopeResult = await runStructuredJsonPrompt({
-        prompt: {
-          system: "你是明史研究资料检索助手。根据用户的检索需求，从资料库中选出最可能包含相关内容的书。只输出JSON。",
-          userTemplate: `检索需求：{{selection}}\n\n资料库目录：\n{{context}}\n\n请选出所有可能相关的书的slug（不要遗漏），输出JSON：{"slugs":[...]}`
-        },
-        variables: { selection: searchHint, context: catalog },
-        aiSettings,
-        temperature: 0.1,
-        maxTokens: 300,
-        modelStrategy: "small"
-      });
-      if (tokenTracker && scopeResult.usage) { tokenTracker.small.prompt += scopeResult.usage.prompt_tokens || 0; tokenTracker.small.completion += scopeResult.usage.completion_tokens || 0; tokenTracker.small.calls += 1; }
-      bookSlugs = unique(scopeResult.data?.slugs || []).slice(0, 10);
-      tlog(`STEP 2.1 done model=${scopeResult.model} books=${bookSlugs.length} (${bookSlugs.join(',')})`);
+      tlog("FAST PATH: pure embedding vec KNN (skip AI scoping + FTS5)...");
+      const vecResults = await vectorSearch(plan.embeddingQuery, 200);
+      tlog(`vec returned ${vecResults.length} candidates`);
+      if (vecResults.length > 0) {
+        const ids = vecResults.map((v) => v.paragraph_id);
+        const rows = fetchParagraphsByIds(ids, excludeSlug);
+        const byId = new Map(rows.map((r) => [r.paragraphId, r]));
+        scored = vecResults
+          .map((v) => {
+            const row = byId.get(v.paragraph_id);
+            if (!row) return null;
+            return { ...row, relevance: 1000 - v.distance, _vecDistance: v.distance };
+          })
+          .filter(Boolean)
+          .slice(0, 200);
+        tlog(`FAST PATH done — ${scored.length} candidates`);
+        embeddingPathSucceeded = true;
+      } else {
+        tlog("vec returned 0 — falling back to FTS5 slow path");
+      }
     } catch (err) {
-      tlog(`STEP 2.1 FAILED ${err?.name}: ${String(err?.message || '').slice(0,80)} — fallback to search all`);
+      tlog(`embedding FAILED ${err?.name}: ${String(err?.message || "").slice(0, 100)} — falling back to FTS5 slow path`);
     }
-  } else {
-    tlog("STEP 2.1 skipped (no AI)");
   }
 
-  // Step 2: Wide search — fetch up to 100 candidates per batch
-  const searchOpts = bookSlugs.length > 0 ? { bookSlugs } : {};
-  const primaryBatches = [
-    mergeSearchTerms(plan.people),
-    mergeSearchTerms(plan.people, plan.events),
-    mergeSearchTerms(plan.institutions, plan.places, plan.keywords),
-  ];
+  // SLOW PATH: 嵌入不可用 / 查询过短 / vec 返 0 → 旧的 FTS5 + AI 选书 + 启发式打分流程
+  if (!embeddingPathSucceeded) {
+    // Step 1: AI-guided book scoping
+    if (aiReady(aiSettings)) {
+      try {
+        tlog("SLOW PATH STEP 1: AI book scoping (small model)...");
+        const catalog = getBookCatalogForAI(excludeSlug);
+        const searchHint = [
+          plan.people.length ? `人物：${plan.people.join("、")}` : "",
+          plan.events.length ? `事件：${plan.events.join("、")}` : "",
+          plan.keywords.length ? `关键词：${plan.keywords.join("、")}` : "",
+          plan.timeHints.length ? `时间：${plan.timeHints.join("、")}` : "",
+        ].filter(Boolean).join("；");
 
-  let collected = [];
-  for (const keywords of primaryBatches) {
-    if (!keywords.length) continue;
-    const result = searchReferenceParagraphs({
-      keywords,
-      excludeSlug,
-      limit: SEARCH_LIMIT,
-      ...searchOpts
-    });
-    collected = dedupeBy([...collected, ...result], (item) => `${item.bookSlug}:${item.chapter}:${item.content.slice(0, 80)}`);
-  }
+        const scopeResult = await runStructuredJsonPrompt({
+          prompt: {
+            system: "你是明史研究资料检索助手。根据用户的检索需求，从资料库中选出最可能包含相关内容的书。只输出JSON。",
+            userTemplate: `检索需求：{{selection}}\n\n资料库目录：\n{{context}}\n\n请选出所有可能相关的书的slug（不要遗漏），输出JSON：{"slugs":[...]}`
+          },
+          variables: { selection: searchHint, context: catalog },
+          aiSettings,
+          temperature: 0.1,
+          maxTokens: 300,
+          modelStrategy: "small"
+        });
+        if (tokenTracker && scopeResult.usage) { tokenTracker.small.prompt += scopeResult.usage.prompt_tokens || 0; tokenTracker.small.completion += scopeResult.usage.completion_tokens || 0; tokenTracker.small.calls += 1; }
+        bookSlugs = unique(scopeResult.data?.slugs || []).slice(0, 10);
+        tlog(`SLOW PATH STEP 1 done model=${scopeResult.model} books=${bookSlugs.length} (${bookSlugs.join(',')})`);
+      } catch (err) {
+        tlog(`SLOW PATH STEP 1 FAILED ${err?.name}: ${String(err?.message || '').slice(0,80)} — fallback to search all`);
+      }
+    } else {
+      tlog("SLOW PATH STEP 1 skipped (no AI)");
+    }
 
-  // Fallback: time hints
-  if (collected.length < 10) {
-    const fallbackBatch = mergeSearchTerms(plan.timeHints, plan.keywords);
-    if (fallbackBatch.length) {
+    // Step 2: Wide search — fetch up to 100 candidates per batch
+    const searchOpts = bookSlugs.length > 0 ? { bookSlugs } : {};
+    const primaryBatches = [
+      mergeSearchTerms(plan.people),
+      mergeSearchTerms(plan.people, plan.events),
+      mergeSearchTerms(plan.institutions, plan.places, plan.keywords),
+    ];
+
+    let collected = [];
+    for (const keywords of primaryBatches) {
+      if (!keywords.length) continue;
       const result = searchReferenceParagraphs({
-        keywords: fallbackBatch,
-        excludeSlug: "ming-shi",
+        keywords,
+        excludeSlug,
         limit: SEARCH_LIMIT,
         ...searchOpts
       });
       collected = dedupeBy([...collected, ...result], (item) => `${item.bookSlug}:${item.chapter}:${item.content.slice(0, 80)}`);
     }
+
+    if (collected.length < 10) {
+      const fallbackBatch = mergeSearchTerms(plan.timeHints, plan.keywords);
+      if (fallbackBatch.length) {
+        const result = searchReferenceParagraphs({
+          keywords: fallbackBatch,
+          excludeSlug: "ming-shi",
+          limit: SEARCH_LIMIT,
+          ...searchOpts
+        });
+        collected = dedupeBy([...collected, ...result], (item) => `${item.bookSlug}:${item.chapter}:${item.content.slice(0, 80)}`);
+      }
+    }
+
+    // Step 3: Score by keyword overlap
+    const strongTokens = mergeSearchTerms(plan.people, plan.events, plan.institutions, plan.places, plan.keywords);
+    const hasPeopleOrEvents = plan.people.length > 0 || plan.events.length > 0;
+    scored = collected
+      .map((item) => ({ ...item, relevance: scoreReferenceContext(item, strongTokens) }))
+      .filter((item) => !hasPeopleOrEvents || item.relevance > 0)
+      .sort((a, b) => b.relevance - a.relevance)
+      .slice(0, 200);
+
+    tlog(`SLOW PATH STEP 2-3 FTS done collected=${collected.length} scored=${scored.length}`);
   }
-
-  // Step 3: Score by keyword overlap
-  const strongTokens = mergeSearchTerms(plan.people, plan.events, plan.institutions, plan.places, plan.keywords);
-  const hasPeopleOrEvents = plan.people.length > 0 || plan.events.length > 0;
-  let scored = collected
-    .map((item) => ({ ...item, relevance: scoreReferenceContext(item, strongTokens) }))
-    .filter((item) => !hasPeopleOrEvents || item.relevance > 0)
-    .sort((a, b) => b.relevance - a.relevance)
-    .slice(0, 200); // take top 200 for AI filtering — wide net, AI judges
-
-  tlog(`STEP 2.2-2.3 FTS search done collected=${collected.length} scored=${scored.length}`);
 
   // Step 4: AI relevance filtering — strict semantic check by small model.
   // 大批量候选（>50）拆成若干 50 条小批，并行喂给小模型，最后合并保留 ID。
@@ -1065,6 +1116,44 @@ function pickEmperorFromText(text) {
   }
 
   return best?.item || null;
+}
+
+// v1.2.1: 模型偶尔不听话，仍在报告里写「## 七、剔除项」「## 未采用材料」之类章节。
+// 这里在拿到 LLM 输出后做一道兜底过滤：扫描所有 H2 / H3 章节，凡标题命中
+// 「剔除 / 未采用 / 不相关材料 / 排除材料 / 已剔除 / 已删除」之一的，整段（含其内容直到下一个同级或更高级标题）删除。
+// 注意：保留 markdown 其他部分（表格、列表、加粗）原样。
+function stripExcludedSections(markdown) {
+  if (!markdown || typeof markdown !== "string") return markdown;
+  const BAD_TITLE = /(剔除|未采用|不相关材料|排除材料|已删除|已剔除|未采用材料)/;
+  const lines = markdown.split(/\r?\n/);
+  const out = [];
+  let skipping = false;
+  let skipLevel = 0; // 进入 skip 时的标题级别（## = 2, ### = 3）
+  for (const line of lines) {
+    const m = line.match(/^(#{1,6})\s+(.*?)\s*$/);
+    if (m) {
+      const level = m[1].length;
+      const title = m[2];
+      if (skipping) {
+        // 遇到同级或更高级（数字更小）标题就结束 skip
+        if (level <= skipLevel) {
+          skipping = false;
+        }
+      }
+      if (!skipping && BAD_TITLE.test(title)) {
+        skipping = true;
+        skipLevel = level;
+        continue;
+      }
+    }
+    if (!skipping) out.push(line);
+  }
+  // 二次清理：删除单行内嵌的「（备注：…未采用/已剔除…）」类括注
+  return out
+    .join("\n")
+    .replace(/[（(][^()（）]*?(剔除|未采用|不相关|排除)[^()（）]*?[)）]/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function formatReferenceContextRows(rows) {
@@ -1383,7 +1472,10 @@ export async function runCrossSourceComparison(selectedText, aiSettings, current
       places,
       keywords,
       timeHints,
-      note: coreEventSummary
+      note: coreEventSummary,
+      // 用选段原文做 embedding 查询（最语义、最不丢信息）；
+      // collectReferenceContexts 内部会判 embedding 是否可用。
+      embeddingQuery: selectedText
     }),
     25,
     aiSettings,
@@ -1431,7 +1523,7 @@ export async function runCrossSourceComparison(selectedText, aiSettings, current
 
     tlog(`STEP 3/3 done model=${result.model} text.length=${result.text.length}`);
     trackUsage(result, "large");
-    payload.reportMarkdown = result.text;
+    payload.reportMarkdown = stripExcludedSections(result.text);
     payload.model = result.model;
   } catch (err) {
     tlog(`STEP 3/3 FAILED ${err?.name}: ${String(err?.message || '').slice(0, 120)}`);
