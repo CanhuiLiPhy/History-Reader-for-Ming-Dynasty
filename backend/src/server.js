@@ -6,6 +6,8 @@ import mime from "mime-types";
 import { FRONTEND_DIST, PORT, getPublicDefaults } from "./config/defaults.js";
 import { explainReignTerm } from "./data/reign-map.js";
 import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook, searchAcrossBooks, searchFuzzy, resolveBookEpubPath, bookEpubExists, DEFAULT_BOOK_SLUG, lookupBiographicalReferences } from "./services/book-service.js";
+import { ensureAnchorMap, translateAnchor } from "./services/epub-anchor-map.js";
+import { ensureSplitEpub as ensureSplitEpubForAnchor } from "./services/epub-splitter.js";
 import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, synthesizeSpeech } from "./services/ai-service.js";
 import { initializeLibrary } from "./services/library-db.js";
 import { ensureSplitEpub } from "./services/epub-splitter.js";
@@ -225,6 +227,20 @@ async function handleBookSearch(req, res, next) {
           }
         }
         const final = filtered.slice(0, limit);
+        // Preload anchor maps so legacy pre-split hrefs get translated.
+        const slugSet = new Set(final.map((r) => r.bookSlug).filter(Boolean));
+        await Promise.all(
+          [...slugSet].map(async (slug) => {
+            try {
+              const epubPath = resolveBookEpubPath(slug);
+              if (!epubPath) return;
+              const splitPath = await ensureSplitEpubForAnchor(epubPath);
+              await ensureAnchorMap(slug, splitPath && splitPath !== epubPath ? splitPath : null);
+            } catch {
+              await ensureAnchorMap(slug, null);
+            }
+          })
+        );
         result = {
           query,
           expandedQueries: [],
@@ -235,7 +251,7 @@ async function handleBookSearch(req, res, next) {
             bookTitle: row.bookTitle,
             chapterId: String(idx),
             chapterOrder: null,
-            chapterHref: row.anchor || "",
+            chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
             chapterTitle: row.chapter || "",
             score: typeof row._distance === "number" ? Number((-(row._distance / 100)).toFixed(3)) : 0,
             snippet: (row.content || "").slice(0, 240),
@@ -367,6 +383,20 @@ app.get("/api/reference/emperors", (_req, res) => {
 
 app.get("/api/reference/officials", (_req, res) => {
   res.json(getOfficialsPayload());
+});
+
+let shixiCache = null;
+app.get("/api/reference/shixi", async (_req, res, next) => {
+  try {
+    if (!shixiCache) {
+      const shixiPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "data/shixi.json");
+      const raw = await fs.readFile(shixiPath, "utf8");
+      shixiCache = JSON.parse(raw);
+    }
+    res.json(shixiCache);
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/reference/history-timeline", (req, res) => {

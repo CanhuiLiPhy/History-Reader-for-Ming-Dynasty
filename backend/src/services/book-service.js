@@ -10,6 +10,7 @@ import * as OpenCC from "opencc-js";
 import { BOOK_PATH, BOOKS_DIR, CACHE_ROOT } from "../config/defaults.js";
 import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
+import { ensureAnchorMap, translateAnchor } from "./epub-anchor-map.js";
 import { getDb } from "./library-db.js";
 
 export const DEFAULT_BOOK_SLUG = "ming-shi";
@@ -754,13 +755,33 @@ export async function searchAcrossBooks(query, options = {}) {
     rows = balanced;
   }
 
+  // Preload anchor-maps for every distinct book in the result so translateAnchor
+  // returns the post-split chapter file instead of the legacy wrapper href.
+  const slugSet = new Set(rows.map((r) => r.bookSlug).filter(Boolean));
+  await Promise.all(
+    [...slugSet].map(async (slug) => {
+      try {
+        const epubPath = resolveBookEpubPath(slug);
+        if (!epubPath) return;
+        const splitPath = await ensureSplitEpub(epubPath);
+        if (splitPath && splitPath !== epubPath) {
+          await ensureAnchorMap(slug, splitPath);
+        } else {
+          await ensureAnchorMap(slug, null); // mark as no-op map
+        }
+      } catch {
+        await ensureAnchorMap(slug, null);
+      }
+    })
+  );
+
   const results = rows.map((row, index) => ({
     id: `${row.bookSlug}-${row.id}`,
     bookSlug: row.bookSlug,
     bookTitle: row.bookTitle,
     chapterId: String(row.chapterOrder ?? index),
     chapterOrder: row.chapterOrder ?? null,
-    chapterHref: row.anchor || "", // EPUB books: anchor 可作 chapter href；DB-only：可能空，前端按 chapterOrder 跳
+    chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
     chapterTitle: row.chapter || "",
     score: typeof row.rank === "number" ? Number((-row.rank).toFixed(3)) : 0,
     snippet: toSnippet(row.content, safeQuery),
@@ -845,13 +866,28 @@ export async function searchFuzzy(query, options = {}) {
     if (balanced.length >= limit) break;
   }
 
+  // Preload anchor maps so translateAnchor can rewrite legacy wrapper hrefs.
+  const slugSet2 = new Set(balanced.map((r) => r.bookSlug).filter(Boolean));
+  await Promise.all(
+    [...slugSet2].map(async (slug) => {
+      try {
+        const epubPath = resolveBookEpubPath(slug);
+        if (!epubPath) return;
+        const splitPath = await ensureSplitEpub(epubPath);
+        await ensureAnchorMap(slug, splitPath && splitPath !== epubPath ? splitPath : null);
+      } catch {
+        await ensureAnchorMap(slug, null);
+      }
+    })
+  );
+
   const results = balanced.map((row) => ({
     id: `${row.bookSlug}-${row.id}`,
     bookSlug: row.bookSlug,
     bookTitle: row.bookTitle,
     chapterId: String(row.chapterOrder ?? 0),
     chapterOrder: row.chapterOrder ?? null,
-    chapterHref: row.anchor || "",
+    chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
     chapterTitle: row.chapter || "",
     score: Math.round((row.coverage / variants.length) * 100) / 100,
     snippet: toSnippet(row.content, safeQuery),

@@ -25,9 +25,10 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { ShixiTree } from "./components/ShixiTree";
+import { HistoricalCalculator } from "./components/HistoricalCalculator";
 import {
   compareReference,
-  convertReignTerm,
   fetchAiChronology,
   fetchChapterContext,
   fetchBookMeta,
@@ -73,12 +74,10 @@ import type {
   EmperorPayload,
   GeocodePlace,
   GeocodeResponse,
-  FamilyTreeNode,
   OfficialsPayload,
   OfficeSearchPayload,
   PersonBiographiesResponse,
   ReadableBook,
-  ReignConversionResponse,
   ReaderBookmark,
   ReaderHighlight,
   ReaderNote,
@@ -606,9 +605,6 @@ function App() {
   const [officeSearchQuery, setOfficeSearchQuery] = useState("");
   const [officeSearchResult, setOfficeSearchResult] = useState<OfficeSearchPayload | null>(null);
   const [officeSearchLoading, setOfficeSearchLoading] = useState(false);
-  const [reignDraft, setReignDraft] = useState("");
-  const [reignResult, setReignResult] = useState<ReignConversionResponse | null>(null);
-  const [reignLoading, setReignLoading] = useState(false);
   const [referenceFilter, setReferenceFilter] = useState("");
   // Officials panel sub-tabs (v0.3 extended data)
   const [officialsTab, setOfficialsTab] = useState<"lineage" | "institutions" | "offices" | "chronology" | "princes">("lineage");
@@ -633,7 +629,6 @@ function App() {
   //   "circle"     圈点·正红   #d4231b
   type MarkStyle = "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle";
   const [markStyle, setMarkStyle] = useState<MarkStyle>("h-gold");
-  const [selectedTreeEmperor, setSelectedTreeEmperor] = useState<FamilyTreeNode | null>(null);
   const [readerLayout, setReaderLayout] = useState<"horizontal" | "vertical">("horizontal");
   const [scriptVariant, setScriptVariant] = useState<"simplified" | "traditional">("traditional");
   // Independent UI 简繁 toggle. The 正文字体转换 above only affects body
@@ -2894,20 +2889,6 @@ function App() {
     setHighlights((current) => current.filter((item) => item.id !== target.id));
   }
 
-  async function handleReignConvert() {
-    if (!reignDraft.trim()) return;
-    try {
-      setReignLoading(true);
-      setReferenceError("");
-      const result = await convertReignTerm(reignDraft.trim());
-      setReignResult(result);
-    } catch (error) {
-      setReferenceError(error instanceof Error ? error.message : "年号换算失败。");
-    } finally {
-      setReignLoading(false);
-    }
-  }
-
   async function handleOfficeSearch() {
     if (!officeSearchQuery.trim()) return;
     try {
@@ -3782,14 +3763,49 @@ function App() {
       }
     }
 
+    // DB-reader books: result.chapterOrder is the DB's chapter_order field, NOT
+    // the 0-based array index that loadDbReaderChapter expects. Resolve to the
+    // proper array index by looking up (label, rawOrder) in the chapter list.
+    // For ming-shi-lu chapter_order starts at 0 so they happen to coincide;
+    // for siku-mingshi etc they're off by one or more.
+    async function resolveDbChapterIndex(): Promise<number | null> {
+      if (typeof result.chapterOrder !== "number") return null;
+      let chs = dbReaderChapters?.chapters;
+      // After switchBook the closure still sees the OLD dbReaderChapters; fetch
+      // fresh in that case.
+      if (needsBookSwitch || !chs) {
+        try {
+          const data = await fetchReaderChapters(targetSlug || currentBookSlug);
+          chs = data.chapters;
+        } catch {
+          chs = undefined;
+        }
+      }
+      if (chs && chs.length > 0) {
+        const idx = chs.findIndex(
+          (c) =>
+            (typeof c.rawOrder === "number" && c.rawOrder === result.chapterOrder) ||
+            c.label === result.chapterTitle,
+        );
+        if (idx >= 0) return idx;
+      }
+      return result.chapterOrder;
+    }
+
     // 同本书：手动触发章节加载（跨书时 switchBook 已处理 EPUB；
     // DB-reader 跨书只加载了 chapter 0，目标章节 != 0 时这里补一次）
     if (targetBook?.hasEpub === false && typeof result.chapterOrder === "number") {
-      requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
+      const arrayIndex = await resolveDbChapterIndex();
+      if (typeof arrayIndex === "number") {
+        requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
+      }
     } else if (result.chapterHref && !needsBookSwitch) {
       void openLocation(result.chapterHref);
     } else if (typeof result.chapterOrder === "number") {
-      requestAnimationFrame(() => { void loadDbReaderChapter(result.chapterOrder!); });
+      const arrayIndex = await resolveDbChapterIndex();
+      if (typeof arrayIndex === "number") {
+        requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
+      }
     }
 
     // 兜底：当跳转目标是同书同章节（state deps 不变），effect 不会再 fire，
@@ -4213,7 +4229,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.2.1</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.3</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -4653,7 +4669,7 @@ function App() {
                 </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("reign")}>
                   <Calculator size={16} />
-                  <span>年号换算</span>
+                  <span>历史计算器</span>
                 </button>
                 <button type="button" className="resource-entry-button" onClick={() => setOpenResourcePanel("officials")}>
                   <Landmark size={16} />
@@ -5357,7 +5373,7 @@ function App() {
             <div className="modal-header">
               <span className="modal-title">
                 {openResourcePanel === "chronology" && "人物志"}
-                {openResourcePanel === "reign" && "年号 / 公元换算"}
+                {openResourcePanel === "reign" && "历史计算器"}
                 {openResourcePanel === "free-chat" && "AI 对话"}
                 {openResourcePanel === "familytree" && "主支三代谱系"}
                 {openResourcePanel === "officials" && "职官/世系"}
@@ -5821,28 +5837,8 @@ function App() {
             })()}
 
             {openResourcePanel === "reign" && (
-              <div className="stack-gap">
-                <input
-                  className="text-input"
-                  value={reignDraft}
-                  onChange={(event) => setReignDraft(event.target.value)}
-                  placeholder="如 弘治三年 / 公元1490年 / 1490"
-                />
-                <div className="inline-actions">
-                  <button type="button" className="primary-button" onClick={() => void handleReignConvert()} disabled={reignLoading || !reignDraft.trim()}>
-                    {reignLoading ? "换算中…" : "立即换算"}
-                  </button>
-                </div>
-                {reignResult && (
-                  <div className="detail-grid">
-                    <div className="detail-item">
-                      <strong>结果</strong>
-                      <span>{reignResult.reignLabel ? `${reignResult.reignLabel} ⇄ 公元${reignResult.gregorian}年` : `${reignResult.label} ⇄ ${reignResult.reign} ${reignResult.year} 年`}</span>
-                    </div>
-                    <div className="detail-item"><strong>皇帝</strong><span>{reignResult.emperor}</span></div>
-                    <div className="detail-item"><strong>说明</strong><span>{reignResult.note}</span></div>
-                  </div>
-                )}
+              <div className="calc-modal-body">
+                <HistoricalCalculator />
               </div>
             )}
 
@@ -5868,38 +5864,8 @@ function App() {
                 </div>
 
                 {officialsTab === "lineage" && (
-                  <div className="dynasty-tree-container">
-                    {selectedTreeEmperor ? (
-                      <div className="emperor-detail-card">
-                        <button type="button" className="ghost-button compact-button" onClick={() => setSelectedTreeEmperor(null)}>
-                          &larr; 返回世系图
-                        </button>
-                        <h3>{selectedTreeEmperor.seq ? `(${selectedTreeEmperor.seq}) ` : ""}{selectedTreeEmperor.name}</h3>
-                        <div className="emperor-detail-meta">
-                          {selectedTreeEmperor.isEmperor && <span className="soft-tag emperor-tag">皇帝</span>}
-                          {selectedTreeEmperor.reign && <span className="soft-tag">在位 {selectedTreeEmperor.reign}</span>}
-                          {selectedTreeEmperor.life && <span className="soft-tag">生卒 {selectedTreeEmperor.life}</span>}
-                          <span className="soft-tag">{selectedTreeEmperor.relation}</span>
-                        </div>
-                        <p className="emperor-detail-summary">{selectedTreeEmperor.summary || "暂无简介。"}</p>
-                        {(() => {
-                          const profile = emperorsData?.list.find((entry) => entry.id === selectedTreeEmperor.id);
-                          if (!profile) return null;
-                          return (
-                            <div className="detail-grid">
-                              <div className="detail-item"><strong>庙号</strong><span>{profile.templeName}</span></div>
-                              <div className="detail-item"><strong>谥号</strong><span>{profile.posthumousTitle}</span></div>
-                              <div className="detail-item"><strong>年号</strong><span>{profile.reignTitles?.join(" / ")}</span></div>
-                              <div className="detail-item"><strong>生卒</strong><span>{profile.birthYear ?? "不详"} - {profile.deathYear ?? "不详"}</span></div>
-                              {profile.father && <div className="detail-item"><strong>父</strong><span>{profile.father}</span></div>}
-                              {profile.mother && <div className="detail-item"><strong>母</strong><span>{profile.mother}</span></div>}
-                            </div>
-                          );
-                        })()}
-                      </div>
-                    ) : (
-                      <DynastyTree node={emperorsData?.familyTree} onSelect={setSelectedTreeEmperor} />
-                    )}
+                  <div className="shixi-modal-body">
+                    <ShixiTree />
                   </div>
                 )}
 
@@ -6527,7 +6493,7 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v1.2.1（2026-05-12）— UI 收紧：勾画 5 选项合并、AI 对话面板瘦身、笔记改名「札记」、人物编年改名「人物志」；提供 Plus / Lite 两个安装包（Lite 不含 embedding，体积小一半）。詳見 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
+              <p><strong>版本：</strong>v1.3（2026-06-03）— 加了明王室世系树（368 节点）；年号换算重做成历史计算器，含年号/日期/干支换算、度量衡、时变货币汇率（宝钞/制钱/金银/米价/平价购买力）；修了搜索结果跳错章的问题。详见 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
               <p><strong>使用说明：</strong></p>
               <ul>
                 <li>首次进入软件请打开右上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
@@ -6537,8 +6503,8 @@ function App() {
               <p><strong>主要功能：</strong></p>
               <ul>
                 <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对</li>
-                <li>职官 / 世系 / 人物志 / 年号公元换算 / 古今地名地图</li>
-                <li>农历⇄公历精确换算（含干支日）；选段「识别日期」按钮自动追溯前文上下文</li>
+                <li>职官 / 明王室世系交互树（368 节点）/ 人物志 / 历史计算器（年号⇄公元 / 日期 / 干支 / 度量衡 / 时变货币汇率）/ 古今地名地图</li>
+                <li>农历⇄公历精确换算（含干支日，支持"永乐四年正月甲午"模糊检索）；选段「识别日期」按钮自动追溯前文上下文</li>
                 <li>4 套阅读主题、10 款字体（界面/正文独立可选）、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
                 <li>自定义 AI 供应商（URL + Key + 模型组）— 不同模型用不同家的 key</li>
               </ul>
@@ -6792,47 +6758,6 @@ function ApiKeyListEditor({ providers, onChange }: {
 
 
 
-
-function DynastyTree({ node, onSelect }: { node?: FamilyTreeNode | null; onSelect: (n: FamilyTreeNode) => void }) {
-  if (!node) return <div className="muted-text">加载中...</div>;
-  return (
-    <div className="dynasty-tree-scroll">
-      <div className="dt-root">
-        <DynastyTreeNode node={node} onSelect={onSelect} />
-      </div>
-    </div>
-  );
-}
-
-function DynastyTreeNode({ node, onSelect }: { node: FamilyTreeNode; onSelect: (n: FamilyTreeNode) => void }) {
-  const kids = node.children?.length ? node.children : [];
-  const label = node.seq ? `(${node.seq}) ${node.name}` : node.name;
-  const reign = node.reign || node.years || "";
-  return (
-    <div className="dt-branch">
-      <div className="dt-node-wrap">
-        <button
-          type="button"
-          className={`dt-node ${node.isEmperor ? "dt-emperor" : "dt-prince"}`}
-          onClick={() => onSelect(node)}
-        >
-          <span className="dt-label">{label}</span>
-          {reign && <span className="dt-reign">{node.isEmperor ? `在位${reign}` : reign}</span>}
-        </button>
-      </div>
-      {kids.length > 0 && (
-        <>
-          <div className="dt-vline" />
-          <div className="dt-children">
-            {kids.map((child) => (
-              <DynastyTreeNode key={child.id} node={child} onSelect={onSelect} />
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
 
 function TocNode({ item, onSelect }: { item: TocItem; onSelect: (href: string) => void }) {
   return (

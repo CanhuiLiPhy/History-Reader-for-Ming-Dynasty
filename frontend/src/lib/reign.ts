@@ -1,6 +1,6 @@
 import { Lunar } from "lunar-javascript";
 
-const MING_REIGNS = [
+export const MING_REIGNS = [
   // `aliases` lists traditional forms (and any common typographic variants)
   // that the regex should also accept; reignYearToGregorian normalizes them
   // back to the canonical simplified `reign`. The default reader scriptVariant

@@ -1,0 +1,1178 @@
+{
+  "_meta": {
+    "title": "明王室世系图 — 树状结构数据",
+    "source_image": "donotpack/database/世系.PNG",
+    "ocr_log": "donotpack/database/世系-ocr.md",
+    "schema": {
+      "name": "节点人物姓名（朱X）",
+      "title": "封号/谥号（X王/帝庙号/追封等）",
+      "seq": "在生父诸子中之序（如 1=嫡长子/长子, 2=次子, 0=之子或佚名）",
+      "rel": "与父关系（嫡长子/次子/三子/庶长子/嗣子/之子/独子等）",
+      "rank": "府内代序号（仅府主有；红框帝系单独以 emperor 字段标）",
+      "fu": "所属府国（秦/晋/燕/周/...）",
+      "emperor": "帝号（如有：太祖/惠宗/...）+年号",
+      "flags": "追封/无后/削爵/废/废为庶人/早夭等数组",
+      "fate": "末代王结局（亡于李自成/张献忠/清廷/缅甸/台湾/金门/农民军等，紫色字）",
+      "note": "图独有的绿字注（医学家/杂剧作家/十二平均律/朱镕基…）或字形待校 [?]",
+      "children": "子节点数组"
+    },
+    "_legend": {
+      "red_box": "emperor 字段（北明 16 帝 + 南明 4 帝）",
+      "purple_text": "fate 字段（末代王结局）",
+      "green_text": "note 字段（非世系趣味性注解）",
+      "[?]": "OCR/图源不清，名/号待复核"
+    }
+  },
+  "root": {
+    "name": "朱元璋",
+    "title": "明太祖",
+    "emperor": "1 明太祖 洪武",
+    "fu": "皇统",
+    "children": [
+      {
+        "name": "朱标",
+        "seq": 1,
+        "rel": "嫡长子",
+        "title": "明 懿文太子",
+        "flags": ["追封"],
+        "children": [
+          {
+            "name": "朱允炆",
+            "seq": 2,
+            "rel": "次子",
+            "title": "明惠宗",
+            "emperor": "2 明惠宗 建文"
+          }
+        ]
+      },
+      {
+        "name": "朱樉",
+        "seq": 2,
+        "rel": "次子",
+        "rank": 1, "fu": "秦",
+        "title": "1 明 秦愍王",
+        "children": [
+          {
+            "name": "朱尚炳", "rel": "嫡长子", "rank": 2, "fu": "秦", "title": "2 明 秦隐王",
+            "children": [
+              {"name": "朱志垔", "rel": "嫡长子", "rank": 3, "fu": "秦", "title": "3 明 秦僖王"},
+              {"name": "朱志均", "rel": "之子", "rank": 4, "fu": "秦", "title": "4 明 秦怀王"},
+              {
+                "name": "朱志𡐅", "rel": "之子", "rank": 5, "fu": "秦", "title": "5 明 秦康王",
+                "children": [
+                  {
+                    "name": "朱公锡", "rel": "嫡长子", "rank": 6, "fu": "秦", "title": "6 明 秦惠王",
+                    "children": [
+                      {
+                        "name": "朱诚泳", "rel": "庶长子", "rank": 7, "fu": "秦", "title": "7 明 秦简王",
+                        "children": [
+                          {"name": "朱秉欆", "rank": 8, "fu": "秦", "title": "8 明 秦昭王", "flags": ["追封"]},
+                          {
+                            "name": "朱秉𤩼", "rank": 9, "fu": "秦", "title": "9 明 秦康王（一作秦定王）",
+                            "children": [
+                              {
+                                "rank": 10, "fu": "秦", "title": "10 明 秦宣王",
+                                "children": [
+                                  {
+                                    "name": "朱敬鎔", "rel": "之子", "rank": 11, "fu": "秦", "title": "11 明 秦靖王",
+                                    "children": [
+                                      {"name": "朱谊澑", "rel": "之子", "rank": 12, "fu": "秦", "title": "12 明 秦敬王"},
+                                      {
+                                        "name": "朱谊漶", "rel": "之子", "rank": 13, "fu": "秦", "title": "13 明 秦肃王",
+                                        "children": [
+                                          {"name": "朱存机", "rel": "庶二子", "rank": 14, "fu": "秦", "title": "14 明 秦景王"},
+                                          {"name": "朱存极", "rel": "庶三子", "rank": 15, "fu": "秦", "title": "15 明 秦王", "fate": "亡于明末李自成"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "name": "朱公铭", "rel": "之子", "fu": "秦/临潼", "title": "明 临潼惠简王",
+                    "children": [
+                      {"name": "朱诚澯", "rel": "庶长子", "fu": "秦/临潼", "title": "明 临潼和悼王"},
+                      {"name": "朱诚润", "rel": "次子", "fu": "秦", "title": "明 秦惇王", "flags": ["追封"]},
+                      {"name": "朱秉柎", "fu": "秦", "title": "明 秦顺王", "flags": ["追封"], "note": "原 OCR 作'朱诚漪/秦树王'，按 txt 修订为'朱秉柎/秦顺王'（初封辅国将军）"},
+                      {"name": "朱怀埢", "rel": "之子", "fu": "秦", "title": "明 秦宣王", "flags": ["追封"], "note": "原 OCR 作'朱怀埨/秦惟王'，按 txt 修订"}
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "朱棡", "seq": 3, "rel": "三子", "rank": 1, "fu": "晋", "title": "1 明 晋恭王",
+        "children": [
+          {
+            "name": "朱济熺", "rel": "嫡长子", "rank": 2, "fu": "晋", "title": "2 明 晋定王",
+            "children": [
+              {
+                "name": "朱美圭", "rel": "之子", "rank": 4, "fu": "晋", "title": "4 明 晋宪王",
+                "children": [
+                  {
+                    "name": "朱钟铉", "rel": "庶长子", "rank": 5, "fu": "晋", "title": "5 明 晋庄王",
+                    "children": [
+                      {
+                        "name": "朱奇源", "rel": "嫡长子", "fu": "晋", "title": "明 晋靖王", "flags": ["追封"],
+                        "children": [
+                          {
+                            "name": "朱表荣", "rel": "嫡长子", "fu": "晋", "title": "明 晋怀王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱知烊", "rel": "之子", "fu": "晋", "title": "明 晋端王"}
+                            ]
+                          },
+                          {
+                            "name": "朱表槏", "rel": "嫡次子", "fu": "晋/新化", "title": "明 新化恭裕王",
+                            "children": [
+                              {
+                                "name": "朱知㸅", "rel": "嫡长子", "fu": "晋/新化", "title": "明 新化端和王",
+                                "children": [
+                                  {"name": "朱新埢", "rel": "庶长子", "fu": "晋/新化"},
+                                  {"name": "朱新墥", "rel": "庶二子", "fu": "晋/新化"}
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {"name": "朱济烺", "rel": "庶三子", "rank": 3, "fu": "晋", "title": "3 明 晋王", "flags": ["废"], "note": "实为朱济熿，待校"},
+          {
+            "rank": 7, "fu": "晋", "title": "7 明 晋简王",
+            "children": [
+              {
+                "name": "朱慎镜", "rel": "嫡长子", "rank": 8, "fu": "晋", "title": "8 明 晋敬王",
+                "children": [
+                  {"name": "朱敏游", "rel": "嫡长子", "rank": 9, "fu": "晋", "title": "9 明 晋哀王"}
+                ]
+              },
+              {
+                "name": "朱慎䥨", "rel": "嫡三子", "rank": 10, "fu": "晋", "title": "10 明 晋惠王",
+                "children": [
+                  {
+                    "name": "朱敏淳", "rel": "嫡长子", "rank": 11, "fu": "晋", "title": "11 明 晋穆王",
+                    "children": [
+                      {
+                        "name": "朱求桂", "rel": "庶长子", "rank": 12, "fu": "晋", "title": "12 明 晋裕王",
+                        "children": [
+                          {"name": "朱审烜", "rel": "嫡长子", "rank": 13, "fu": "晋", "title": "13 明 晋王", "fate": "亡于清廷"}
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "朱棣", "seq": 4, "rel": "四子", "rank": 1, "fu": "燕", "title": "1 明 燕王",
+        "emperor": "3 明成祖 永乐",
+        "children": [
+          {
+            "name": "朱高炽", "rel": "嫡长子", "emperor": "4 明仁宗 洪熙",
+            "children": [
+              {
+                "name": "朱瞻基", "rel": "嫡长子", "emperor": "5 明宣宗 宣德",
+                "children": [
+                  {
+                    "name": "朱祁镇", "rel": "长子", "emperor": "6 明英宗 正统/8 明英宗 天顺",
+                    "children": [
+                      {
+                        "name": "朱见深", "rel": "长子", "emperor": "8 明宪宗 成化",
+                        "children": [
+                          {
+                            "name": "朱祐樘", "rel": "三子", "emperor": "9 明孝宗 弘治",
+                            "children": [
+                              {"name": "朱厚照", "rel": "长子", "emperor": "10 明武宗 正德"}
+                            ]
+                          },
+                          {
+                            "name": "朱祐杬", "rel": "四子", "fu": "兴", "title": "明 兴献王 / 追封睿宗", "flags": ["追封"],
+                            "children": [
+                              {
+                                "name": "朱厚熜", "rel": "之子", "emperor": "11 明世宗 嘉靖",
+                                "children": [
+                                  {
+                                    "name": "朱载垕", "rel": "三子", "emperor": "12 明穆宗 隆庆",
+                                    "children": [
+                                      {
+                                        "name": "朱翊钧", "rel": "三子", "emperor": "13 明神宗 万历",
+                                        "children": [
+                                          {
+                                            "name": "朱常洛", "rel": "长子", "emperor": "14 明光宗 泰昌",
+                                            "children": [
+                                              {"name": "朱由校", "rel": "长子", "emperor": "15 明熹宗 天启", "note": "三子皆早殇，无后嗣"},
+                                              {
+                                                "name": "朱由检", "rel": "五子", "emperor": "16 明思宗 崇祯",
+                                                "children": [
+                                                  {"name": "朱慈烺", "rel": "嫡长子", "title": "明 献愍太子"},
+                                                  {"name": "朱慈炯", "rel": "嫡三子", "title": "南明 1 定哀王", "fate": "亡于明末李自成", "note": "即'朱三太子'"},
+                                                  {"name": "朱慈炤", "rel": "四子", "title": "南明 1 永悼王", "fate": "亡于明末李自成"}
+                                                ]
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "name": "朱常洵", "rel": "三子", "rank": 1, "fu": "福", "title": "1 明 福忠王",
+                                            "children": [
+                                              {"name": "朱由崧", "rel": "之子", "emperor": "17 南明安宗 弘光"}
+                                            ]
+                                          },
+                                          {"name": "朱常浩", "rel": "五子", "rank": 1, "fu": "瑞", "title": "1 明 瑞王", "fate": "亡于明末张献忠"},
+                                          {"name": "朱常润", "rel": "六子", "rank": 1, "fu": "惠", "title": "1 明 惠王", "fate": "亡于清廷"},
+                                          {
+                                            "name": "朱常瀛", "rel": "七子", "rank": 1, "fu": "桂", "title": "1 明 桂端王",
+                                            "children": [
+                                              {"name": "朱由榔", "rel": "之子", "emperor": "20 南明昭宗 永历"}
+                                            ]
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "name": "朱翊镠", "rel": "四子", "rank": 1, "fu": "潞", "title": "1 明 潞简王",
+                                        "children": [
+                                          {"name": "朱常涝", "rel": "三子", "fu": "潞", "title": "明 潞王、南明监国", "fate": "亡于清廷"},
+                                          {"name": "朱常淓", "rel": "嫡三子", "rank": 2, "fu": "潞", "title": "2 明 潞闵王"}
+                                        ]
+                                      }
+                                    ]
+                                  },
+                                  {"name": "朱载圳", "fu": "景", "title": "1 明 景恭王", "fate": "无后"},
+                                  {"name": "朱载珍", "fu": "戚", "title": "1 明 戚怀王", "fate": "无后", "note": "明史原作'朱载𰋁'（U+1D2C1，CJK Ext F 罕字），通用替代字'珍'"},
+                                  {"name": "朱载㙺", "fu": "蓟", "title": "1 明 蓟哀王", "fate": "无后"},
+                                  {"name": "朱载𰉬", "fu": "均", "title": "1 明 均思王", "fate": "无后"}
+                                ]
+                              }
+                            ]
+                          },
+                          {"name": "朱祐榰", "rel": "五子", "rank": 1, "fu": "岐", "title": "1 明 岐惠王", "fate": "无后"},
+                          {
+                            "name": "朱祐槟", "rel": "六子", "rank": 1, "fu": "益", "title": "1 明 益端王",
+                            "children": [
+                              {"name": "朱厚烨", "rel": "嫡长子", "rank": 2, "fu": "益", "title": "2 明 益庄王"},
+                              {
+                                "name": "朱厚炫", "rel": "次子", "rank": 3, "fu": "益", "title": "3 明 益恭王",
+                                "children": [
+                                  {
+                                    "name": "朱载增", "rank": 4, "fu": "益", "title": "明 益昭王", "flags": ["追封"],
+                                    "children": [
+                                      {
+                                        "name": "朱翊鈏", "rel": "长子", "rank": 4, "fu": "益", "title": "4 明 益宣王",
+                                        "children": [
+                                          {
+                                            "name": "朱常𰝢", "rel": "次子", "rank": 5, "fu": "益", "title": "5 明 益敬王",
+                                            "children": [
+                                              {
+                                                "name": "朱由木", "rel": "庶三子", "rank": 6, "fu": "益", "title": "6 明 益定王",
+                                                "children": [
+                                                  {"name": "朱慈炲", "rel": "嫡长子", "rank": 7, "fu": "益", "title": "7 明 益先王", "fate": "亡于明末"}
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {"name": "朱祐楎", "rel": "七子", "rank": 1, "fu": "衡", "title": "1 明 衡恭王",
+                            "children": [
+                              {"name": "朱厚㷂", "rel": "庶长子", "rank": 2, "fu": "衡", "title": "2 明 衡庄王",
+                                "children": [
+                                  {"name": "朱载圭", "rank": 3, "fu": "衡", "title": "3 明 衡康王"},
+                                  {"name": "朱载封", "rank": 4, "fu": "衡", "title": "4 明 衡安王",
+                                    "children": [
+                                      {"name": "朱翊镬", "rel": "嫡长子", "rank": 5, "fu": "衡", "title": "5 明 衡定王",
+                                        "children": [
+                                          {"name": "朱常㵾", "rel": "庶长子", "rank": 6, "fu": "衡", "title": "6 明 衡宪王",
+                                            "children": [
+                                              {"name": "朱由椒", "rel": "庶三子", "rank": 7, "fu": "衡", "title": "7 明 衡王", "fate": "亡于清廷"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {"name": "朱祐枟", "rel": "八子", "rank": 1, "fu": "雍", "title": "1 明 雍靖王", "fate": "无后"},
+                          {"name": "朱祐榰", "rel": "九子", "rank": 1, "fu": "寿", "title": "1 明 寿定王", "fate": "无后", "note": "与五子岐惠王朱祐榰同名同字"},
+                          {"name": "朱祐柠", "rel": "十一子", "rank": 1, "fu": "汝", "title": "1 明 汝安王", "fate": "无后"},
+                          {"name": "朱祐橓", "rel": "十二子", "rank": 1, "fu": "泾", "title": "1 明 泾简王", "fate": "无后"},
+                          {"name": "朱祐枢", "rel": "十三子", "rank": 1, "fu": "荣", "title": "1 明 荣庄王",
+                            "children": [
+                              {"name": "朱厚勋", "rel": "嫡长子", "fu": "荣", "title": "明 荣怀穆王", "flags": ["追封"],
+                                "children": [
+                                  {"name": "朱载墐", "rank": 2, "fu": "荣", "title": "2 明 荣恭王",
+                                    "children": [
+                                      {"name": "朱翊鉁", "rel": "嫡长子", "rank": 3, "fu": "荣", "title": "3 明 荣定王",
+                                        "children": [
+                                          {"name": "朱常溁", "rel": "嫡长子", "rank": 4, "fu": "荣", "title": "4 明 荣王",
+                                            "children": [
+                                              {"name": "朱由枵", "rel": "嫡次子", "rank": 5, "fu": "荣", "title": "5 明 荣宪王",
+                                                "children": [
+                                                  {"name": "朱慈照", "rel": "嫡长子", "rank": 6, "fu": "荣", "title": "6 明 荣王"}
+                                                ]
+                                              },
+                                              {"name": "朱由桢", "rel": "嫡五子", "rank": 7, "fu": "荣", "title": "7 明 荣王", "fate": "亡于明末"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {"name": "朱祐楷", "rel": "十四子", "rank": 1, "fu": "申", "title": "1 明 申懿王", "fate": "无后"}
+                        ]
+                      },
+                      {"name": "朱见潾", "rel": "次子", "rank": 1, "fu": "德", "title": "1 明 德庄王",
+                        "children": [
+                          {"name": "朱祐榕", "rel": "嫡次子", "rank": 2, "fu": "德", "title": "2 明 德懿王",
+                            "children": [
+                              {"name": "朱厚炖", "rel": "庶二子", "fu": "德", "title": "明 德怀王", "flags": ["追封"],
+                                "children": [
+                                  {"name": "朱载墱", "rank": 3, "fu": "德", "title": "3 明 德恭王",
+                                    "children": [
+                                      {"name": "朱翊錧", "rel": "嫡次子", "rank": 4, "fu": "德", "title": "4 明 德定王",
+                                        "children": [
+                                          {"name": "朱常𰝙", "rel": "嫡长子", "rank": 5, "fu": "德", "title": "5 明 德端王",
+                                            "children": [
+                                              {"name": "朱由枢", "rel": "庶二子", "rank": 6, "fu": "德", "title": "6 明 德王"}
+                                            ]
+                                          },
+                                          {"name": "朱常澍", "rel": "嫡三子", "fu": "德/纪城", "title": "明 纪城温裕王",
+                                            "children": [
+                                              {"name": "朱由栎", "rel": "之子", "rank": 7, "fu": "德", "title": "7 明 德王", "fate": "亡于清廷"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {"name": "朱见淳", "rel": "四子", "rank": 1, "fu": "许", "title": "1 明 许悼王", "fate": "无后"},
+                      {"name": "朱见澍", "rel": "五子", "rank": 1, "fu": "秀", "title": "1 明 秀怀王", "fate": "无后"},
+                      {"name": "朱见泽", "rel": "六子", "rank": 1, "fu": "崇", "title": "1 明 崇简王",
+                        "children": [
+                          {"name": "朱祐樒", "rel": "嫡长子", "rank": 2, "fu": "崇", "title": "2 明 崇靖王",
+                            "children": [
+                              {"name": "朱厚耀", "rel": "嫡长子", "rank": 3, "fu": "崇", "title": "3 明 崇恭王",
+                                "children": [
+                                  {"name": "朱载境", "rel": "嫡长子", "rank": 4, "fu": "崇", "title": "4 明 崇庄王",
+                                    "children": [
+                                      {"name": "朱翊金爵", "rel": "嫡长子", "rank": 5, "fu": "崇", "title": "5 明 崇端王", "note": "末字图为'⿰金爵'合字（金字旁右爵），Unicode 暂无对应",
+                                        "children": [
+                                          {"name": "朱常𰜰", "rel": "次子", "fu": "崇", "title": "明 崇昭王", "flags": ["追封"],
+                                            "children": [
+                                              {"name": "朱由樻", "rel": "庶四子", "rank": 6, "fu": "崇", "title": "6 明 崇愍王",
+                                                "children": [
+                                                  {"name": "朱慈爌", "rel": "之子", "rank": 7, "fu": "崇", "title": "7 明 崇王", "fate": "亡于清廷"}
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {"name": "朱见浚", "rel": "七子", "rank": 1, "fu": "吉", "title": "1 明 吉简王",
+                        "children": [
+                          {"name": "朱祐枎", "rel": "庶长子", "fu": "吉", "title": "明 吉悼王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱厚熼", "rel": "庶长子", "rank": 2, "fu": "吉", "title": "2 明 吉定王",
+                                "children": [
+                                  {"name": "朱载均", "rel": "庶长子", "rank": 3, "fu": "吉", "title": "3 明 吉端王",
+                                    "children": [
+                                      {"name": "朱翊銮", "rel": "之子", "rank": 4, "fu": "吉", "title": "4 明 吉宣王",
+                                        "children": [
+                                          {"name": "朱常淳", "rel": "庶长子", "fu": "吉", "title": "明 吉宪王", "flags": ["追封"],
+                                            "children": [
+                                              {"name": "朱由栋", "rel": "之子", "rank": 5, "fu": "吉", "title": "5 明 吉贞王",
+                                                "children": [
+                                                  {"name": "朱慈煃", "rel": "三子", "rank": 6, "fu": "吉", "title": "6 明 吉王", "fate": "亡于明末缅甸", "note": "图注作'秦王'，疑为'吉王'笔误"}
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {"name": "朱见治", "rel": "八子", "rank": 1, "fu": "忻", "title": "1 明 忻穆王", "fate": "无后"},
+                      {"name": "朱见沛", "rel": "九子", "rank": 1, "fu": "徽", "title": "1 明 徽庄王",
+                        "children": [
+                          {"name": "朱祐栭", "rel": "庶长子", "rank": 2, "fu": "徽", "title": "2 明 徽简王",
+                            "children": [
+                              {"name": "朱厚熚", "rel": "庶长子", "rank": 3, "fu": "徽", "title": "3 明 徽X王",
+                                "children": [
+                                  {"name": "朱载瑈", "rank": 4, "fu": "徽", "title": "4 明 徽王", "fate": "犯罪削爵"}
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {"name": "朱祁钰", "rel": "次子", "emperor": "7 明代宗 景泰"}
+                ]
+              },
+              {"name": "朱瞻埈", "rel": "次子", "rank": 1, "fu": "郑", "title": "1 明 郑靖王",
+                "children": [
+                  {"name": "朱祁锳", "rel": "嫡长子", "rank": 2, "fu": "郑", "title": "2 明 郑简王"},
+                  {"name": "朱祁鎻", "rel": "嫡四子", "fu": "郑/盟津", "title": "明 盟津庄惠王", "flags": ["追封"]},
+                  {"name": "朱祐枔", "rel": "之子", "rank": 3, "fu": "郑", "title": "3 明 郑康王",
+                    "children": [
+                      {"name": "朱祐橒", "rel": "嫡长子", "fu": "郑", "title": "明 郑懿王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱厚烷", "rel": "嫡长子", "rank": 4, "fu": "郑", "title": "4 明 郑王"}
+                        ]
+                      }
+                    ]
+                  },
+                  {"name": "朱载墐", "rank": 6, "fu": "郑", "title": "6 明 郑敬王"},
+                  {"name": "朱载堉", "fu": "郑", "title": "郑世子（让爵）", "note": "【绿字】明音乐家，创建十二平均律"},
+                  {"name": "朱翊铎", "rel": "之子", "rank": 7, "fu": "郑", "title": "7 明 郑静王",
+                    "children": [
+                      {"name": "朱常澂", "rel": "之子", "rank": 8, "fu": "郑", "title": "8 明 郑王", "fate": "亡于清廷"}
+                    ]
+                  }
+                ]
+              },
+              {"name": "朱瞻墉", "rel": "三子", "rank": 1, "fu": "越", "title": "1 明 越靖王", "fate": "无后"},
+              {"name": "朱瞻垠", "rel": "四子", "rank": 1, "fu": "蕲", "title": "1 明 蕲献王", "fate": "无后"},
+              {"name": "朱瞻墡", "rel": "五子", "rank": 1, "fu": "襄", "title": "1 明 襄宪王",
+                "children": [
+                  {"name": "朱祁镛", "rel": "嫡长子", "rank": 2, "fu": "襄", "title": "2 明 襄定王",
+                    "children": [
+                      {"name": "朱见淑", "rel": "庶三子", "rank": 3, "fu": "襄", "title": "3 明 襄简王",
+                        "children": [
+                          {"name": "朱祐材", "rel": "嫡长子", "rank": 4, "fu": "襄", "title": "4 明 襄怀王"},
+                          {"name": "朱祐櫍", "rel": "庶二子", "rank": 5, "fu": "襄", "title": "5 明 襄惠王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱厚熲", "rel": "庶长子", "rank": 6, "fu": "襄", "title": "6 明 襄端王",
+                                "children": [
+                                  {"name": "朱载尧", "rank": 7, "fu": "襄", "title": "7 明 襄敬王",
+                                    "children": [
+                                      {"name": "朱翊铭", "rel": "庶长子", "rank": 8, "fu": "襄", "title": "8 明 襄忠王",
+                                        "children": [
+                                          {"name": "朱常澄", "rel": "嫡次子", "rank": 9, "fu": "襄", "title": "9 明 襄王", "fate": "亡于明末"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {"name": "朱瞻堈", "rel": "六子", "rank": 1, "fu": "荆", "title": "1 明 荆宪王",
+                "children": [
+                  {"name": "朱祁镐", "rel": "嫡长子", "rank": 2, "fu": "荆", "title": "2 明 荆靖王",
+                    "children": [
+                      {"name": "朱见溥", "rel": "嫡次子", "rank": 3, "fu": "荆", "title": "3 明 荆王"},
+                      {"name": "朱祐橺", "rank": 4, "fu": "荆", "title": "4 明 荆和王"},
+                      {"name": "朱祐橝", "fu": "荆/樊山", "title": "明 樊山王", "note": "字形/支系待校"},
+                      {"name": "朱载塎", "fu": "荆", "title": "明 荆庄王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱翊钜", "rel": "嫡长子", "rank": 6, "fu": "荆", "title": "6 明 荆恭王",
+                            "children": [
+                              {"name": "朱常洁", "rel": "嫡次子", "rank": 7, "fu": "荆", "title": "7 明 荆敬王"},
+                              {"name": "朱常岙", "rel": "嫡三子", "rank": 8, "fu": "荆", "title": "8 明 荆康王",
+                                "children": [
+                                  {"name": "朱由樊", "rel": "嫡次子", "rank": 9, "fu": "荆", "title": "9 明 荆定王",
+                                    "children": [
+                                      {"name": "朱慈烟", "rel": "嫡长子", "rank": 10, "fu": "荆", "title": "10 明 荆王"},
+                                      {"name": "朱慈烆", "rel": "庶长子", "rank": 11, "fu": "荆", "title": "11 明 荆王", "fate": "亡于明末张献忠"}
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {"name": "朱瞻墺", "rel": "七子", "rank": 1, "fu": "淮", "title": "1 明 淮靖王",
+                "children": [
+                  {"name": "朱祁铨", "rel": "长子", "rank": 2, "fu": "淮", "title": "2 明 淮康王",
+                    "children": [
+                      {"name": "朱见濍", "rel": "嫡次子", "fu": "淮", "title": "明 淮怀王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱祐㮦", "rel": "次子", "rank": 4, "fu": "淮", "title": "4 明 淮庄王",
+                            "children": [
+                              {"name": "朱厚燽", "rel": "嫡长子", "rank": 5, "fu": "淮", "title": "5 明 淮宪王", "note": "原 OCR'朱厚焘'按 txt 修订",
+                                "children": [
+                                  {"name": "朱载坮", "rank": 6, "fu": "淮", "title": "6 明 淮恭王", "note": "原 OCR'朱载塏'按 txt 修订"},
+                                  {"name": "朱载坚", "rank": 7, "fu": "淮", "title": "7 明 淮顺王", "flags": ["追封"], "note": "初封建昌王，追封；原 OCR'朱载玺'按 txt 修订",
+                                    "children": [
+                                      {"name": "朱翊鉅", "rel": "之子", "rank": 8, "fu": "淮", "title": "8 明 淮王",
+                                        "children": [
+                                          {"name": "朱常清", "rel": "嫡长子", "rank": 9, "fu": "淮", "title": "9 明 淮王、南明监国",
+                                            "children": [
+                                              {"name": "朱由桂", "rel": "之子", "rank": 10, "fu": "淮", "title": "10 明 淮王", "fate": "亡于明末台湾"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {"name": "朱瞻垲", "rel": "八子", "rank": 1, "fu": "滕", "title": "1 明 滕怀王", "fate": "无后"},
+              {"name": "朱瞻垍", "rel": "九子", "rank": 1, "fu": "梁", "title": "1 明 梁庄王", "fate": "无后"},
+              {"name": "朱瞻埏", "rel": "庶子", "rank": 1, "fu": "卫", "title": "1 明 卫恭王", "fate": "无后"}
+            ]
+          },
+          {"name": "朱高煦", "rel": "嫡次子", "rank": 1, "fu": "汉", "title": "1 明 汉王", "fate": "谋反削爵"},
+          {"name": "朱高燧", "rel": "嫡三子", "rank": 1, "fu": "赵", "title": "1 明 赵简王",
+            "children": [
+              {"name": "朱瞻塙", "rel": "嫡长子", "rank": 2, "fu": "赵", "title": "2 明 赵惠王",
+                "children": [
+                  {"name": "朱祁鎡", "rel": "之子", "rank": 3, "fu": "赵", "title": "3 明 赵悼王"},
+                  {"name": "朱祁镃", "rank": 4, "fu": "赵", "title": "4 明 赵靖王",
+                    "children": [
+                      {"name": "朱见灂", "rel": "庶长子", "rank": 5, "fu": "赵", "title": "5 明 赵庄王",
+                        "children": [
+                          {"name": "朱祐棌", "rel": "庶长子", "rank": 6, "fu": "赵", "title": "6 明 赵康王", "note": "初封清流王",
+                            "children": [
+                              {"name": "朱厚煜", "rel": "庶长子", "rank": 7, "fu": "赵", "title": "7 明 赵恭王", "note": "原 OCR 序号 6/7 冲突已按 txt 修订",
+                                "children": [
+                                  {"name": "朱载培", "fu": "赵", "title": "明 赵恭王（追封）", "flags": ["追封"], "note": "初封获嘉王",
+                                    "children": [
+                                      {"name": "朱载垸", "rel": "旁支", "fu": "赵/成皋", "title": "明 成皋端穆王",
+                                        "children": [
+                                          {"name": "朱翊錝", "rel": "庶长子", "fu": "赵/成皋", "title": "明 成皋昭裕王",
+                                            "children": [
+                                              {"name": "朱常㳛", "rel": "庶长子", "fu": "赵", "title": "明 赵恪王（袭封成皋王进封）",
+                                                "children": [
+                                                  {"name": "朱由棪", "rel": "之子", "rank": 10, "fu": "赵", "title": "10 末代 明 赵王", "fate": "亡于明末"}
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      },
+                                      {"name": "朱翊锱", "fu": "赵", "title": "明 赵安王（追封）", "flags": ["追封"],
+                                        "children": [
+                                          {"name": "朱常清", "rank": 9, "fu": "赵", "title": "9 明 赵穆王",
+                                            "children": [
+                                              {"name": "朱由桂", "fu": "赵", "title": "明 赵顺王", "note": "初封寿光王",
+                                                "children": [
+                                                  {"name": "朱慈㷥", "rel": "之子", "rank": 8, "fu": "赵", "title": "8 明 赵王", "note": "图独有节点，待复核"}
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱橚", "seq": 5, "rel": "五子", "rank": 1, "fu": "周", "title": "1 明 周定王", "note": "【绿字】医学家",
+        "children": [
+          {"name": "朱有燉", "rel": "嫡长子", "rank": 2, "fu": "周", "title": "2 明 周宪王", "note": "【绿字】杂剧作家"},
+          {"name": "朱有爝", "rel": "四子", "rank": 3, "fu": "周", "title": "3 明 周惠王",
+            "children": [
+              {"name": "朱子埅", "rel": "庶长子", "rank": 4, "fu": "周", "title": "4 明 周靖王",
+                "children": [
+                  {"name": "朱同镶", "rel": "庶长子", "rank": 5, "fu": "周", "title": "5 明 周懿王"},
+                  {"name": "朱安㶇", "rel": "庶二子", "fu": "周", "title": "明 周悼王", "flags": ["追封"], "note": "原 OCR'朱安㵎'按 txt 修订",
+                    "children": [
+                      {"name": "朱睦㰂", "rel": "庶长子", "rank": 7, "fu": "周", "title": "7 明 周恭王", "note": "原 OCR'朱睦楧'按 txt 修订（朱睦楧实为南陵郡王）",
+                        "children": [
+                          {"name": "朱朝堈", "rel": "嫡长子", "rank": 8, "fu": "周", "title": "8 明 周庄王", "note": "原 OCR'朱勤熨'按 txt 修订",
+                            "children": [
+                              {"name": "朱在铤", "rel": "嫡长子", "rank": 9, "fu": "周", "title": "9 明 周敬王",
+                                "children": [
+                                  {"name": "朱肃溱", "rel": "嫡长子", "rank": 10, "fu": "周", "title": "10 明 周端王",
+                                    "children": [
+                                      {"name": "朱恭枵", "rel": "之子", "rank": 11, "fu": "周", "title": "11 明 周孝王",
+                                        "children": [
+                                          {"name": "朱绍烔", "rel": "嫡长子", "fu": "周", "title": "明 周烈王", "flags": ["追封"],
+                                            "children": [
+                                              {"name": "朱伦奎", "rel": "之子", "rank": 12, "fu": "周", "title": "12 明 周王"},
+                                              {"name": "朱伦圣", "rel": "之子", "rank": 13, "fu": "周", "title": "13 明 周王", "fate": "亡于明末台湾"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱桢", "seq": 6, "rel": "六子", "rank": 1, "fu": "楚", "title": "1 明 楚昭王",
+        "children": [
+          {"name": "朱孟烷", "rel": "三子", "rank": 2, "fu": "楚", "title": "2 明 楚庄王",
+            "children": [
+              {"name": "朱季塛", "rel": "庶长子", "fu": "楚/东安", "title": "明 东安恭定王", "flags": ["追封"], "note": "支系入嗣大宗",
+                "children": [
+                  {"name": "朱季堄", "rel": "之子", "rank": 3, "fu": "楚", "title": "3 明 楚宪王",
+                    "children": [
+                      {"name": "朱均𨱂", "rel": "之子", "rank": 5, "fu": "楚", "title": "5 明 楚靖王",
+                        "children": [
+                          {"name": "朱荣㳦", "rel": "庶长子", "rank": 6, "fu": "楚", "title": "6 明 楚端王", "note": "原 OCR'朱荣𣐌/楚怀王'按 txt 修订",
+                            "children": [
+                              {"name": "朱显榕", "rel": "嫡长子", "rank": 7, "fu": "楚", "title": "7 明 楚愍王", "note": "原 OCR 标'楚恭王'按 txt 修订",
+                                "children": [
+                                  {"name": "朱英燿", "rel": "废世子", "fu": "楚", "title": "明 楚废世子", "note": "原 OCR 标'8楚愍王'实为废世子，未袭爵"},
+                                  {"name": "朱英㷿", "rel": "之子", "rank": 8, "fu": "楚", "title": "8 明 楚恭王",
+                                    "children": [
+                                      {"name": "朱华奎", "rank": 9, "fu": "楚", "title": "9 明 楚定王", "fate": "亡于明末张献忠"}
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱榑", "seq": 7, "rel": "七子", "rank": 1, "fu": "齐", "title": "1 明 齐恭王", "fate": "谋反削爵"},
+      {"name": "朱梓", "seq": 8, "rel": "八子", "rank": 1, "fu": "潭", "title": "1 明 潭王", "fate": "无后"},
+      {"name": "朱杞", "seq": 9, "rel": "九子", "rank": 1, "fu": "赵（早夭）", "title": "1 明 赵王", "fate": "无后", "note": "早夭，与成祖子朱高燧的赵府异支"},
+      {"name": "朱檀", "seq": 10, "rel": "十子", "rank": 1, "fu": "鲁", "title": "1 明 鲁荒王",
+        "children": [
+          {"name": "朱肇辉", "rel": "长子", "rank": 2, "fu": "鲁", "title": "2 明 鲁靖王",
+            "children": [
+              {"name": "朱泰堪", "rel": "之子", "rank": 3, "fu": "鲁", "title": "3 明 鲁惠王",
+                "children": [
+                  {"name": "朱阳铸", "rel": "之子", "rank": 4, "fu": "鲁", "title": "4 明 鲁庄王",
+                    "children": [
+                      {"name": "朱当㳘", "rel": "之子", "fu": "鲁", "title": "明 鲁怀王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱健杙", "rel": "长子", "fu": "鲁", "title": "明 鲁悼王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱观㸅", "rel": "之子", "rank": 5, "fu": "鲁", "title": "5 明 鲁端王",
+                                "children": [
+                                  {"name": "朱颐坦", "rel": "之子", "rank": 6, "fu": "鲁", "title": "6 明 鲁恭王",
+                                    "children": [
+                                      {"name": "朱寿鏳", "rel": "庶六子", "rank": 7, "fu": "鲁", "title": "7 明 鲁敬王"},
+                                      {"name": "朱寿鋐", "rel": "庶七子", "rank": 8, "fu": "鲁", "title": "8 明 鲁宪王"},
+                                      {"name": "朱寿镛", "rel": "庶九子", "rank": 9, "fu": "鲁", "title": "9 明 鲁肃王",
+                                        "children": [
+                                          {"name": "朱以派", "rel": "庶三子", "rank": 10, "fu": "鲁", "title": "10 明 鲁安王"},
+                                          {"name": "朱以海", "rel": "之子", "rank": 11, "fu": "鲁", "title": "11 明 鲁王、南明监国", "fate": "亡于明末金门"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱椿", "seq": 11, "rel": "十一子", "rank": 1, "fu": "蜀", "title": "1 明 蜀献王",
+        "children": [
+          {"name": "朱悦燫", "rel": "嫡长子", "fu": "蜀", "title": "明 蜀靖王", "flags": ["追封"],
+            "children": [
+              {"name": "朱友堉", "rel": "三子", "rank": 3, "fu": "蜀", "title": "3 明 蜀靖王"},
+              {"name": "朱友坝", "rel": "庶五子", "rank": 4, "fu": "蜀", "title": "4 明 蜀和王",
+                "children": [
+                  {"name": "朱申鋘", "rel": "嫡长子", "rank": 5, "fu": "蜀", "title": "5 明 蜀定王",
+                    "children": [
+                      {"name": "朱申鉴", "rel": "嫡三子", "rank": 6, "fu": "蜀", "title": "6 明 蜀怀王",
+                        "children": [
+                          {"name": "朱宾瀚", "rel": "嫡长子", "rank": 8, "fu": "蜀", "title": "8 明 蜀昭王",
+                            "children": [
+                              {"name": "朱让栩", "rel": "嫡长子", "rank": 9, "fu": "蜀", "title": "9 明 蜀成王",
+                                "children": [
+                                  {"name": "朱承爚", "rel": "庶三子", "rank": 10, "fu": "蜀", "title": "10 明 蜀康王",
+                                    "children": [
+                                      {"name": "朱宣圻", "rel": "嫡长子", "rank": 11, "fu": "蜀", "title": "11 明 蜀端王",
+                                        "children": [
+                                          {"name": "朱奉铨", "rel": "嫡长子", "rank": 12, "fu": "蜀", "title": "12 明 蜀恭王",
+                                            "children": [
+                                              {"name": "朱至澍", "rel": "嫡长子", "rank": 13, "fu": "蜀", "title": "13 明 蜀愍王", "fate": "亡于明末张献忠"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱柏", "seq": 12, "rel": "十二子", "rank": 1, "fu": "湘", "title": "1 明 湘献王", "fate": "无后", "note": "建文削藩自焚"},
+      {"name": "朱桂", "seq": 13, "rel": "十三子", "rank": 1, "fu": "代", "title": "1 明 代简王",
+        "children": [
+          {"name": "朱逊煓", "rel": "长子", "fu": "代", "title": "明 代隐戾王", "flags": ["追封"],
+            "children": [
+              {"name": "朱仕㙻", "rel": "之子", "rank": 2, "fu": "代", "title": "2 明 代戾王",
+                "children": [
+                  {"name": "朱成𬭞", "rel": "嫡次子", "rank": 3, "fu": "代", "title": "3 明 代隐王"},
+                  {"name": "朱聪沬", "rel": "庶长子", "fu": "代", "title": "明 代恭怡王", "flags": ["追封"],
+                    "children": [
+                      {"name": "朱俊杖", "rel": "嫡四子", "rank": 4, "fu": "代", "title": "4 明 代懿王", "note": "原 OCR 谥号'奉'按 txt 修订为'懿'"},
+                      {"name": "朱充耀", "rel": "庶长子", "rank": 5, "fu": "代", "title": "5 明 代昭王",
+                        "children": [
+                          {"name": "朱廷埼", "rel": "嫡长子", "rank": 6, "fu": "代", "title": "6 明 代恭王",
+                            "children": [
+                              {"name": "朱鼐铉", "rel": "庶长子", "rank": 7, "fu": "代", "title": "7 明 代定王"},
+                              {"name": "朱鼐钧", "rel": "庶二子", "rank": 8, "fu": "代", "title": "8 明 代王",
+                                "children": [
+                                  {"name": "朱鼎渭", "rel": "庶二子", "rank": 9, "fu": "代", "title": "9 明 代康王",
+                                    "children": [
+                                      {"name": "朱彝㯟", "rel": "嫡长子", "rank": 10, "fu": "代", "title": "10 明 代裕王",
+                                        "children": [
+                                          {"name": "朱传𤇸", "rel": "嫡长子", "rank": 11, "fu": "代", "title": "11 明 代王", "fate": "亡于明末李自成"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱楧", "seq": 14, "rel": "十四子", "rank": 1, "fu": "肃", "title": "1 明 肃庄王",
+        "children": [
+          {"name": "朱赡焰", "rel": "嫡长子", "rank": 2, "fu": "肃", "title": "2 明 肃康王",
+            "children": [
+              {"name": "朱禄埤", "rel": "之子", "rank": 3, "fu": "肃", "title": "3 明 肃简王",
+                "children": [
+                  {"name": "朱贡錝", "rel": "庶长子", "rank": 4, "fu": "肃", "title": "4 明 肃恭王",
+                    "children": [
+                      {"name": "朱真淤", "rel": "嫡长子", "fu": "肃", "title": "明 肃靖王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱弼柿", "rel": "嫡四子", "fu": "肃", "title": "明 肃安王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱缙𤊟", "rel": "庶长子", "rank": 7, "fu": "肃", "title": "7 明 肃懿王",
+                                "children": [
+                                  {"rank": 6, "fu": "肃", "title": "6 明 肃怀王", "note": "排序与图相反，待复核",
+                                    "children": [
+                                      {"rank": 8, "fu": "肃", "title": "8 明 肃宪王",
+                                        "children": [
+                                          {"name": "朱识鋐", "rel": "嫡长子", "rank": 9, "fu": "肃", "title": "9 明 肃王", "fate": "亡于明末张献忠"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱植", "seq": 15, "rel": "十五子", "rank": 1, "fu": "辽", "title": "1 明 辽简王",
+        "children": [
+          {"name": "朱贵烚", "rel": "庶二子", "rank": 2, "fu": "辽", "title": "2 明 辽王", "flags": ["被废"]},
+          {"name": "朱豪㙷", "rel": "嫡长子", "fu": "辽/长阳", "title": "明 长阳昭和王", "flags": ["追封"],
+            "children": [
+              {"name": "朱恩钠", "rel": "嫡长子", "fu": "辽/长阳", "title": "明 长阳安和王", "flags": ["追封"],
+                "children": [
+                  {"name": "朱致格", "rel": "之子", "fu": "辽", "title": "明 辽庄王",
+                    "children": [
+                      {"name": "朱宪㸅", "rel": "嫡长子", "fu": "辽", "title": "明 辽愍王", "flags": ["被废"], "note": "初封句容王，后袭辽王被废，辽藩除国",
+                        "children": [
+                          {"name": "朱定埵", "rel": "嫡长子", "fu": "辽/长阳", "title": "明 长阳悼僖王", "flags": ["追封"],
+                            "children": [
+                              {"name": "朱宪烷", "rel": "嫡长子", "fu": "辽/长阳", "title": "明 长阳恭僖王", "flags": ["追封"],
+                                "children": [
+                                  {"name": "朱术雅", "rank": 9, "fu": "辽", "title": "9 南明 辽王"},
+                                  {"name": "朱术桂", "rank": 10, "fu": "辽", "title": "10 南明 辽王/宁靖王", "fate": "亡于明末台湾"}
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱㮵", "seq": 16, "rel": "十六子", "rank": 1, "fu": "庆", "title": "1 明 庆靖王",
+        "children": [
+          {"name": "朱秩煃", "rel": "嫡长子", "rank": 2, "fu": "庆", "title": "2 明 庆怀王",
+            "children": [
+              {"name": "朱邃墁", "rel": "嫡长子", "rank": 3, "fu": "庆", "title": "3 明 庆庄王",
+                "children": [
+                  {"name": "朱寘澯", "rel": "嫡次子", "rank": 4, "fu": "庆", "title": "4 明 庆恭王",
+                    "children": [
+                      {"name": "朱台浤", "rel": "庶长子", "rank": 5, "fu": "庆", "title": "5 明 庆定王",
+                        "children": [
+                          {"name": "朱鼒枋", "rel": "嫡长子", "rank": 6, "fu": "庆", "title": "6 明 庆惠王",
+                            "children": [
+                              {"name": "朱倪贵", "rel": "嫡长子", "rank": 7, "fu": "庆", "title": "7 明 庆端王",
+                                "children": [
+                                  {"rank": 9, "fu": "庆", "title": "9 明 庆宪王",
+                                    "children": [
+                                      {"name": "朱帅锌", "rel": "嫡次子", "rank": 10, "fu": "庆", "title": "10 明 庆王",
+                                        "children": [
+                                          {"name": "朱倬漼", "rel": "之子", "rank": 11, "fu": "庆", "title": "11 明 庆王", "fate": "亡于明末李自成"}
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱权", "seq": 17, "rel": "十七子", "rank": 1, "fu": "宁", "title": "1 明 宁献王",
+        "children": [
+          {"name": "朱盘烒", "rel": "嫡长子", "fu": "宁", "title": "明 宁惠王", "flags": ["追封"],
+            "children": [
+              {"name": "朱奠培", "rel": "嫡长子", "fu": "宁", "title": "明 宁靖王",
+                "children": [
+                  {"name": "朱觐钧", "rel": "庶长子", "fu": "宁", "title": "明 宁康王",
+                    "children": [
+                      {"name": "朱宸濠", "rel": "庶子", "fu": "宁", "title": "明 宁王", "fate": "谋反削爵", "note": "【绿字】正德宸濠之乱"}
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱楩", "seq": 18, "rel": "十八子", "rank": 1, "fu": "岷", "title": "1 明 岷庄王",
+        "children": [
+          {"name": "朱徽煣", "rel": "次子", "rank": 2, "fu": "岷", "title": "2 明 岷恭王",
+            "children": [
+              {"name": "朱音埑", "rel": "之子", "rank": 3, "fu": "岷", "title": "3 明 岷顺王", "note": "原 OCR'朱音垍'按 txt 修订",
+                "children": [
+                  {"name": "朱膺鉟", "rel": "嫡长子", "rank": 4, "fu": "岷", "title": "4 明 岷简王",
+                    "children": [
+                      {"name": "朱彦汰", "rel": "庶长子", "rank": 5, "fu": "岷", "title": "5 明 岷靖王",
+                        "children": [
+                          {"name": "朱誉荣", "rel": "嫡长子", "rank": 6, "fu": "岷", "title": "6 明 岷康王",
+                            "children": [
+                              {"name": "朱定耀", "rel": "庶二子", "rank": 7, "fu": "岷", "title": "7 明 岷宪王",
+                                "children": [
+                                  {"name": "朱干跬", "rel": "庶长子", "fu": "岷", "title": "明 岷靖世子", "note": "图独有节点，txt 无对应",
+                                    "children": [
+                                      {"name": "朱企铮", "rel": "嫡长子", "rank": 8, "fu": "岷", "title": "8 明 岷悼王"},
+                                      {"name": "朱企㳣", "rel": "嫡次子", "rank": 9, "fu": "岷", "title": "9 明 岷王", "fate": "亡于明末农民军",
+                                        "children": [
+                                          {"name": "朱小鲁", "fu": "岷", "note": "图独有【绿字】岷府末裔近代支系起首"},
+                                          {"name": "朱其美", "fu": "岷", "note": "【绿字】"},
+                                          {"name": "朱蒲松", "fu": "岷", "note": "【绿字】"},
+                                          {"name": "朱崇相", "fu": "岷", "note": "【绿字】"},
+                                          {"name": "朱怪泰", "fu": "岷", "note": "【绿字】"},
+                                          {"name": "朱玉堂/朱原善", "fu": "岷", "note": "【绿字】清 光禄大夫"},
+                                          {"name": "朱昌琳/朱容典", "fu": "岷", "note": "【绿字】清 长沙首富"},
+                                          {"name": "朱昌藩/朱容桂", "fu": "岷", "note": "【绿字】清",
+                                            "children": [
+                                              {"name": "朱访绪", "fu": "岷", "note": "【绿字】清 河南补用道",
+                                                "children": [
+                                                  {"name": "朱宽淑", "rel": "三子", "fu": "岷", "note": "【绿字】清 江陵县县令",
+                                                    "children": [
+                                                      {"name": "朱宽霖", "rel": "之子", "fu": "岷", "note": "【绿字】中华人民共和国",
+                                                        "children": [
+                                                          {"name": "朱镕基", "rel": "之子", "fu": "岷", "note": "【绿字】中华人民共和国 国务院总理"},
+                                                          {"name": "朱云来", "fu": "岷", "note": "【绿字】中国国际金融有限公司CEO"}
+                                                        ]
+                                                      }
+                                                    ]
+                                                  }
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱橞", "seq": 19, "rel": "十九子", "rank": 1, "fu": "谷", "title": "1 明 谷王", "fate": "谋反削爵"},
+      {"name": "朱松", "seq": 20, "rel": "二十子", "rank": 1, "fu": "韩", "title": "1 明 韩宪王",
+        "children": [
+          {"name": "朱冲𤊨", "rel": "嫡长子", "rank": 2, "fu": "韩", "title": "2 明 韩恭王",
+            "children": [
+              {"name": "朱范圯", "rel": "庶长子", "rank": 3, "fu": "韩", "title": "3 明 韩怀王"},
+              {"name": "朱范堮", "rel": "庶二子", "rank": 4, "fu": "韩", "title": "4 明 韩靖王",
+                "children": [
+                  {"name": "朱徵钋", "rel": "庶长子", "rank": 5, "fu": "韩", "title": "5 明 韩惠王",
+                    "children": [
+                      {"name": "朱偕㳘", "rel": "庶二子", "rank": 6, "fu": "韩", "title": "6 明 韩康王"},
+                      {"name": "朱旭㮦", "rel": "庶三子", "rank": 7, "fu": "韩", "title": "7 明 韩昭王",
+                        "children": [
+                          {"name": "朱融燧", "rel": "嫡长子", "rank": 8, "fu": "韩", "title": "8 明 韩定王",
+                            "children": [
+                              {"name": "朱谟㙻", "rel": "嫡次子", "rank": 9, "fu": "韩", "title": "9 明 韩端王",
+                                "children": [
+                                  {"name": "朱朗錡", "rel": "嫡长子", "rank": 10, "fu": "韩", "title": "10 明 韩端王",
+                                    "children": [
+                                      {"name": "朱璟浤", "rel": "嫡长子", "fu": "韩", "title": "明 韩简王", "flags": ["追封"],
+                                        "children": [
+                                          {"name": "朱逵杞", "rel": "嫡长子", "fu": "韩", "title": "明 韩庄王", "flags": ["追封"],
+                                            "children": [
+                                              {"name": "朱亶嵴", "rel": "嫡长子", "rank": 11, "fu": "韩", "title": "11 明 韩王", "fate": "亡于明末"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱模", "seq": 21, "rel": "二十一子", "rank": 1, "fu": "沈", "title": "1 明 沈简王",
+        "children": [
+          {"name": "朱佶焞", "rel": "庶长子", "rank": 2, "fu": "沈", "title": "2 明 沈康王",
+            "children": [
+              {"name": "朱幼㙾", "rel": "嫡长子", "rank": 3, "fu": "沈", "title": "3 明 沈庄王",
+                "children": [
+                  {"name": "朱诠铤", "rel": "嫡二子", "rank": 4, "fu": "沈", "title": "4 明 沈恭王",
+                    "children": [
+                      {"name": "朱诠鉌", "rel": "嫡二子", "fu": "沈", "title": "明 沈宪王", "flags": ["追封"],
+                        "children": [
+                          {"name": "朱勋瀷", "rel": "嫡长子", "rank": 5, "fu": "沈", "title": "5 明 沈宣王",
+                            "children": [
+                              {"name": "朱胤栘", "rel": "嫡次子", "fu": "沈", "title": "明 沈宪王（追封）", "flags": ["追封"], "note": "灵川王进封；原 OCR 误作'6沈定王'",
+                                "children": [
+                                  {"name": "朱恬烄", "rel": "嫡长子", "rank": 6, "fu": "沈", "title": "6 明 沈宣王", "note": "原 OCR 误作'7沈定王'",
+                                    "children": [
+                                      {"name": "朱珵尧", "rel": "嫡长子", "rank": 7, "fu": "沈", "title": "7 明 沈定王", "note": "原 OCR 漏，按 txt 补入",
+                                        "children": [
+                                          {"name": "朱效镛", "rel": "嫡长子", "rank": 8, "fu": "沈", "title": "8 明 沈裕王",
+                                            "children": [
+                                              {"name": "朱迥洪", "rel": "嫡长子", "rank": 9, "fu": "沈", "title": "9 明 沈王", "fate": "亡于明末李自成"}
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱楹", "seq": 22, "rel": "二十二子", "rank": 1, "fu": "安", "title": "1 明 安惠王", "fate": "无后"},
+      {"name": "朱桱", "seq": 23, "rel": "二十三子", "rank": 1, "fu": "唐", "title": "1 明 唐定王",
+        "children": [
+          {"name": "朱琼烃", "rel": "嫡二子", "rank": 2, "fu": "唐", "title": "2 明 唐靖王"},
+          {"name": "朱琼炟", "rel": "次子", "rank": 3, "fu": "唐", "title": "3 明 唐宪王",
+            "children": [
+              {"name": "朱芝址", "rel": "嫡二子", "rank": 4, "fu": "唐", "title": "4 明 唐庄王",
+                "children": [
+                  {"name": "朱弥铋", "rel": "庶三子", "fu": "唐", "title": "明 唐恭王", "flags": ["追封"],
+                    "children": [
+                      {"name": "朱宇温", "rel": "嫡长子", "rank": 6, "fu": "唐", "title": "6 明 唐敬王",
+                        "children": [
+                          {"name": "朱宙栐", "rel": "庶二子", "rank": 7, "fu": "唐", "title": "7 明 唐顺王",
+                            "children": [
+                              {"name": "朱硕熿", "rel": "庶长子", "rank": 8, "fu": "唐", "title": "8 明 唐端王",
+                                "children": [
+                                  {"name": "朱器墭", "rel": "庶长子", "fu": "唐", "title": "明 唐裕王", "flags": ["追封"],
+                                    "children": [
+                                      {"name": "朱聿键", "rel": "之子", "fu": "唐", "title": "南明绍宗", "emperor": "南明 绍宗 隆武"},
+                                      {"name": "朱聿镆", "rel": "之子", "rank": 9, "fu": "唐", "title": "9 明 唐愍王"},
+                                      {"name": "朱聿𨧀", "rel": "之子", "fu": "唐", "title": "南明 19 帝 绍武", "emperor": "南明 绍武"},
+                                      {"name": "朱聿锷", "rel": "之子", "rank": 10, "fu": "唐", "title": "10 明 唐王", "fate": "亡于明末尚可喜"}
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱栋", "seq": 24, "rel": "二十四子", "rank": 1, "fu": "郢", "title": "1 明 郢靖王", "fate": "无后"},
+      {"name": "朱𣚉", "seq": 25, "rel": "二十五子", "rank": 1, "fu": "伊", "title": "1 明 伊厉王",
+        "children": [
+          {"name": "朱颙炔", "rel": "长子", "rank": 2, "fu": "伊", "title": "2 明 伊简王",
+            "children": [
+              {"name": "朱勉堡", "rel": "庶长子", "fu": "伊", "title": "明 伊安王", "flags": ["追封"],
+                "children": [
+                  {"name": "朱𬤊钒", "rel": "嫡四子", "rank": 3, "fu": "伊", "title": "3 明 伊悼王",
+                    "children": [
+                      {"name": "朱訏淳", "rel": "嫡长子", "rank": 5, "fu": "伊", "title": "5 明 伊庄王",
+                        "children": [
+                          {"name": "朱典楧", "rel": "庶二子", "rank": 6, "fu": "伊", "title": "6 明 伊敬王", "fate": "违法削爵"}
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {"name": "朱楠", "seq": 26, "rel": "二十六子", "fate": "幼殇未封", "note": "未及之国"}
+    ]
+  }
+}

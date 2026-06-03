@@ -284,6 +284,31 @@ export async function fetchOfficials(): Promise<OfficialsPayload> {
   return parseJsonResponse<OfficialsPayload>(response);
 }
 
+export type ShixiNode = {
+  name?: string;
+  title?: string;
+  seq?: number;
+  rel?: string;
+  rank?: number;
+  fu?: string;
+  emperor?: string;
+  flags?: string[];
+  fate?: string;
+  note?: string;
+  children?: ShixiNode[];
+};
+
+export type ShixiPayload = {
+  _meta?: Record<string, unknown>;
+  root: ShixiNode;
+  _separate_emperor_lines?: Record<string, ShixiNode>;
+};
+
+export async function fetchShixi(): Promise<ShixiPayload> {
+  const response = await fetchWithTimeout("/api/reference/shixi");
+  return parseJsonResponse<ShixiPayload>(response);
+}
+
 export async function convertReignTerm(term: string): Promise<ReignConversionResponse> {
   const url = new URL("/api/reference/reign-convert", window.location.origin);
   url.searchParams.set("term", term);
