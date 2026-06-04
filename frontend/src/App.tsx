@@ -4229,7 +4229,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.3</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.3.1</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -6493,26 +6493,24 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v1.3（2026-06-03）— 加了明王室世系树（368 节点）；年号换算重做成历史计算器，含年号/日期/干支换算、度量衡、时变货币汇率（宝钞/制钱/金银/米价/平价购买力）；修了搜索结果跳错章的问题。详见 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
+              <p><strong>版本：</strong>v1.3.1（2026-06-03）— 明实录、四库全书本明史、东林列传、菽园杂记实现基于jiayan的自动标点。新增明王室世系树，历史计算器，含日期换算、度量衡、货币汇率；修正了关于搜索结果跳转的bug。详见 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
               <p><strong>使用说明：</strong></p>
               <ul>
-                <li>首次进入软件请打开右上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
-                <li>纯阅读 / 检索 / 字体 / 主题 / 圈点 / 笔记 / 地图本地数据 不需要 API；翻译 / 解释 / 提问 / 史料比对 / AI 编年 / AI 朗读 / AI 地名推断 需要联网调 API。</li>
-                <li>选段后会弹出操作工具栏（翻译 / 解释 / 圈点 / 高亮 / 笔记等）。左右侧栏可折叠。</li>
+                <li>首次进入软件请打开左上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
+                <li>翻译 / 解释 / 提问 / 史料比对 / AI 编年 / AI 朗读 / AI 地名推断 需要联网调 API。</li>
+                <li>选段后会弹出操作工具栏。</li>
               </ul>
               <p><strong>主要功能：</strong></p>
               <ul>
-                <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对</li>
-                <li>职官 / 明王室世系交互树（368 节点）/ 人物志 / 历史计算器（年号⇄公元 / 日期 / 干支 / 度量衡 / 时变货币汇率）/ 古今地名地图</li>
-                <li>农历⇄公历精确换算（含干支日，支持"永乐四年正月甲午"模糊检索）；选段「识别日期」按钮自动追溯前文上下文</li>
-                <li>4 套阅读主题、10 款字体（界面/正文独立可选）、界面/正文简繁可选、字号字色自定义、3 色高亮 + 下划线 + 古文圈点</li>
-                <li>自定义 AI 供应商（URL + Key + 模型组）— 不同模型用不同家的 key</li>
+                <li>22 部明代史籍多书阅读（12 部带 EPUB 原典翻页 + 10 部检索类章节阅读），AI 跨书检索 + 史料交叉比对 +自动日期识别</li>
+                <li>职官 / 明王室世系交互树/ 人物志 / 历史计算器/ 古今地名地图</li>
+                <li>4 套阅读主题、10 款字体、3 色高亮 + 下划线 + 古文圈点</li>
               </ul>
               <p><strong>数据声明：</strong></p>
               <ul>
-                <li>正文/古籍文本来自互联网公开资源（Wikisource、CText 等）+ 个人整理 + 基于公开资源的 OCR 处理（PaddleOCR-VL / MinerU + Claude Sonnet 重写）。版权归原始来源所有。</li>
-                <li>历史时间线数据：《中国历史大事年表 古代及中世纪史部分》（吉林师范大学历史系，中国古代及中世纪史教研室 编）OCR 扫描版本，仅引用，原始版权归编者所有。</li>
-                <li>字体：内置 8 款中文字体许可不一，绝大多数开源（霞鹜文楷 / 汇文系列 / 京华老宋 等），方正系列（永乐大典楷体 / 瘦金 / 礼器碑）仅个人非商用授权。具体许可请查发行方原始声明。</li>
+                <li>正文/古籍文本来自互联网公开资源（Wikisource、CText 等）+ 个人整理 + 基于公开资源的 OCR 处理。版权归原始来源所有。</li>
+                <li>历史时间线数据源：《中国历史大事年表 古代及中世纪史部分》OCR 扫描版本。</li>
+                <li>字体：方正系列（永乐大典楷体 / 瘦金 / 礼器碑）仅个人非商用授权。具体许可请查发行方原始声明。</li>
                 <li>AI 回答仅供参考。本软件仅供个人学习研究使用，不得用于商业用途。</li>
               </ul>
             </div>

@@ -63,3 +63,7 @@ Thumbs.db
 npm-debug.log*
 .claude/
 
+
+# === Python 缓存 ===
+__pycache__/
+*.pyc
