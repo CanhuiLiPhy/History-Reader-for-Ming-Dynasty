@@ -74,3 +74,14 @@ export function translateAnchor(slug, anchor) {
   if (!map || map.size === 0) return anchor;
   return map.get(anchor) || anchor;
 }
+
+/** Extract the `#fragment` part of an anchor href, e.g.
+ *  "OEBPS/text00017.html#filepos0003788693" -> "filepos0003788693".
+ *  Returns "" if no fragment.
+ *  Frontend uses this to scroll to the exact paragraph element by ID after
+ *  rendition.display() lands on the chapter file. */
+export function extractAnchorFragment(anchor) {
+  if (!anchor) return "";
+  const i = anchor.indexOf("#");
+  return i >= 0 ? anchor.slice(i + 1) : "";
+}
