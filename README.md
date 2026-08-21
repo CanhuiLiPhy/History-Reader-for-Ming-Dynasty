@@ -2,6 +2,17 @@
 
 一个本地的明史阅读工具。包含《明史》等二十多部明代史籍资料，以及时间线、地名，官职等数据库，以及基于大语言模型的辅助阅读系统。
 
+## v1.3.2 版本更新
+
+**资料**
+
+- 明实录全库（16 万段，含 14 帝实录 2402 卷）换上 LLM 标点：抬头空格、「」『』直接引语、《》书名号、`＜⿰X-X＞` 复合字符全部保留
+
+**修复**
+
+- 任意书任意场景下，点击搜索结果直接跳到对应段落（不再回到章节首页 / 重复点击不再跳别处）
+- DB-reader 多栏分页与 EPUB 段落锚统一一条「找元素 → scroll/CFI → flash」逻辑
+
 ## v1.3.1 版本更新
 
 **资料**
@@ -40,8 +51,8 @@
 
 到 [Releases](https://github.com/CanhuiLiPhy/Reader-Mingshi/releases) 下载对应平台：
 
-- macOS（Apple Silicon）：`明史阅读器-1.3.1-arm64.dmg`
-- Windows x64（解压即用）：`mingshi-reader-1.3.1-win.zip`
+- macOS（Apple Silicon）：`明史阅读器-1.3.2-arm64.dmg`
+- Windows x64（解压即用）：`mingshi-reader-1.3.2-win.zip`
 
 安装包**不附带任何古籍正文数据**，启动后是空库，需自行准备书源后导入（见下「自带书源」一节）。
 
