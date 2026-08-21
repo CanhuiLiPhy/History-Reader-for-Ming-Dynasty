@@ -1,0 +1,11 @@
+{
+  "id": "canhuiliphy/mingshilu-qwen-punct-p8",
+  "title": "Mingshilu Qwen Punct P8",
+  "code_file": "mingshi-qwen-punct.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["canhuiliphy/mingshilu-prechunked-p78"]
+}
