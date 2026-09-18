@@ -1,14 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import cors from "cors";
 import express from "express";
 import mime from "mime-types";
-import { FRONTEND_DIST, PORT, getPublicDefaults } from "./config/defaults.js";
+import { FRONTEND_DIST, PORT, getBuiltinAiCredentials, getPublicDefaults } from "./config/defaults.js";
 import { explainReignTerm } from "./data/reign-map.js";
 import { buildPersonChronology, getBookMeta, getContextSnippets, searchBook, searchAcrossBooks, searchFuzzy, resolveBookEpubPath, bookEpubExists, DEFAULT_BOOK_SLUG, lookupBiographicalReferences } from "./services/book-service.js";
-import { ensureAnchorMap, translateAnchor } from "./services/epub-anchor-map.js";
+import { ensureAnchorMap, translateAnchor, extractAnchorFragment } from "./services/epub-anchor-map.js";
 import { ensureSplitEpub as ensureSplitEpubForAnchor } from "./services/epub-splitter.js";
-import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, synthesizeSpeech } from "./services/ai-service.js";
+import { aiReady, expandSearchIntent, resolveAiSettings, runReaderAction, scrubSecrets, synthesizeSpeech } from "./services/ai-service.js";
 import { initializeLibrary } from "./services/library-db.js";
 import { ensureSplitEpub } from "./services/epub-splitter.js";
 import { getReadableBooks, getReaderChapters, getReaderChapter } from "./services/library-reader.js";
@@ -30,26 +33,269 @@ import {
   filterRelevantReferences
 } from "./services/reference-service.js";
 import { searchByEmbedding, isAvailable as embeddingAvailable } from "./services/embedding-service.js";
+import { ROLES, getSiteContent, initializeAuth } from "./auth/auth-db.js";
+import { attachUser, requireAuth, requireRole } from "./auth/middleware.js";
+import { createAuthRouter } from "./auth/auth-routes.js";
+import { createAdminRouter } from "./auth/admin-routes.js";
+import { createAuthPagesRouter } from "./auth/pages.js";
+import { createUserRouter } from "./auth/user-routes.js";
+import { getUserAiCredentials } from "./auth/user-state.js";
+import { getStagingChapter, getStagingChapters, isStagingSlug, listStagingBooks } from "./services/staging-library.js";
 
 const app = express();
+
+// Behind nginx: trust the single reverse-proxy hop so req.ip / req.secure
+// reflect the real client rather than 127.0.0.1.
+app.set("trust proxy", 1);
 
 app.use(cors());
 app.use(express.json({ limit: "4mb" }));
 
-// Disable caching for all responses during development
-app.use((_req, res, next) => {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
+// Cache policy.
+//   /api/*    — never cached: responses are per-user and change constantly.
+//   *.epub    — exempt. These are immutable book blobs of 5–24 MB each; under
+//               blanket no-store every reload and every book switch re-fetched
+//               the whole file (明史 4.9 MB, 國榷 23.5 MB), which was the single
+//               largest cause of the reader feeling slow on the web. The routes
+//               themselves set a validated long-lived policy.
+//   Static    — handled in serveFrontend().
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/") && !req.path.endsWith(".epub")) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  }
   next();
 });
+
+/**
+ * 中文：EPUB 书文件的缓存策略——私有缓存 1 天，之后靠 ETag 校验，命中就 304。
+ *
+ * Cache policy for book blobs.
+ *
+ * `private` because the file is only reachable by an authenticated account and
+ * must not be held by a shared proxy. One day of freshness, then revalidation:
+ * a re-imported book propagates within a day, and an unchanged one costs a
+ * 304 instead of 24 MB. `must-revalidate` keeps a stale copy from being served
+ * after expiry.
+ *
+ * Args:
+ *   res (express.Response): response to receive the header.
+ */
+function setEpubCacheHeaders(res) {
+  res.setHeader("Cache-Control", "private, max-age=86400, must-revalidate");
+  res.removeHeader("Pragma");
+  res.removeHeader("Expires");
+}
+
+// 中文：账号系统只在网站版启用；Electron 桌面版不设 MINGSHI_REQUIRE_AUTH，
+// 行为与加入账号系统之前完全一致，不会弹登录。
+//
+// The account system is opt-in via MINGSHI_REQUIRE_AUTH=1, which only the web
+// deployment's .env sets. The Electron desktop build ships the very same
+// server.js; leaving the flag unset keeps that build's behaviour byte-for-byte
+// identical to before accounts existed — no sign-in wall on a local app.
+const AUTH_ENABLED = process.env.MINGSHI_REQUIRE_AUTH === "1";
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/settings/defaults", (_req, res) => {
-  res.json(getPublicDefaults());
+/**
+ * 中文：为一次请求解析出该用什么凭证。密钥只在服务端流动，绝不经过浏览器。
+ *
+ * Resolve the credentials an individual request may use.
+ *
+ * This is the single choke point for "who is allowed to spend whose key", and
+ * the reason a distributed account can use the owner's key without ever being
+ * able to read it.
+ *
+ * Desktop build (AUTH_ENABLED false): unchanged from before accounts existed —
+ * there is no account system, the client owns its settings and passes them in.
+ *
+ * Web build: whatever credentials the client sent are **discarded**, because
+ * the client is never given any (see redactAiCredentials / redactStateCredentials).
+ * The effective key is then chosen server-side:
+ *
+ *   1. the account's own key, if it has entered one — anybody may add theirs;
+ *   2. otherwise the built-in key from the server environment, but only for
+ *      manager and admin. A visitor with no key of its own simply gets no AI.
+ *
+ * Order matters: an account's own key wins, so adding one is a real override
+ * rather than a no-op. Provider lists concatenate in the same order, and
+ * resolveProviderForModel takes the first match.
+ *
+ * Args:
+ *   req (express.Request): the live request; `req.user` supplies id and role.
+ *   clientAi (object): the `aiSettings` blob from the request body. Only its
+ *     non-credential fields (model choice, prompt, custom actions) are honoured.
+ *
+ * Returns:
+ *   object: settings ready for the AI service, credentials attached in-process.
+ */
+function resolveRequestAiSettings(req, clientAi = {}) {
+  if (!AUTH_ENABLED) return resolveAiSettings(clientAi);
+
+  const { apiKey: _k, ttsApiKey: _t, baseURL: _b, ttsBaseURL: _tb, modelProviders: _p, ...safe } = clientAi || {};
+
+  const own = req.user ? getUserAiCredentials(req.user.id) : null;
+  const role = req.user?.role;
+  const builtin = (role === ROLES.MANAGER || role === ROLES.ADMIN) ? getBuiltinAiCredentials() : null;
+
+  const effective = { ...safe };
+  // baseURL 与 apiKey 必须成对切换，混搭必然 401。
+  if (own?.apiKey) {
+    effective.apiKey = own.apiKey;
+    effective.baseURL = own.baseURL || undefined;
+  } else if (builtin?.apiKey) {
+    effective.apiKey = builtin.apiKey;
+    effective.baseURL = builtin.baseURL || undefined;
+  }
+  if (own?.ttsApiKey) {
+    effective.ttsApiKey = own.ttsApiKey;
+    effective.ttsBaseURL = own.ttsBaseURL || undefined;
+  } else if (builtin?.ttsApiKey) {
+    effective.ttsApiKey = builtin.ttsApiKey;
+    effective.ttsBaseURL = builtin.ttsBaseURL || undefined;
+  }
+  effective.modelProviders = [...(own?.modelProviders || []), ...(builtin?.modelProviders || [])];
+
+  // 顶层凭证兜底：只在「列表里加了一条」而顶层为空时，把第一条提上来。
+  //
+  // 密钥可以只存在于某条 provider 上：前端的 API Key 列表编辑器是按条管理的，
+  // 顶层 baseURL/apiKey 只是兼容老调用链的镜像字段。而 chatCompletion 在模型
+  // 名匹配不到任何 provider 时会回落到顶层那一对 —— 顶层为空就等于「有 key
+  // 却用不了」。实测确实撞到：访客加了自己的 API 后仍被判定为「没有 key」。
+  //
+  // Promote the first provider's credentials when the top-level pair is empty.
+  // A key may legitimately exist only on a provider entry — the list editor is
+  // the real interface and the top-level baseURL/apiKey are a compatibility
+  // mirror — while chatCompletion falls back to that top-level pair whenever a
+  // model matches no provider. Leaving it empty produced "no API key" for an
+  // account that had just added one.
+  if (!effective.apiKey) {
+    const first = effective.modelProviders.find((p) => String(p?.apiKey || "").trim() && p?.baseURL);
+    if (first) {
+      effective.apiKey = first.apiKey;
+      effective.baseURL = first.baseURL;
+    }
+  }
+
+  // 模型名只有相对于凭证才有意义 —— 凭证既然由服务端决定，模型就必须一起校验。
+  //
+  // 客户端会把它存着的整份 AI 设置发回来，其中的 model / modelOptions 可能是
+  // 上一套供应商留下的。凭证换成 MiniMax 之后，那些名字（deepseek-v4-pro、
+  // Doubao-Seed-2.0-mini…）会被原样拿去打 MiniMax 端点，一路 404 到重试链耗尽：
+  //   「404 The model `Doubao-Seed-2.0-mini` does not exist.
+  //     （已尝试模型：deepseek-v4-pro -> glm-4.7 -> Doubao-Seed-2.0-mini）」
+  // 而且这是**静默**的 —— 账号设置页看起来一切正常，只有调用时才炸。
+  //
+  // A model name means nothing except relative to the credentials that will
+  // serve it, so now that the server picks the credentials it must vet the
+  // model too. The client posts back its whole stored AI settings, and those
+  // may name models from a previous provider; those names were being forwarded
+  // verbatim, producing a 404 for every entry in the retry chain. Anything the
+  // effective providers cannot serve is dropped here and the server's own
+  // default takes over.
+  const servable = new Set((effective.modelProviders || []).flatMap((p) => p.models || []));
+  if (servable.size) {
+    const keep = (name) => (name && servable.has(name) ? name : undefined);
+    const filter = (list) => (Array.isArray(list) ? list.filter((m) => servable.has(m)) : []);
+    effective.model = keep(effective.model);
+    effective.smallModel = keep(effective.smallModel);
+    effective.defaultModel = keep(effective.defaultModel);
+    const options = filter(effective.modelOptions);
+    const smallOptions = filter(effective.smallModelOptions);
+    effective.modelOptions = options.length ? options : [...servable];
+    effective.smallModelOptions = smallOptions.length ? smallOptions : [...servable];
+  }
+
+  return resolveAiSettings(effective, { allowServerDefaults: false });
+}
+
+/**
+ * 中文：没有可用凭证时给一句人话，而不是让 OpenAI SDK 抛英文报错。
+ *
+ * Guard an AI route when no credential resolved to this request.
+ *
+ * Without it a visitor account hits the OpenAI client's own "The
+ * OPENAI_API_KEY environment variable is missing or empty", which says nothing
+ * about what the person should actually do.
+ *
+ * Args:
+ *   aiSettings (object): result of resolveRequestAiSettings.
+ *   res (express.Response): response to answer with 400 when unusable.
+ *
+ * Returns:
+ *   boolean: true when the request may proceed; false once a reply was sent.
+ */
+function ensureAiCredentials(aiSettings, res) {
+  // 顶层或任意一条 provider 有 key 都算可用 —— 只认顶层会把「只在列表里加了
+  // 一条 API」的账号误判为未配置。
+  // Either the top-level key or any provider entry counts: checking only the
+  // top-level rejected accounts whose key lives on a list entry.
+  const hasProviderKey = (aiSettings?.modelProviders || []).some((p) => String(p?.apiKey || "").trim());
+  if (aiSettings?.apiKey || hasProviderKey) return true;
+  res.status(400).json({
+    error: "当前账号还没有可用的 API Key。请在「设置 → AI 设置 → 自定义 API 配置」里添加一条自己的 Key 后再试。",
+  });
+  return false;
+}
+
+if (AUTH_ENABLED) {
+  // Resolve the session cookie into req.user for every request (public too).
+  app.use(attachUser);
+
+  // -------------------------------------------------------------------------
+  // Public surface: sign-in, registration, and the pages that host them.
+  // -------------------------------------------------------------------------
+  app.use("/api/auth", createAuthRouter());
+  app.use(createAuthPagesRouter());
+
+  // -------------------------------------------------------------------------
+  // Authentication gate. Every route registered after this line — including the
+  // reader's own API and the static frontend bundle — requires a signed-in,
+  // approved account.
+  // -------------------------------------------------------------------------
+  app.use(requireAuth);
+
+  // Per-account state sync: bookmarks, notes, highlights, AI settings and UI
+  // preferences all live server-side, keyed by account rather than browser.
+  app.use("/api/user", createUserRouter());
+
+  // Administration API (user management, staging library, site content).
+  app.use("/api/admin", requireRole(ROLES.MANAGER), createAdminRouter());
+} else {
+  // Desktop build: tell the frontend's storage adapter there is no account
+  // backend, so it keeps using local storage exactly as it always has.
+  app.get("/api/user/state", (_req, res) => {
+    res.json({ enabled: false, state: {} });
+  });
+}
+
+// Site content authored in the admin console, read by the reader's 关于 panel.
+// In the desktop build there is no admin console, so this answers with empty
+// entries rather than touching (and thereby creating) the account database.
+app.get("/api/site/content", (_req, res) => {
+  if (!AUTH_ENABLED) {
+    const empty = { value: "", updatedAt: null, updatedBy: "" };
+    res.json({ versionNotice: { key: "version_notice", ...empty }, readme: { key: "readme", ...empty } });
+    return;
+  }
+  res.json({
+    versionNotice: getSiteContent("version_notice"),
+    readme: getSiteContent("readme"),
+  });
+});
+
+app.get("/api/settings/defaults", (req, res) => {
+  // 内置凭证条目只对管理员可见；访客得到一份空的 provider 列表，
+  // 与 resolveRequestAiSettings 的角色门禁保持一致。
+  // The built-in credential entry is listed for managers and admins only,
+  // matching the role gate that decides who may actually spend it.
+  const role = req.user?.role;
+  const includeBuiltin = !AUTH_ENABLED || role === ROLES.MANAGER || role === ROLES.ADMIN;
+  res.json(getPublicDefaults({ includeBuiltin, redact: AUTH_ENABLED }));
 });
 
 app.get("/api/reference/overview", async (_req, res, next) => {
@@ -74,11 +320,29 @@ app.get("/api/book/meta", async (req, res, next) => {
   }
 });
 
-// New: list all readable books
+// New: list all readable books.
+// The curated corpus comes first; administrator uploads from the staging
+// library are appended so they show up in the same book list. Staged books
+// carry category "staging" and are excluded from every search path.
 app.get("/api/library/books", async (_req, res, next) => {
   try {
     const books = await getReadableBooks();
-    res.json({ books });
+    const staged = listStagingBooks().map((book) => ({
+      slug: book.slug,
+      title: book.title,
+      author: book.author || "",
+      dynasty: book.dynasty || "",
+      category: "staging",
+      description: book.description || "",
+      chapterCount: book.chapterCount,
+      paragraphCount: book.paragraphCount,
+      charCount: book.charCount,
+      hasEpub: false,
+      staging: true,
+      uploadedBy: book.uploadedBy,
+      uploadedAt: book.uploadedAt,
+    }));
+    res.json({ books: [...books, ...staged] });
   } catch (error) {
     next(error);
   }
@@ -89,6 +353,12 @@ app.get("/api/library/books/:slug/chapters", async (req, res, next) => {
   try {
     const slug = String(req.params.slug || "").trim();
     if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
+    if (isStagingSlug(slug)) {
+      const staged = getStagingChapters(slug);
+      if (!staged) { res.status(404).json({ error: "未找到该书。" }); return; }
+      res.json(staged);
+      return;
+    }
     const data = await getReaderChapters(slug);
     if (!data) { res.status(404).json({ error: "未找到该书。" }); return; }
     res.json(data);
@@ -104,6 +374,12 @@ app.get("/api/library/books/:slug/chapter/:index", async (req, res, next) => {
     const index = Number.parseInt(String(req.params.index || "0"), 10);
     if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
     if (!Number.isFinite(index) || index < 0) { res.status(400).json({ error: "章节索引无效。" }); return; }
+    if (isStagingSlug(slug)) {
+      const staged = getStagingChapter(slug, index);
+      if (!staged) { res.status(404).json({ error: "未找到该章节。" }); return; }
+      res.json(staged);
+      return;
+    }
     const data = await getReaderChapter(slug, index);
     if (!data) { res.status(404).json({ error: "未找到该章节。" }); return; }
     res.json(data);
@@ -121,21 +397,25 @@ app.get("/api/library/books/:slug/source.epub", async (req, res, next) => {
     if (!slug) { res.status(400).json({ error: "缺少 slug。" }); return; }
     if (!bookEpubExists(slug)) { res.status(404).json({ error: "该书无 EPUB 文件。" }); return; }
     const epubPath = resolveBookEpubPath(slug);
+    let servePath = epubPath;
     try {
-      const splitPath = await ensureSplitEpub(epubPath);
-      const stat = await fs.stat(splitPath);
-      res.type("application/epub+zip");
-      res.setHeader("Content-Length", stat.size);
-      const { createReadStream } = await import("node:fs");
-      createReadStream(splitPath).pipe(res);
+      servePath = await ensureSplitEpub(epubPath);
     } catch (splitError) {
       console.error("epub-splitter failed for", slug, splitError.message, "→ serving original");
-      const stat = await fs.stat(epubPath);
-      res.type("application/epub+zip");
-      res.setHeader("Content-Length", stat.size);
-      const { createReadStream } = await import("node:fs");
-      createReadStream(epubPath).pipe(res);
     }
+    setEpubCacheHeaders(res);
+    // sendFile (rather than a raw read stream) gives us ETag + Last-Modified
+    // and answers a conditional request with 304, so a revalidation costs a
+    // few hundred bytes instead of the whole book.
+    // dotfiles:"allow" is required, not cosmetic: split EPUBs live under
+    // backend/.cache/, and send()'s default dotfiles:"ignore" 404s any path
+    // containing a dot-segment.
+    res.sendFile(servePath, {
+      dotfiles: "allow",
+      headers: { "Content-Type": "application/epub+zip" },
+    }, (error) => {
+      if (error && !res.headersSent) next(error);
+    });
   } catch (error) {
     next(error);
   }
@@ -169,11 +449,7 @@ async function handleBookSearch(req, res, next) {
     if (!slugs.length && payload.slug && String(payload.slug).trim()) {
       slugs = [String(payload.slug).trim()];
     }
-    const aiSettings = resolveAiSettings(payload.aiSettings || {
-      baseURL: payload.baseURL,
-      apiKey: payload.apiKey,
-      model: payload.model
-    });
+    const aiSettings = resolveRequestAiSettings(req, payload.aiSettings || { model: payload.model });
 
     let expandedQueries = [];
     let aiExpansion = null;
@@ -252,6 +528,7 @@ async function handleBookSearch(req, res, next) {
             chapterId: String(idx),
             chapterOrder: null,
             chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
+            paragraphAnchor: extractAnchorFragment(row.anchor || ""),
             chapterTitle: row.chapter || "",
             score: typeof row._distance === "number" ? Number((-(row._distance / 100)).toFixed(3)) : 0,
             snippet: (row.content || "").slice(0, 240),
@@ -319,7 +596,8 @@ app.get("/api/book/reign-lookup", (req, res) => {
 app.post("/api/reference/lookup", async (req, res, next) => {
   try {
     const { query = "", aiSettings: clientAi1 = {} } = req.body || {};
-    const aiSettings = resolveAiSettings(clientAi1);
+    const aiSettings = resolveRequestAiSettings(req, clientAi1);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (!String(query).trim()) {
       res.status(400).json({ error: "缺少待查询词条。" });
       return;
@@ -339,7 +617,8 @@ app.post("/api/reference/compare", async (req, res, _next) => {
       res.status(400).json({ error: "缺少待比对的选段。" });
       return;
     }
-    const aiSettings = resolveAiSettings(clientAiSettings);
+    const aiSettings = resolveRequestAiSettings(req, clientAiSettings);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     // 整个 cross-compare 流程 = 4 步串行 AI 调用（关键词抽取 → 书目筛选 →
     // 候选过滤 → 最终报告），每步可能撞 timeout 走 fallback 队列。给足空间。
     // 前端 fetchWithTimeout 是 900s，这里设 850s 留 50s 给响应序列化。
@@ -370,7 +649,7 @@ app.get("/api/reference/geocode", async (req, res, next) => {
       res.status(400).json({ error: "缺少地名 q。" });
       return;
     }
-    const aiSettings = resolveAiSettings(req.query);
+    const aiSettings = resolveRequestAiSettings(req, req.query);
     res.json(await geocodePlaces(query, aiSettings));
   } catch (error) {
     next(error);
@@ -389,7 +668,7 @@ let shixiCache = null;
 app.get("/api/reference/shixi", async (_req, res, next) => {
   try {
     if (!shixiCache) {
-      const shixiPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "data/shixi.json");
+      const shixiPath = path.resolve(__dirname, "data/shixi.json");
       const raw = await fs.readFile(shixiPath, "utf8");
       shixiCache = JSON.parse(raw);
     }
@@ -421,8 +700,17 @@ app.get("/api/reference/history-timeline-categories", (_req, res) => {
 });
 
 // ===== timeline event admin (inline edit + double-click modal) =====
+// Reading the event list is open to any signed-in account; mutating the shared
+// timeline database is restricted to 管理员 and above, since these rows are
+// global state rather than per-user data.
 app.get("/api/timeline-events", (_req, res) => {
   res.json({ events: listAllTimelineEvents({ includeHidden: true }) });
+});
+
+app.use("/api/timeline-events", (req, res, next) => {
+  if (!AUTH_ENABLED) { next(); return; }
+  if (req.method === "GET" || req.method === "HEAD") { next(); return; }
+  requireRole(ROLES.MANAGER)(req, res, next);
 });
 
 app.patch("/api/timeline-events/:id", (req, res) => {
@@ -517,7 +805,8 @@ app.get("/api/reference/chapter-context", async (req, res, next) => {
 app.post("/api/ai/action", async (req, res, next) => {
   try {
     const { type, selection = "", question = "", person = "", aiSettings: clientAi2 = {}, customAction = null } = req.body || {};
-    const aiSettings = resolveAiSettings(clientAi2);
+    const aiSettings = resolveRequestAiSettings(req, clientAi2);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (type === "qa") {
       const result = await answerReadingQuestion({
         selection,
@@ -553,7 +842,8 @@ app.post("/api/ai/action", async (req, res, next) => {
 app.post("/api/ai/person-chronology", async (req, res, next) => {
   try {
     const { person = "", aiSettings: clientAi3 = {} } = req.body || {};
-    const aiSettings = resolveAiSettings(clientAi3);
+    const aiSettings = resolveRequestAiSettings(req, clientAi3);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (!person.trim()) {
       res.status(400).json({ error: "缺少人物名。" });
       return;
@@ -645,7 +935,8 @@ app.get("/api/person/biographies", async (req, res, next) => {
 app.post("/api/ai/free-conversation", async (req, res, next) => {
   try {
     const { messages = [], aiSettings: clientAi = {} } = req.body || {};
-    const aiSettings = resolveAiSettings(clientAi);
+    const aiSettings = resolveRequestAiSettings(req, clientAi);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (!Array.isArray(messages) || messages.length === 0) {
       res.status(400).json({ error: "messages 必须非空 (至少包含一条用户消息)。" });
       return;
@@ -665,7 +956,8 @@ app.post("/api/ai/person-conversation", async (req, res, next) => {
       messages = [],
       aiSettings: clientAi = {},
     } = req.body || {};
-    const aiSettings = resolveAiSettings(clientAi);
+    const aiSettings = resolveRequestAiSettings(req, clientAi);
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (!Array.isArray(messages) || messages.length === 0) {
       res.status(400).json({ error: "messages 必须非空 (至少包含一条用户消息)。" });
       return;
@@ -681,7 +973,8 @@ app.post("/api/ai/speech", async (req, res, next) => {
   try {
     const { text = "", voice = "" } = req.body || {};
     // TTS uses server-side config for model/key, but accepts client voice choice
-    const aiSettings = resolveAiSettings({});
+    const aiSettings = resolveRequestAiSettings(req, {});
+    if (!ensureAiCredentials(aiSettings, res)) return;
     if (voice) aiSettings.ttsVoice = voice;
     if (!text.trim()) {
       res.status(400).json({ error: "缺少要朗读的文本。" });
@@ -701,36 +994,61 @@ app.post("/api/ai/speech", async (req, res, next) => {
 });
 
 app.get("/book/source.epub", async (req, res, next) => {
+  const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
   try {
-    const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
     const epubPath = resolveBookEpubPath(slug);
-    const splitPath = await ensureSplitEpub(epubPath);
-    const stat = await fs.stat(splitPath);
-    res.type("application/epub+zip");
-    res.setHeader("Content-Length", stat.size);
-    const { createReadStream } = await import("node:fs");
-    createReadStream(splitPath).pipe(res);
-  } catch (error) {
-    console.error("epub-splitter failed, serving original:", error.message);
+    let servePath = epubPath;
     try {
-      const slug = String(req.query.slug || DEFAULT_BOOK_SLUG).trim() || DEFAULT_BOOK_SLUG;
-      const epubPath = resolveBookEpubPath(slug);
-      const stat = await fs.stat(epubPath);
-      res.type("application/epub+zip");
-      res.setHeader("Content-Length", stat.size);
-      const { createReadStream } = await import("node:fs");
-      createReadStream(epubPath).pipe(res);
-    } catch (fallbackError) {
-      next(fallbackError);
+      servePath = await ensureSplitEpub(epubPath);
+    } catch (splitError) {
+      console.error("epub-splitter failed, serving original:", splitError.message);
     }
+    setEpubCacheHeaders(res);
+    // dotfiles:"allow" is required, not cosmetic: split EPUBs live under
+    // backend/.cache/, and send()'s default dotfiles:"ignore" 404s any path
+    // containing a dot-segment.
+    res.sendFile(servePath, {
+      dotfiles: "allow",
+      headers: { "Content-Type": "application/epub+zip" },
+    }, (error) => {
+      if (error && !res.headersSent) next(error);
+    });
+  } catch (error) {
+    next(error);
   }
 });
 
+/**
+ * 中文：挂载编译好的前端。带哈希的静态资源长缓存，index.html 不缓存。
+ *
+ * Serve the built React frontend.
+ *
+ * Caching: hashed bundles under /assets and the (large, stable) font files
+ * get a one-year immutable lifetime, while index.html is revalidated on every
+ * load so a redeploy takes effect immediately. The fonts are 154 MB in total,
+ * which is why leaving them uncacheable is not an option on a public site.
+ *
+ * The SPA fallback is a terminal middleware rather than `app.get("*")`:
+ * Express 5 routes through path-to-regexp v8, where a bare "*" is not a valid
+ * pattern and throws at registration time.
+ */
 async function serveFrontend() {
   try {
     await fs.access(FRONTEND_DIST);
-    app.use(express.static(FRONTEND_DIST));
-    app.get("*", (_req, res) => {
+    app.use(express.static(FRONTEND_DIST, {
+      index: false,
+      maxAge: 0,
+      setHeaders(res, filePath) {
+        if (/[\\/](assets|fonts|icons)[\\/]/.test(filePath) || /-[A-Za-z0-9_-]{8,}\.(js|css)$/.test(filePath)) {
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        } else {
+          res.setHeader("Cache-Control", "no-cache");
+        }
+      },
+    }));
+    app.use((req, res, next) => {
+      if (req.method !== "GET" && req.method !== "HEAD") { next(); return; }
+      res.setHeader("Cache-Control", "no-cache");
       res.sendFile(path.join(FRONTEND_DIST, "index.html"));
     });
   } catch {
@@ -740,16 +1058,39 @@ async function serveFrontend() {
   }
 }
 
+if (AUTH_ENABLED) {
+  const authInit = initializeAuth();
+  if (authInit.seeded.length) {
+    console.log(`[auth] 已创建预置账号: ${authInit.seeded.join(", ")}（初始密码 password，首次登录须修改）`);
+  }
+  // 不再往账号里种 key：内置凭证留在服务端，按角色在请求时挂载。
+  // No credential is written into any account any more; the built-in key stays
+  // in the server environment and is attached per request by role. See
+  // resolveRequestAiSettings above.
+  console.log(`[auth] 账号库: ${authInit.dbPath}`);
+} else {
+  console.log("[auth] 未启用账号系统（桌面/本地模式）。网站版请设置 MINGSHI_REQUIRE_AUTH=1。");
+}
+
 await serveFrontend();
 await initializeLibrary();
 
 app.use((error, _req, res, _next) => {
   const status = error.status || 500;
   res.status(status).json({
-    error: error.message || "服务器内部错误"
+    // 出口脱敏：上游 401/403 的错误体可能带着 Authorization 里的 key，
+    // 自建端点的错误格式不受我们控制，所以在这里过一遍再返回。
+    // Scrub on the way out: an upstream auth failure can echo the credential,
+    // and the self-hosted endpoint's error format is not ours to trust.
+    error: scrubSecrets(error.message) || "服务器内部错误"
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Mingshi Reader backend running at http://127.0.0.1:${PORT}`);
+// Bind to loopback by default so the Node port is never directly reachable
+// from the internet — nginx terminates TLS and proxies to it. Set MINGSHI_HOST
+// to 0.0.0.0 only when running without a reverse proxy.
+const HOST = process.env.MINGSHI_HOST || "127.0.0.1";
+
+app.listen(PORT, HOST, () => {
+  console.log(`Mingshi Reader backend running at http://${HOST}:${PORT}`);
 });

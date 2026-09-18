@@ -2,6 +2,16 @@
    document AND the EPUB iframe (epub.js inherits parent stylesheets via theme
    override; we also call rendition.themes.font() which re-uses these names).
 
+   每个字体先列 WOFF2 后列 TTF：WOFF2 是无损重新封装（字形数据一模一样，
+   只是换成 Brotli 压缩的容器），网页版能省下 13%–38% 的传输量；不认 WOFF2
+   的环境会自动回落到 TTF，所以桌面版行为不变。
+
+   Each face lists WOFF2 before TTF. WOFF2 is a lossless repackaging — the
+   glyph data is identical, only the container compression differs — and saves
+   13%–38% over gzipped TTF on the web deployment, where one font file is the
+   largest thing a first-time visitor downloads. Anything that cannot read
+   WOFF2 falls through to the TTF, so the desktop build is unaffected.
+
    File names contain CJK characters and full-width parens; using them
    directly in url() works in modern browsers but we wrap each in
    double-quotes for safety. */
@@ -9,55 +19,63 @@
 /* 仿宋（匯文仿宋） */
 @font-face {
   font-family: "Huiwen Fangsong";
-  src: url("/fonts/仿宋（匯文仿宋）.ttf") format("truetype");
+  src: url("/fonts/仿宋（匯文仿宋）.woff2") format("woff2"),
+       url("/fonts/仿宋（匯文仿宋）.ttf") format("truetype");
   font-display: swap;
 }
 
 /* 漢隸（方正禮器碑） */
 @font-face {
   font-family: "Fangzheng Liqi";
-  src: url("/fonts/漢隸（方正禮器碑）.TTF") format("truetype");
+  src: url("/fonts/漢隸（方正禮器碑）.woff2") format("woff2"),
+       url("/fonts/漢隸（方正禮器碑）.TTF") format("truetype");
   font-display: swap;
 }
 
 /* 楷體（方正永樂大典） */
 @font-face {
   font-family: "Fangzheng Yongle";
-  src: url("/fonts/楷體（方正永樂大典）.TTF") format("truetype");
+  src: url("/fonts/楷體（方正永樂大典）.woff2") format("woff2"),
+       url("/fonts/楷體（方正永樂大典）.TTF") format("truetype");
   font-display: swap;
 }
 
 /* 明體（汇文明朝） */
 @font-face {
   font-family: "Huiwen Mingchao";
-  src: url("/fonts/明體（汇文明朝）.ttf") format("truetype");
+  src: url("/fonts/明體（汇文明朝）.woff2") format("woff2"),
+       url("/fonts/明體（汇文明朝）.ttf") format("truetype");
   font-display: swap;
 }
 
 /* 瘦金（方正瘦金） */
 @font-face {
   font-family: "Fangzheng Shoujin";
-  src: url("/fonts/瘦金（方正瘦金）.TTF") format("truetype");
+  src: url("/fonts/瘦金（方正瘦金）.woff2") format("woff2"),
+       url("/fonts/瘦金（方正瘦金）.TTF") format("truetype");
   font-display: swap;
 }
 
 /* 宋體（京華老宋） */
 @font-face {
   font-family: "Jinghua Laosong";
-  src: url("/fonts/宋體（京華老宋）.ttf") format("truetype");
+  src: url("/fonts/宋體（京華老宋）.woff2") format("woff2"),
+       url("/fonts/宋體（京華老宋）.ttf") format("truetype");
   font-display: swap;
 }
 
 /* 霞鹜文楷 */
 @font-face {
   font-family: "LXGW WenKai";
-  src: url("/fonts/霞鹜（霞鹜文楷）.ttf") format("truetype");
+  src: url("/fonts/霞鹜（霞鹜文楷）.woff2") format("woff2"),
+       url("/fonts/霞鹜（霞鹜文楷）.ttf") format("truetype");
   font-display: swap;
 }
 
 /* 正楷（汇文正楷） */
 @font-face {
   font-family: "Huiwen Zhengkai";
-  src: url("/fonts/正楷（汇文正楷）.ttf") format("truetype");
+  src: url("/fonts/正楷（汇文正楷）.woff2") format("woff2"),
+       url("/fonts/正楷（汇文正楷）.ttf") format("truetype");
   font-display: swap;
 }

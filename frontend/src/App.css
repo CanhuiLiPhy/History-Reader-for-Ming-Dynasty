@@ -44,7 +44,7 @@
   height: 100vh;
   max-height: 100vh;
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr) 360px;
+  grid-template-columns: 260px minmax(0, 1fr) 360px;
   gap: 1rem;
   padding: 1rem;
   overflow: hidden;
@@ -59,7 +59,7 @@
 }
 
 .app-shell.assistant-collapsed {
-  grid-template-columns: 320px minmax(0, 1fr) 0;
+  grid-template-columns: 260px minmax(0, 1fr) 0;
   gap: 1rem 0;
 }
 
@@ -176,18 +176,19 @@
 }
 
 .brand-card {
-  padding: 1.3rem 1.25rem;
+  padding: 0.75rem 1rem;
 }
 
 .brand-card h1 {
-  margin: 0.4rem 0 0.45rem;
-  font-size: 1.65rem;
+  margin: 0.2rem 0 0.3rem;
+  font-size: 1.35rem;
 }
 
 .brand-card p {
-  margin: 0 0 0.5rem;
+  margin: 0 0 0.35rem;
   color: #6e5940;
-  line-height: 1.6;
+  line-height: 1.45;
+  font-size: 0.85rem;
 }
 
 .version-badge {
@@ -1382,7 +1383,7 @@ g.reader-circle line {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 0.9rem 1.1rem;
+  padding: 0.5rem 1.1rem;
   transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.15s ease;
   overflow: hidden;
 }
@@ -1468,12 +1469,9 @@ g.reader-circle line {
   accent-color: #a56b32;
 }
 
+/* 进度条下方一行（"位置已保存"+"朗读已就绪"）默认隐藏，只露进度条 */
 .footer-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  color: #7c664f;
-  font-size: 0.86rem;
+  display: none;
 }
 
 .assistant-panel {
@@ -1801,7 +1799,23 @@ g.reader-circle line {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  /* 必须高过窄屏侧栏抽屉（z-index 40）和书目下拉（50）。
+
+     设置和资源面板的入口按钮都长在 .sidebar 里，手机上要点它们抽屉必然是
+     开着的，点完也不会自动收起。抽屉 position:fixed / z-index:40，和这里的
+     backdrop 是同一 stacking context 下的兄弟节点（.app-shell 只有
+     overflow:hidden，不产生 stacking context），原先的 30 打不过它 ——
+     抽屉宽 min(88vw,360px)，弹窗宽 min(62rem,100vw-2rem)，弹窗几乎整个
+     藏在抽屉后面。
+
+     Must outrank the narrow-screen sidebar drawer (z-index 40) and the book
+     dropdown (50). Every settings and resource dialog is opened from a button
+     inside .sidebar, so on a phone the drawer is necessarily open at that
+     moment and nothing collapses it. The drawer and this backdrop are
+     siblings in the same stacking context — .app-shell only sets
+     overflow:hidden, which does not establish one — so at z-index 30 the
+     drawer painted over the dialog and hid nearly all of it. */
+  z-index: 60;
   display: grid;
   place-items: center;
   background: rgba(29, 19, 12, 0.38);
@@ -2317,23 +2331,116 @@ g.reader-circle line {
 }
 
 @media (max-width: 1100px) {
-  .app-shell {
-    height: auto;
-    grid-template-columns: 1fr;
-    overflow: visible;
+  /* 窄屏改为「正文占满屏幕 + 侧栏浮层抽屉」。
+
+     之前是三栏竖向堆叠，展开左栏后目录列表有一万多像素高，直接把正文顶到
+     屏幕外（实测阅读工具栏落在 y=826，而视口只有 844 高），用户得往下滚很久
+     才能回到正文 —— 这就是「正文飘到屏幕外看不见」。抽屉化之后，侧栏浮在正文
+     之上，正文位置始终不动。
+
+     Narrow screens use "reader fills the viewport + side panels as overlay
+     drawers". Stacking the three columns vertically meant that opening the
+     sidebar — whose table of contents is over 15,000 px tall — pushed the
+     reader completely below the fold (its toolbar measured at y=826 in an
+     844 px viewport). Floating the panels over the reader keeps the text
+     exactly where it was.
+
+     三个 .app-shell.xxx-collapsed 变体必须一起列出：折叠态选择器特异度 0,3,0，
+     只写 .app-shell（0,1,0）会被压过 —— 而两栏默认就是折叠的。
+     All three collapsed variants must be listed: those selectors carry
+     specificity 0,3,0 and would otherwise beat a bare .app-shell (0,1,0),
+     and both side panels start collapsed. */
+  .app-shell,
+  .app-shell.sidebar-collapsed,
+  .app-shell.assistant-collapsed,
+  .app-shell.sidebar-collapsed.assistant-collapsed {
+    height: 100vh;
+    height: 100dvh;          /* dvh: 手机浏览器地址栏收放时不会裁掉底部 */
+    max-height: 100dvh;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.6rem;
+    padding: 0.6rem;
+    overflow: hidden;
   }
 
-  .reader-column {
-    min-height: auto;
-    overflow: visible;
+  /* 侧栏 = 浮层抽屉 / Side panels become overlay drawers. */
+  .sidebar,
+  .assistant-panel {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    width: min(88vw, 360px);
+    max-width: none;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.6rem;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    border-radius: 0;
+    box-shadow: 0 0 42px rgba(60, 40, 15, 0.32);
   }
 
-  .reader-host {
-    min-height: 58vh;
+  .sidebar {
+    left: 0;
+    background: var(--ui-page-bg);
   }
 
   .assistant-panel {
-    grid-template-rows: auto;
+    right: 0;
+  }
+
+  /* 折叠态本来只是 width:0 + opacity:0；抽屉化后必须真正移出，
+     否则那道阴影会留在屏幕边缘、且仍可能吃到点击。
+     The collapsed state only zeroed width and opacity; as a fixed drawer it
+     must leave the layout entirely, or its shadow lingers at the screen edge
+     and it can still swallow taps. */
+  .sidebar.is-collapsed,
+  .assistant-panel.is-collapsed {
+    display: none;
+  }
+
+  /* 抽屉打开时，藏掉对侧那个 position:fixed 的展开按钮。
+     它固定在右上角 top:1.2rem/right:0.8rem，正好压在左栏自己的「‹ 收起」
+     按钮上，两个键叠在一起点不开 —— 这就是「按键会重合」。
+     Hide the opposite fixed toggle while a drawer is open: it sits at
+     top:1.2rem/right:0.8rem, exactly on top of the sidebar's own collapse
+     button, so the two controls overlapped and neither could be tapped
+     reliably. */
+  .app-shell:not(.sidebar-collapsed) .assistant-toggle-btn,
+  .app-shell:not(.assistant-collapsed) .sidebar-toggle-btn {
+    display: none;
+  }
+
+  /* 正文列占满剩余视口，不再随侧栏移动 / Reader owns the viewport. */
+  .reader-column {
+    min-height: 0;
+    max-height: none;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .reader-host {
+    min-height: 0;
+    height: 100%;
+  }
+
+  /* 现在由抽屉本身滚动，内部不要再套一层滚动容器 */
+  .sidebar-panel {
+    overflow: visible;
+  }
+
+  .panel-scroll {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .office-table,
+  .chronology-list {
+    max-height: none;
   }
 
   .map-layout {
@@ -2342,6 +2449,35 @@ g.reader-circle line {
 
   .timeline-list {
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  }
+}
+
+/* 手机竖屏：进一步收紧留白，并让工具栏可换行不溢出。
+   Phone portrait: tighten padding and let the toolbars wrap. */
+@media (max-width: 640px) {
+  .app-shell {
+    gap: 0.6rem;
+    padding: 0.6rem;
+  }
+
+  .sidebar-panel,
+  .assistant-panel,
+  .reader-card {
+    padding: 0.75rem;
+    border-radius: 1rem;
+  }
+
+  .reader-toolbar {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+
+  .toolbar-actions {
+    flex-wrap: wrap;
+  }
+
+  .panel-scroll {
+    max-height: 60vh;
   }
 }
 

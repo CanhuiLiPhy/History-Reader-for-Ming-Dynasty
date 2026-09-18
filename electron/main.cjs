@@ -196,6 +196,9 @@ function createMainWindow() {
     webPreferences: {
       contextIsolation: true,
       sandbox: true,
+      // <webview> 用于嵌入中研院历史地名查询 — 它反 iframe / 第三方 cookie，
+      // <webview> 有独立 session 能正常保留搜索状态。
+      webviewTag: true,
     },
   });
 

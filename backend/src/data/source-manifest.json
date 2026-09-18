@@ -64,7 +64,9 @@
     "crawl": {
       "mode": "allpages",
       "allPagesPrefix": "明㑹典 (四庫全書本)/",
-      "excludeTitleParts": ["全覽"]
+      "excludeTitleParts": [
+        "全覽"
+      ]
     },
     "description": "制度与官制类资料，主要用于职官百科与制度背景。"
   },
@@ -181,7 +183,9 @@
     "crawl": {
       "mode": "allpages",
       "allPagesPrefix": "天下郡國利病書 (四部叢刊本)/",
-      "excludeTitleParts": ["冊次"]
+      "excludeTitleParts": [
+        "冊次"
+      ]
     },
     "description": "顾炎武地理政治名著，详载明代各省府州县沿革与利病，适合地名与制度考证。"
   },
@@ -196,7 +200,9 @@
     "crawl": {
       "mode": "allpages",
       "allPagesPrefix": "菽園雜記 (四庫全書本)/",
-      "excludeTitleParts": ["全覽"]
+      "excludeTitleParts": [
+        "全覽"
+      ]
     },
     "description": "陆容笔记，记明中期典章制度与人物掌故，可补《明史》志书之缺。"
   },
@@ -342,5 +348,15 @@
     "sourceType": "local-epub",
     "sourceUrl": "local://database",
     "description": "王夫之以《资治通鉴》为基础的史评，覆盖战国至五代；论史观、王霸、人君、用兵、治法等，可与明史互参。"
+  },
+  {
+    "slug": "zhuozhong-zhi",
+    "title": "酌中志",
+    "author": "刘若愚",
+    "dynasty": "明",
+    "category": "reference",
+    "sourceType": "epub",
+    "sourceUrl": "local://酌中志.epub",
+    "description": "明末宦官刘若愚所撰，记万历至崇祯间宫廷制度、内府衙门、宫内建置与魏忠贤时事，为明代宫廷史第一手材料。"
   }
 ]

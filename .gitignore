@@ -67,3 +67,8 @@ npm-debug.log*
 # === Python 缓存 ===
 __pycache__/
 *.pyc
+
+# 网站版账号库与临时书库（运行时数据，不入版本库）
+# Web deployment account DB + staging library — runtime data.
+backend/.userdata/
+_to_delete/

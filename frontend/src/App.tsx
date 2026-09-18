@@ -1,5 +1,5 @@
 import type { MouseEvent as ReactMouseEvent } from "react";
-import { startTransition, useEffect, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ePub from "epubjs";
 import L from "leaflet";
 import * as OpenCC from "opencc-js";
@@ -278,6 +278,57 @@ function storageKey(name: string) {
   return `${STORAGE_PREFIX}:${name}`;
 }
 
+/**
+ * 中文：滑动翻页的判定阈值。
+ *
+ * Thresholds for swipe-to-turn-page.
+ *
+ * 三个条件同时满足才算翻页，缺一不可：横向位移够大（排除误触）、横向明显大于
+ * 纵向（排除上下滚动）、动作够快（排除长按拖选后的缓慢移动）。
+ *
+ * A gesture must clear all three to count as a page turn: enough horizontal
+ * travel (rejects stray taps), clearly more horizontal than vertical (rejects
+ * vertical scrolling), and quick enough (rejects the slow drag of a
+ * long-press text selection).
+ */
+const SWIPE_MIN_DISTANCE = 55;      // px
+const SWIPE_HORIZONTAL_RATIO = 1.4; // |dx| must exceed |dy| * this
+const SWIPE_MAX_DURATION = 700;     // ms
+
+
+/**
+ * 中文：把选段工具栏的水平位置钳制在视口内，避免靠近左右边缘时被截掉半个。
+ *
+ * Clamp the selection toolbar's horizontal anchor so the popup stays fully on
+ * screen.
+ *
+ * The toolbar is centred on the selection via `transform: translateX(-50%)`,
+ * so an anchor closer to a viewport edge than half the toolbar's width pushes
+ * the overhanging half out of view — which is what hid the ✕ and 標記 buttons
+ * whenever text near the left margin was selected.
+ *
+ * Args:
+ *   anchorX (number): desired centre, in viewport pixels.
+ *
+ * Returns:
+ *   number: a centre guaranteed to keep a toolbar of up to SELECTION_TOOLBAR_
+ *     MAX_WIDTH fully visible, with SELECTION_TOOLBAR_MARGIN to spare. The
+ *     clamp uses the CSS max-width rather than the rendered width, since the
+ *     element is measured before it exists; erring wide keeps a narrow toolbar
+ *     slightly off-centre but never clipped.
+ */
+function clampSelectionToolbarX(anchorX: number): number {
+  const SELECTION_TOOLBAR_MAX_WIDTH = 576; // .selection-toolbar max-width: 36rem
+  const SELECTION_TOOLBAR_MARGIN = 12;
+  const viewport = window.innerWidth;
+  const usable = Math.max(0, viewport - SELECTION_TOOLBAR_MARGIN * 2);
+  const half = Math.min(SELECTION_TOOLBAR_MAX_WIDTH, usable) / 2;
+  const min = half + SELECTION_TOOLBAR_MARGIN;
+  const max = viewport - half - SELECTION_TOOLBAR_MARGIN;
+  if (max <= min) return viewport / 2;
+  return Math.min(Math.max(anchorX, min), max);
+}
+
 function formatTime(value: string) {
   return new Date(value).toLocaleString("zh-CN", {
     year: "numeric",
@@ -347,7 +398,37 @@ function mergeAiSettings(defaults: DefaultsPayload | null, persisted: AiSettings
   const persistedTtsBaseUrl =
     persisted?.ttsBaseURL && persisted.ttsBaseURL !== LEGACY_DEFAULT_BASE_URL ? persisted.ttsBaseURL : base.ttsBaseURL;
   // v1.2.1：modelProviders 是新的单一事实源。长度 0 时回落到 base 默认（带 dev env key 的两条）。
-  const finalProviders = persisted?.modelProviders?.length ? persisted.modelProviders : (base.modelProviders ?? []);
+  //
+  // 2026-08-18：改为「用户自己的 + 内置」合并，而不是二选一。
+  //
+  // 原来是 persisted.length ? persisted : base —— 账号一旦自己加过一条 API，
+  // 服务端下发的内置条目就整个消失：模型池只剩自己那几个，内置模型从下拉里
+  // 不见了，而 model 又会被 base.defaultModel 设成一个下拉里没有的值，select
+  // 直接显示空白。这与「每个模型对应一个 key」的设计相悖 —— 两套 key 本就该
+  // 并存，各自服务各自的模型。
+  //
+  // Merge the account's own entries with the server's built-in ones instead of
+  // choosing between them. The old either/or meant that adding a single API key
+  // made the built-in entry vanish: its models dropped out of the pool, the
+  // selected model was then set to a value the dropdown no longer contained,
+  // and the select rendered blank. Per-model credential routing only works if
+  // both sets are present at once.
+  //
+  // 顺序即优先级：自己的排前面，同名模型以自己的为准（与后端
+  // resolveProviderForModel 的 first-match-wins 一致）。
+  // Order is priority: own entries first, so a model both sets claim resolves
+  // to the account's own key — matching resolveProviderForModel on the server.
+  //
+  // persisted 里可能残留着上次保存进去的内置条目副本（前端把整份设置写回时
+  // 会带上），所以按 builtin 标记过滤掉，避免重复。
+  // A stale copy of the built-in entry may sit in `persisted` because the client
+  // writes its whole settings object back; filter by the flag to avoid dupes.
+  const ownProviders = (persisted?.modelProviders ?? []).filter((p) => !p.builtin);
+  const builtinProviders = (base.modelProviders ?? []).filter((p) => p.builtin);
+  const mergedProviders = [...ownProviders, ...builtinProviders];
+  const finalProviders = mergedProviders.length
+    ? mergedProviders
+    : (persisted?.modelProviders?.length ? persisted.modelProviders : (base.modelProviders ?? []));
   // modelOptions / smallModelOptions 自动从 providers 派生（所有激活模型的并集）。
   // providers 为空时（打包版首次启动 + 未持久化）回落到 base 静态列表，保证下拉不空。
   const pool = [...new Set(finalProviders.flatMap((p) => p.models))];
@@ -396,7 +477,15 @@ function App() {
   // Set by navigateToSearchResult before a search-result click triggers
   // chapter loading; consumed by the chapter-loaded effect to scroll to
   // the exact paragraph and flash-highlight it.
-  const pendingSearchNavRef = useRef<{ paragraphId: number; text: string; attempts: number } | null>(null);
+  // `anchor` 是搜索结果带回来的 EPUB 段落锚（filepos…）；EPUB 路径下优先用
+  // doc.getElementById(anchor) 精确定位，找不到再退回到 text needle。
+  const pendingSearchNavRef = useRef<{ paragraphId: number; text: string; anchor: string; attempts: number } | null>(null);
+  // 每次点搜索结果都 +1，让 useEffect 即使在同书同章重复点击时也能重 fire。
+  const [searchNavTick, setSearchNavTick] = useState(0);
+  // 搜索导航触发的 loadDbReaderChapter，要禁掉 chapter 加载完后那次 scrollLeft=0
+  // 的 reset，否则会跟 scrollToSearchTarget 算好的页位置打架（先滚到目标页又被
+  // 拉回首页）。其他调用方（TOC、上/下章）保持原 reset 行为。
+  const skipNextDbScrollResetRef = useRef(false);
   // v1.2: 标记模式撤销栈。每次打标（标记模式 / 普通工具栏的「标记」按钮）push 一条 [id...]
   // Cmd+Z / Ctrl+Z 弹一条并把这些 id 从 highlights 里删掉。
   const markUndoStackRef = useRef<string[][]>([]);
@@ -505,6 +594,41 @@ function App() {
   // 检索结果显示条数（前后端共享，覆盖默认）
   const [searchLimit, setSearchLimit] = useState<number>(50);
   const [aiSettings, setAiSettings] = useState<AiSettings>(defaultAiSettings);
+
+  // 内置条目激活的模型名集合。内置 = 服务器 .env 提供、前端不可查看也不可编辑；
+  // 有没有这一条由服务端按角色决定，所以这里只读标记，不自己判断。
+  // Models served by the server's own credentials. Whether such an entry exists
+  // at all is the server's decision (it is role-gated), so this only reads the
+  // flag rather than inferring it.
+  const builtinModels = useMemo(
+    () => new Set((aiSettings.modelProviders || []).filter((p) => p.builtin).flatMap((p) => p.models || [])),
+    [aiSettings.modelProviders]
+  );
+
+  /**
+   * 中文：模型在下拉里的显示名。内置模型去掉厂商前缀并标注（default）。
+   *
+   * Display name for a model in the selector.
+   *
+   * Built-in models are shown as "MiniMax-M2.5（default）" rather than the raw
+   * "MiniMaxAI/MiniMax-M2.5": the vendor prefix is noise for the one model a
+   * reader gets without configuring anything, and the marker tells them it
+   * needs no key of their own. Every other model keeps its exact id, because
+   * for user-supplied providers the prefix is often significant (OpenRouter
+   * routes on it) and the id is what they typed.
+   *
+   * Args:
+   *   model (string): the model id as sent to the API.
+   *
+   * Returns:
+   *   string: label for display only — the option's value stays the raw id.
+   */
+  const modelLabel = (model: string) => {
+    if (!builtinModels.has(model)) return model;
+    const short = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
+    return `${short}（default）`;
+  };
+
   const [customActions, setCustomActions] = useState<CustomAction[]>([]);
   const [highlights, setHighlights] = useState<ReaderHighlight[]>([]);
   const [notes, setNotes] = useState<ReaderNote[]>([]);
@@ -516,6 +640,15 @@ function App() {
   const [sourceViewer, setSourceViewer] = useState<{ bookTitle: string; chapter: string; highlight: string; paragraphs: string[] } | null>(null);
   const [sourceViewerLoading, setSourceViewerLoading] = useState(false);
   const [apiConfigOpen, setApiConfigOpen] = useState(false);
+
+  // 设置面板的分组弹窗。设置项原本是一条很长的列表，手机上尤其难找；
+  // 现在按主题收进各自的窗口，面板里只留入口按钮。
+  //
+  // Which settings dialog is open. The settings tab used to be one long
+  // scrolling list — hard to navigate, especially on a phone — so the controls
+  // now live in per-topic dialogs behind entry buttons.
+  const [settingsSection, setSettingsSection] =
+    useState<"ai" | "appearance" | "account" | null>(null);
   const [lastLocation, setLastLocation] = useState("");
   const [noteComposerOpen, setNoteComposerOpen] = useState(false);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
@@ -612,6 +745,135 @@ function App() {
   const [chronologyFilter, setChronologyFilter] = useState("");
   const [openResourcePanel, setOpenResourcePanel] = useState<string | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  // 站点公告：网站版由管理员在后台编辑，桌面版取不到则保持 null 不显示。
+  // Site notice authored in the web deployment's admin console. The desktop
+  // build has no such endpoint, so a failed fetch simply leaves this null and
+  // the About dialog renders exactly as before.
+  const [siteContent, setSiteContent] = useState<{
+    versionNotice: { value: string; updatedAt: string | null; updatedBy: string };
+    readme: { value: string; updatedAt: string | null; updatedBy: string };
+  } | null>(null);
+
+  // 「我的账户」：只有网站版拿得到；桌面版没有账号系统，account 保持 null，
+  // 设置面板里那一整块就不渲染。
+  //
+  // Signed-in account, fetched from /api/auth/me. The desktop build has no
+  // account system, so this stays null and the whole 我的账户 block is omitted
+  // rather than rendering controls that could not work.
+  type AccountInfo = {
+    id: number;
+    username: string;
+    displayName: string;
+    role: string;
+    roleLabel: string;
+    can: { manageUsers: boolean; manageAllUsers: boolean };
+  };
+  const [account, setAccount] = useState<AccountInfo | null>(null);
+  const [acctUsername, setAcctUsername] = useState("");
+  const [acctDisplayName, setAcctDisplayName] = useState("");
+  const [acctCurrentPw, setAcctCurrentPw] = useState("");
+  const [acctNewPw, setAcctNewPw] = useState("");
+  const [acctNewPw2, setAcctNewPw2] = useState("");
+  const [acctMsg, setAcctMsg] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [acctBusy, setAcctBusy] = useState(false);
+
+  // 用户名能不能改：访客不行，管理员及以上可以。前端只是把按钮藏起来，
+  // 真正的判定在后端 PATCH /api/auth/profile 里，绕过前端也改不了。
+  //
+  // Whether this account may rename itself. The frontend only hides the
+  // control; the decision is enforced server-side in PATCH /api/auth/profile,
+  // so bypassing the UI changes nothing.
+  const canRenameSelf = Boolean(account?.can?.manageUsers);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/api/auth/me", { headers: { Accept: "application/json" } });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (cancelled || !data?.user) return;
+        setAccount(data.user);
+        setAcctUsername(data.user.username);
+        setAcctDisplayName(data.user.displayName || "");
+      } catch {
+        // Desktop build or offline — leave the account block hidden.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  /**
+   * 中文：保存用户名 / 称呼。
+   *
+   * Persist a username and/or display-name change.
+   *
+   * Sends only the fields that actually differ, so a visitor saving just their
+   * display name never trips the server's manager-only username check.
+   */
+  const saveAccountProfile = useCallback(async () => {
+    setAcctMsg(null);
+    setAcctBusy(true);
+    try {
+      const body: Record<string, string> = {};
+      if (canRenameSelf && acctUsername.trim() && acctUsername.trim() !== account?.username) {
+        body.username = acctUsername.trim();
+        body.currentPassword = acctCurrentPw;
+      }
+      if (acctDisplayName !== (account?.displayName || "")) body.displayName = acctDisplayName;
+      if (!Object.keys(body).length) {
+        setAcctMsg({ kind: "error", text: "没有要修改的内容。" });
+        return;
+      }
+      const response = await fetch("/api/auth/profile", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `保存失败 (${response.status})`);
+      setAccount(data.user);
+      setAcctUsername(data.user.username);
+      setAcctDisplayName(data.user.displayName || "");
+      setAcctCurrentPw("");
+      setAcctMsg({ kind: "ok", text: "账户信息已更新。" });
+    } catch (error) {
+      setAcctMsg({ kind: "error", text: error instanceof Error ? error.message : "保存失败。" });
+    } finally {
+      setAcctBusy(false);
+    }
+  }, [account, acctUsername, acctDisplayName, acctCurrentPw, canRenameSelf]);
+
+  /**
+   * 中文：修改自己的密码。
+   *
+   * Change one's own password. The server revokes every other session of this
+   * account and re-issues one for the current tab, so other devices are signed
+   * out but this one keeps working.
+   */
+  const saveAccountPassword = useCallback(async () => {
+    setAcctMsg(null);
+    if (acctNewPw !== acctNewPw2) {
+      setAcctMsg({ kind: "error", text: "两次输入的新密码不一致。" });
+      return;
+    }
+    setAcctBusy(true);
+    try {
+      const response = await fetch("/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword: acctCurrentPw, newPassword: acctNewPw }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `修改失败 (${response.status})`);
+      setAcctCurrentPw(""); setAcctNewPw(""); setAcctNewPw2("");
+      setAcctMsg({ kind: "ok", text: "密码已更新，其他设备上的登录已失效。" });
+    } catch (error) {
+      setAcctMsg({ kind: "error", text: error instanceof Error ? error.message : "修改失败。" });
+    } finally {
+      setAcctBusy(false);
+    }
+  }, [acctCurrentPw, acctNewPw, acctNewPw2]);
   // Default collapsed — main reading area gets full width on launch.
   // The footer (page slider + status) follows this same flag.
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
@@ -671,6 +933,27 @@ function App() {
   const [newActionSystem, setNewActionSystem] = useState("");
   const [newActionTemplate, setNewActionTemplate] = useState("");
   const [hasLoadedLocalState, setHasLoadedLocalState] = useState(false);
+
+
+  // 打开「关于」时拉一次站点公告；桌面版没有这个接口，失败就静默跳过。
+  // Fetch the admin-authored site notice when the About dialog opens. The
+  // endpoint only exists in the web deployment; in the desktop build the
+  // request 404s and the dialog keeps its built-in content unchanged.
+  useEffect(() => {
+    if (!aboutOpen || siteContent) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/api/site/content");
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setSiteContent(data);
+      } catch {
+        // Desktop build or offline — keep the static About content.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [aboutOpen, siteContent]);
 
   useEffect(() => {
     let cancelled = false;
@@ -806,10 +1089,22 @@ function App() {
           "system-songti", "system-fangsong",
           "mingchao", "fangsong", "songti", "kaiti", "zhengkai", "xiawu", "lishu", "shoujin",
         ];
+        // 顺序很重要：先认当前合法 key，迁移表只用来兜住不认识的老 key。
+        // 反过来写会让迁移表劫持同名的当前 key —— "kaiti" 就是这样：它既是
+        // 老体系里"楷书=霞鹜文楷"的旧名，又是现体系里「楷體（方正永樂大典）」
+        // 的正式 key。旧写法先查迁移表，于是任何人在设置里选了方正永樂大典，
+        // 下次打开都会被悄悄换成霞鹜文楷（而且体积是前者的两倍）。
+        //
+        // Order matters: honour a currently-valid key first and consult the
+        // legacy table only for keys that are no longer valid. The reverse
+        // lets the legacy table hijack a live key — which is what happened to
+        // "kaiti". It is both the pre-v1.0 name for 霞鹜文楷 and the current
+        // key for 楷體（方正永樂大典）, so choosing the latter in Settings was
+        // silently rewritten to the former (twice the download) on next load.
         const migrate = (raw: string, fallback: FontKey): FontKey =>
-          fontKeyMigration[raw] ?? (validKeys.includes(raw as FontKey) ? (raw as FontKey) : fallback);
+          validKeys.includes(raw as FontKey) ? (raw as FontKey) : (fontKeyMigration[raw] ?? fallback);
         setReaderFontFamily(migrate(savedReaderFontFamily, "mingchao"));
-        setUiFontFamily(migrate(savedUiFontFamily, "zhengkai"));
+        setUiFontFamily(migrate(savedUiFontFamily, "kaiti"));
         setReaderFontSize(savedReaderFontSize);
         setReaderFontColor(savedReaderFontColor);
         setDateDisplay(savedDateDisplay);
@@ -906,17 +1201,52 @@ function App() {
     // 字体优先级：内置自有字体 → 系统等价回退 → 通用 serif/sans 兜底。
     // 10 个 key（前 2 个是系统宋体/仿宋两种回退栈，后 8 个是
     // frontend/public/fonts/fonts.css 里 @font-face 注册的内置字体）。
+    // 兜底顺序：所选内置字体 → 方正永樂大典 → 系统字体 → serif。
+    //
+    // 兜底字体按「谁真的补得上」来配，不再一律垫方正永樂大典。
+    //
+    // 2026-08-18 用 scripts/font-coverage.py 实测《明史》全书 6,728 个唯一字
+    // （繁体，阅读器默认）后重排。旧链把所有字体都兜到方正永樂大典，但它自己
+    // 只有 GB2312 档的 9,615 个汉字 —— 和另外两个方正字体缺的几乎是同一批字：
+    //
+    //     礼器碑缺 1,104 字，永樂大典能补   0 字（  0.0%）
+    //     瘦金  缺 1,163 字，永樂大典能补  66 字（  5.7%）
+    //
+    // 也就是说那一层每次冷启动多下 2.8 MB，却几乎什么都没补上。换成同风格的
+    // 匯文系（GBK 档，约 20,900 汉字）后三个都是 100%：
+    //
+    //     永樂大典 → 汇文正楷   补齐 1,248/1,248
+    //     瘦金     → 汇文仿宋   补齐 1,163/1,163
+    //     礼器碑   → 汇文正楷   补齐 1,104/1,104
+    //
+    // 反过来，匯文系和京華老宋自己就是 GBK/扩展档，对《明史》实测缺字为 0，
+    // 给它们垫内置字体是纯粹的流量浪费，所以这几条链里的内置兜底全部去掉。
+    //
+    // Fallbacks are now chosen by what each one can actually supply.
+    //
+    // Measured on 2026-08-18 against all 6,728 distinct characters in 明史
+    // (traditional, the reader's default) with scripts/font-coverage.py. The
+    // previous chain sent every face to 方正永樂大典, but that face is itself a
+    // GB2312-class font of 9,615 hanzi and is missing very nearly the same
+    // characters as the other two 方正 faces: it filled 0 of 礼器碑's 1,104 gaps
+    // and 66 of 瘦金's 1,163. It cost 2.8 MB per cold start to supply almost
+    // nothing. The 匯文 faces are GBK-class (~20,900 hanzi) and close 100% of
+    // those gaps while matching the calligraphic style.
+    //
+    // Conversely the 匯文 and 京華老宋 faces have zero measured gaps on this
+    // corpus, so a bundled fallback behind them is pure wasted bandwidth and
+    // has been removed from their chains.
     const FONT_FAMILIES: Record<FontKey, string> = {
       "system-songti":  '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
       "system-fangsong": '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", "Noto Serif SC", serif',
       mingchao: '"Huiwen Mingchao", "Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
       fangsong: '"Huiwen Fangsong", "FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", serif',
       songti: '"Jinghua Laosong", "Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
-      kaiti: '"Fangzheng Yongle", "Huiwen Zhengkai", "LXGW WenKai", "KaiTi", "STKaiti", "BiauKai", "楷体", serif',
-      zhengkai: '"Huiwen Zhengkai", "Fangzheng Yongle", "LXGW WenKai", "KaiTi", "STKaiti", serif',
-      xiawu: '"LXGW WenKai", "Huiwen Zhengkai", "Fangzheng Yongle", "KaiTi", "STKaiti", serif',
-      lishu: '"Fangzheng Liqi", "LiSu", "STLiti", "SimLi", "隶书", serif',
-      shoujin: '"Fangzheng Shoujin", "LXGW WenKai", "KaiTi", "STKaiti", serif',
+      kaiti: '"Fangzheng Yongle", "Huiwen Zhengkai", "KaiTi", "STKaiti", "BiauKai", "楷体", serif',
+      zhengkai: '"Huiwen Zhengkai", "KaiTi", "STKaiti", "楷体", serif',
+      xiawu: '"LXGW WenKai", "KaiTi", "STKaiti", "楷体", serif',
+      lishu: '"Fangzheng Liqi", "Huiwen Zhengkai", "LiSu", "STLiti", "SimLi", "隶书", serif',
+      shoujin: '"Fangzheng Shoujin", "Huiwen Fangsong", "KaiTi", "STKaiti", "楷体", serif',
     };
     const families = FONT_FAMILIES;
     const preset = presets[readerTheme];
@@ -1010,17 +1340,21 @@ function App() {
   // UI 字体（独立于正文字体）：写到 --ui-font-family CSS 变量上，App.css 里
   // body / 各面板继承。同时持久化到 localStorage 跨 session 保留。
   useEffect(() => {
+    // 与正文字体栈保持同一套兜底规则，理由见 FONT_FAMILIES 上方的注释。
+    // Same fallback rules as the reader stack; rationale documented above
+    // FONT_FAMILIES. Keep the two tables in step — a face that falls back
+    // differently in the interface than in the text reads as a bug.
     const FONT_FAMILIES_UI: Record<typeof uiFontFamily, string> = {
       "system-songti":   '"Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "宋体", serif',
       "system-fangsong": '"FangSong", "STFangsong", "FangSong_GB2312", "仿宋", "Source Han Serif SC", "Noto Serif SC", serif',
       mingchao: '"Huiwen Mingchao", "Source Han Serif SC", "Noto Serif SC", "Songti SC", serif',
       fangsong: '"Huiwen Fangsong", "FangSong", "STFangsong", "仿宋", serif',
       songti:   '"Jinghua Laosong", "Source Han Serif SC", "Songti SC", "SimSun", serif',
-      kaiti:    '"Fangzheng Yongle", "Huiwen Zhengkai", "LXGW WenKai", "KaiTi", serif',
-      zhengkai: '"Huiwen Zhengkai", "Fangzheng Yongle", "LXGW WenKai", "KaiTi", serif',
-      xiawu:    '"LXGW WenKai", "Huiwen Zhengkai", "Fangzheng Yongle", "KaiTi", serif',
-      lishu:    '"Fangzheng Liqi", "LiSu", "STLiti", "隶书", serif',
-      shoujin:  '"Fangzheng Shoujin", "LXGW WenKai", "KaiTi", serif',
+      kaiti:    '"Fangzheng Yongle", "Huiwen Zhengkai", "KaiTi", "STKaiti", "楷体", serif',
+      zhengkai: '"Huiwen Zhengkai", "KaiTi", "STKaiti", "楷体", serif',
+      xiawu:    '"LXGW WenKai", "KaiTi", "STKaiti", "楷体", serif',
+      lishu:    '"Fangzheng Liqi", "Huiwen Zhengkai", "LiSu", "STLiti", "隶书", serif',
+      shoujin:  '"Fangzheng Shoujin", "Huiwen Fangsong", "KaiTi", "STKaiti", "楷体", serif',
     };
     document.documentElement.style.setProperty("--ui-font-family", FONT_FAMILIES_UI[uiFontFamily]);
   }, [uiFontFamily]);
@@ -1522,7 +1856,8 @@ function App() {
     const belowY = rect ? rect.bottom + window.scrollY + 12 : event.clientY + 12;
     const aboveY = rect ? rect.top + window.scrollY - popupHeight - 12 : belowY;
     const top = (belowY + popupHeight < window.innerHeight + window.scrollY) ? belowY : Math.max(8, aboveY);
-    const left = rect ? rect.left + window.scrollX + (rect.width / 2) : event.clientX;
+    const rawLeft = rect ? rect.left + window.scrollX + (rect.width / 2) : event.clientX;
+    const left = clampSelectionToolbarX(rawLeft);
     setSelectionText(text);
     // Build a paragraph-anchored cfi when possible.
     //   single-paragraph: db:<slug>:<idx>:<pid>:<cstart>-<cend>            (5 parts)
@@ -1629,17 +1964,35 @@ function App() {
     }
   }
 
-  // Load a chapter for DB-reader (non-EPUB books)
+  // Load a chapter for DB-reader (non-EPUB books).
+  //
+  // Same-chapter short-circuit: if the requested index matches what's already
+  // loaded, return immediately. This avoids a subtle race where search nav
+  // re-clicks the SAME chapter, scrollToSearchTarget snaps to the target page
+  // and clears pendingSearchNavRef, THEN the rAF below would run with the ref
+  // already null and reset scrollLeft to 0 — slingshotting the view back to
+  // page 1. Caller can rely on `searchNavTick`-driven useEffect to (re)align
+  // scroll position within the existing chapter.
   async function loadDbReaderChapter(index: number) {
     if (!dbReaderChapters || index < 0 || index >= dbReaderChapters.chapters.length) return;
+    if (dbReaderChapter && dbReaderIndex === index) return;
     setDbReaderLoading(true);
     try {
       const data = await fetchReaderChapter(currentBookSlug, index);
       setDbReaderChapter(data);
       setDbReaderIndex(index);
       setDbPageIndex(0);
-      // Force scroll back to start; effect below recomputes page totals
+      // Force scroll back to start; effect below recomputes page totals.
+      // 双重例外：
+      //   (1) skipNextDbScrollResetRef = true → 当次 chapter-load 是搜索导航
+      //       触发的，不能把 scrollLeft 清掉；
+      //   (2) pendingSearchNavRef.current 仍非空（搜索导航还没消费）→ 同上。
+      // 任一命中就消费旗子并 return；其他调用方（TOC、上下章按钮）走原 reset。
       requestAnimationFrame(() => {
+        if (skipNextDbScrollResetRef.current || pendingSearchNavRef.current) {
+          skipNextDbScrollResetRef.current = false;
+          return;
+        }
         if (dbReaderHostRef.current) dbReaderHostRef.current.scrollLeft = 0;
         dbTargetPageRef.current = 0;
         dbAnchorParaRef.current = null;
@@ -1678,6 +2031,36 @@ function App() {
     }
     if (!anchor && paras.length) anchor = paras[paras.length - 1];
     dbAnchorParaRef.current = anchor?.dataset.paragraphId ?? null;
+  }
+
+  // DB-reader（无 EPUB 的书）的滑动翻页。这类书直接渲染在主文档里，不在
+  // iframe 中，所以用 React 的 onTouchStart / onTouchEnd 即可。
+  //
+  // Swipe paging for DB-reader books. Those render directly in the main
+  // document rather than an iframe, so React's own touch handlers suffice.
+  const dbTouchRef = useRef<{ x: number; y: number; t: number; count: number } | null>(null);
+
+  function onDbTouchStart(event: React.TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    if (!touch) return;
+    dbTouchRef.current = { x: touch.clientX, y: touch.clientY, t: Date.now(), count: event.touches.length };
+  }
+
+  function onDbTouchEnd(event: React.TouchEvent<HTMLDivElement>) {
+    const start = dbTouchRef.current;
+    dbTouchRef.current = null;
+    if (!start || start.count !== 1) return;
+    const touch = event.changedTouches[0];
+    if (!touch) return;
+    // 与 EPUB 侧同一套阈值和「选中时不翻页」规则，保证两类书手感一致。
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (Math.abs(dx) < SWIPE_MIN_DISTANCE) return;
+    if (Math.abs(dx) < Math.abs(dy) * SWIPE_HORIZONTAL_RATIO) return;
+    if (Date.now() - start.t > SWIPE_MAX_DURATION) return;
+    flipDbPage(dx < 0 ? 1 : -1);
   }
 
   function flipDbPage(direction: -1 | 1) {
@@ -1783,20 +2166,28 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarCollapsed, assistantCollapsed, currentBookSlug, readableBooks]);
 
-  // Consume pendingSearchNavRef after the chapter has rendered. Tries
-  // immediately, then once more after a short delay to cover the multi-
-  // column layout settle time for DB-reader and the iframe ready event
-  // for EPUB rendition.
+  // Consume pendingSearchNavRef after the chapter has rendered. searchNavTick
+  // ensures this effect fires even when the user re-clicks the same result in
+  // the same chapter (where no other dep changes). Retries with backoff to
+  // cover multi-column layout settle (DB-reader) and iframe ready (EPUB).
   useEffect(() => {
     if (!pendingSearchNavRef.current) return;
     if (scrollToSearchTarget()) return;
-    const t1 = window.setTimeout(() => { if (!scrollToSearchTarget()) {
-      const t2 = window.setTimeout(() => { scrollToSearchTarget(); }, 400);
-      (window as unknown as { __searchScrollT2?: number }).__searchScrollT2 = t2;
-    }}, 120);
-    return () => { window.clearTimeout(t1); };
+    let cancelled = false;
+    const timers: number[] = [];
+    for (const ms of [120, 280, 600, 1200, 2200]) {
+      timers.push(window.setTimeout(() => {
+        if (cancelled) return;
+        if (!pendingSearchNavRef.current) return; // already consumed
+        scrollToSearchTarget();
+      }, ms));
+    }
+    return () => {
+      cancelled = true;
+      for (const t of timers) window.clearTimeout(t);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dbReaderChapter, dbReaderIndex, readerReady, currentBookSlug]);
+  }, [dbReaderChapter, dbReaderIndex, readerReady, currentBookSlug, searchNavTick]);
 
   async function openLocation(target: string) {
     if (!renditionRef.current) return;
@@ -1857,6 +2248,19 @@ function App() {
   function goPrevPage() {
     renditionRef.current?.prev?.();
   }
+
+  // 滑动手势的翻页出口。走 ref 而不是直接闭包：iframe 里的 touch 监听是在
+  // rendition 初始化时注册的，那个闭包会一直持有当时的函数快照，换书或换章
+  // 之后就调到了过期的对象上。
+  //
+  // Page-turn entry points for the swipe listeners, routed through refs. The
+  // in-iframe touch handlers are registered once when the rendition is built,
+  // so a directly captured closure would keep pointing at that moment's
+  // functions and go stale after a book or chapter change.
+  const swipeNextRef = useRef<(() => void) | null>(null);
+  const swipePrevRef = useRef<(() => void) | null>(null);
+  swipeNextRef.current = goNextPage;
+  swipePrevRef.current = goPrevPage;
 
   function jumpToPage(targetPage: number) {
     if (!renditionRef.current || jumpingRef.current) return;
@@ -1933,6 +2337,21 @@ function App() {
       flow: "paginated",
       spread: getRenditionSpread(),
       manager: "default",
+      // allowScriptedContent 必须为 true，否则 Safari 里选不中字。
+      // epub.js 把每章渲染进带 sandbox 的 srcdoc iframe；不给 allow-scripts
+      // 时，它注入到 iframe 里的事件监听脚本会被拦掉。Chromium 对此宽容，
+      // WebKit（Safari 与 iOS 上所有浏览器）严格执行，结果就是在 Safari 里
+      // 拖选正文没有任何反应 —— 选区建不起来，工具栏自然也不弹。
+      //
+      // Required for text selection to work in Safari. epub.js renders each
+      // section into a sandboxed srcdoc iframe; without allow-scripts the
+      // listeners it injects into that frame are blocked. Chromium tolerates
+      // this, WebKit enforces it, so on Safari and every iOS browser dragging
+      // across the text produced no selection and no toolbar at all. The
+      // console message is: "Blocked script execution in 'about:srcdoc'
+      // because the document's frame is sandboxed and the 'allow-scripts'
+      // permission is not set."
+      allowScriptedContent: true,
     });
 
     if (import.meta.env.DEV) {
@@ -1968,14 +2387,14 @@ function App() {
     // URL 与 frontend/public/fonts/fonts.css 一致。
     const O = window.location.origin;
     const FONT_FACE_CSS = `
-      @font-face { font-family: "Huiwen Mingchao";    src: url("${O}/fonts/${encodeURIComponent("明體（汇文明朝）.ttf")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Huiwen Fangsong";    src: url("${O}/fonts/${encodeURIComponent("仿宋（匯文仿宋）.ttf")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Jinghua Laosong";    src: url("${O}/fonts/${encodeURIComponent("宋體（京華老宋）.ttf")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Fangzheng Yongle";   src: url("${O}/fonts/${encodeURIComponent("楷體（方正永樂大典）.TTF")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Huiwen Zhengkai";    src: url("${O}/fonts/${encodeURIComponent("正楷（汇文正楷）.ttf")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "LXGW WenKai";        src: url("${O}/fonts/${encodeURIComponent("霞鹜（霞鹜文楷）.ttf")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Fangzheng Liqi";     src: url("${O}/fonts/${encodeURIComponent("漢隸（方正禮器碑）.TTF")}") format("truetype"); font-display: swap; }
-      @font-face { font-family: "Fangzheng Shoujin";  src: url("${O}/fonts/${encodeURIComponent("瘦金（方正瘦金）.TTF")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Mingchao"; src: url("${O}/fonts/${encodeURIComponent("明體（汇文明朝）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("明體（汇文明朝）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Fangsong"; src: url("${O}/fonts/${encodeURIComponent("仿宋（匯文仿宋）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("仿宋（匯文仿宋）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Jinghua Laosong"; src: url("${O}/fonts/${encodeURIComponent("宋體（京華老宋）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("宋體（京華老宋）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Yongle"; src: url("${O}/fonts/${encodeURIComponent("楷體（方正永樂大典）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("楷體（方正永樂大典）.TTF")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Huiwen Zhengkai"; src: url("${O}/fonts/${encodeURIComponent("正楷（汇文正楷）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("正楷（汇文正楷）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "LXGW WenKai"; src: url("${O}/fonts/${encodeURIComponent("霞鹜（霞鹜文楷）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("霞鹜（霞鹜文楷）.ttf")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Liqi"; src: url("${O}/fonts/${encodeURIComponent("漢隸（方正禮器碑）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("漢隸（方正禮器碑）.TTF")}") format("truetype"); font-display: swap; }
+      @font-face { font-family: "Fangzheng Shoujin"; src: url("${O}/fonts/${encodeURIComponent("瘦金（方正瘦金）.woff2")}") format("woff2"), url("${O}/fonts/${encodeURIComponent("瘦金（方正瘦金）.TTF")}") format("truetype"); font-display: swap; }
     `;
     const LAYOUT_OVERRIDE_CSS = `
       /* Only neutralize EPUB's own width caps — never set explicit width or
@@ -1988,6 +2407,48 @@ function App() {
       }
       body *:not(code):not(pre) {
         font-family: inherit !important;
+      }
+      /* 有些 EPUB（如《大明律》）在每个 span 上写死了内联 font-size / color，
+         内联样式压过样式表，导致字号调节失效、注释比正文还大、夜间主题下
+         黑字黑底。这里统一中和掉，再按语义标签重建字号层级。
+
+         Some EPUBs — 大明律 is the worst offender, with ~2,000 spans carrying
+         an inline style of font-size:16px plus color:rgb(0,0,0) — hardcode
+         absolute pixel sizes and pure-black text inline.
+         Inline styles outrank any stylesheet,
+         so the reader's own font-size setting silently stopped applying to
+         those runs while un-styled annotations kept inheriting the reader size,
+         leaving notes rendered LARGER than the body text they annotate.
+
+         Neutralise the inline size and re-derive a proportional hierarchy from
+         semantic elements, so every book scales with the reader's font-size
+         slider. Only pure-black inline colours are dropped — a book that uses
+         colour meaningfully (red annotations, for instance) keeps it. */
+      body [style*="font-size"] {
+        font-size: inherit !important;
+      }
+      /* The heading selectors below deliberately have NO descendant space:
+         they match a heading that itself carries an inline size, out-
+         specificity-ing the generic rule above. A span nested inside the
+         heading is left to that generic rule and simply inherits the heading's
+         size. Writing these as descendant selectors instead makes the
+         multiplier compound — 20px x 1.5 x 1.5 = 45px. */
+      body h1, body h1[style*="font-size"] { font-size: 1.5em !important; }
+      body h2, body h2[style*="font-size"] { font-size: 1.3em !important; }
+      body h3, body h3[style*="font-size"] { font-size: 1.15em !important; }
+      body h4, body h5, body h6,
+      body h4[style*="font-size"], body h5[style*="font-size"], body h6[style*="font-size"] {
+        font-size: 1.05em !important;
+      }
+      body sup, body sub, body sup[style*="font-size"], body sub[style*="font-size"] {
+        font-size: 0.7em !important;
+      }
+      body [style*="color:rgb(0, 0, 0)"],
+      body [style*="color:rgb(0,0,0)"],
+      body [style*="color: rgb(0, 0, 0)"],
+      body [style*="color:#000"],
+      body [style*="color: #000"] {
+        color: inherit !important;
       }
       /* Some EPUBs (e.g. 三朝辽事实录) cap paragraphs to 40em which prevents
          text from filling the reader on wider viewports. Strip max-width and
@@ -2040,6 +2501,45 @@ function App() {
     const hooksHost = rendition as unknown as RenditionHooks;
     hooksHost.hooks?.content?.register?.((contents: EpubContentsLike) => {
       const doc = contents.document;
+
+      // 触摸滑动翻页。监听必须挂在 iframe 自己的 document 上 —— 正文渲染在
+      // iframe 里，手指划过正文时父页面收不到任何 touch 事件。
+      //
+      // Swipe-to-turn. The listeners must live on the iframe's own document:
+      // the text is rendered inside that frame, so a finger dragging across it
+      // never produces a touch event in the parent page.
+      if (!(doc as unknown as { __mingshiSwipe?: boolean }).__mingshiSwipe) {
+        (doc as unknown as { __mingshiSwipe?: boolean }).__mingshiSwipe = true;
+        let sx = 0, sy = 0, st = 0, touches = 0;
+        doc.addEventListener("touchstart", (event: TouchEvent) => {
+          touches = event.touches.length;
+          const t = event.touches[0];
+          if (!t) return;
+          sx = t.clientX; sy = t.clientY; st = Date.now();
+        }, { passive: true });
+        doc.addEventListener("touchend", (event: TouchEvent) => {
+          // 双指手势是缩放，不是翻页。
+          if (touches !== 1) return;
+          const t = event.changedTouches[0];
+          if (!t) return;
+          const dx = t.clientX - sx;
+          const dy = t.clientY - sy;
+          const dt = Date.now() - st;
+          // 选中文字时不翻页：长按选段再拖动会同时满足滑动条件，
+          // 那时用户要的是选字而不是翻页。
+          // Never page while text is selected — a long-press selection drag
+          // satisfies the swipe test too, and there the intent is selection.
+          const sel = contents.window.getSelection?.();
+          if (sel && !sel.isCollapsed) return;
+          // 门槛：横向位移足够大、明显比纵向大（否则是上下滚动）、且不是慢拖。
+          if (Math.abs(dx) < SWIPE_MIN_DISTANCE) return;
+          if (Math.abs(dx) < Math.abs(dy) * SWIPE_HORIZONTAL_RATIO) return;
+          if (dt > SWIPE_MAX_DURATION) return;
+          if (dx < 0) swipeNextRef.current?.();
+          else swipePrevRef.current?.();
+        }, { passive: true });
+      }
+
       if (!doc.querySelector("#mingshi-injected-fonts")) {
         const style = doc.createElement("style");
         style.id = "mingshi-injected-fonts";
@@ -2095,9 +2595,13 @@ function App() {
         const aboveY = hasRect ? (frameRect?.top || 0) + rect!.top - popupHeight - 12 : belowY;
         // Show below if enough space, otherwise above
         const top = (belowY + popupHeight < window.innerHeight) ? belowY : Math.max(8, aboveY);
-        const left = hasRect
+        // Paginated epub.js makes the iframe far wider than the viewport
+        // (13,800 px for 明史), so an un-clamped anchor readily lands outside
+        // the visible area — clamp before handing it to the toolbar.
+        const rawLeft = hasRect
           ? (frameRect?.left || 0) + rect!.left + (rect!.width / 2) + window.scrollX
           : (frameRect?.left || 0) + (frameRect?.width || 0) / 2 + window.scrollX;
+        const left = clampSelectionToolbarX(rawLeft);
 
         selectionContentsRef.current = contents;
         setSelectionText(text);
@@ -3059,6 +3563,13 @@ function App() {
   }
 
   async function handleReferenceLookup(targetText = effectiveSelectionText) {
+    // 正在查就直接忽略这次点击。防重入放在这里而不是给按钮加 disabled：
+    // 灰掉的按钮在选段工具栏上很显眼也很难看，而用户真正需要的只是"再点没反应"，
+    // 不是"按钮消失"。详见 requestAiAction 上的同类注释。
+    // Ignore the click while a lookup is in flight. The guard lives here rather
+    // than on the button's `disabled` attribute so the toolbar keeps its normal
+    // appearance; see the matching note on requestAiAction.
+    if (lookupLoading) return;
     if (!targetText.trim()) {
       setReferenceError("请先选中词语、短句或一小段文字。");
       return;
@@ -3211,6 +3722,26 @@ function App() {
   void fetchTimeline; void setTimelineLoading; void setTimelineData; void setTimelineOpen;
 
   function requestAiAction(type: "translate" | "pronounce" | "explain" | "qa" | "punctuate" | "custom", customAction?: CustomAction) {
+    // 请求进行中就吞掉这次点击，而不是把按钮置灰。
+    //
+    // 原来靠 <button disabled={aiLoading}> 防重入，副作用是选段工具栏上的按钮
+    // 在等结果期间整个变灰 —— 工具栏浮在正文上、按钮又密集，一片灰很扎眼，而
+    // 用户此时正盯着右侧面板看结果，并不需要工具栏给反馈。
+    //
+    // 但 disabled 不能只是删掉：它是当时唯一的防重入手段，去掉后连点会发出重复
+    // 的 AI 请求（既烧 token 又可能让后到的响应覆盖先到的）。所以把守卫挪到这里，
+    // 按钮保持可点，点了也确实没有副作用。
+    //
+    // Swallow the click while a request is in flight instead of disabling the
+    // button. The `disabled` attribute greyed out the whole selection toolbar
+    // while waiting — conspicuous, since the toolbar floats over the text and
+    // its buttons sit close together — even though the user is watching the
+    // side panel for the result, not the toolbar. It could not simply be
+    // deleted, though: it was the only re-entry guard, and without one a double
+    // click fires duplicate AI requests that both cost tokens and let a late
+    // response overwrite an earlier one. Moving the check here keeps the button
+    // looking live while making the extra click genuinely inert.
+    if (aiLoading) return;
     if (type !== "qa" && !selectionText.trim()) {
       setAiError("请先在正文里选中一段文字。");
       return;
@@ -3232,6 +3763,12 @@ function App() {
   }
 
   function requestCrossCompare() {
+    // 比对进行中忽略重复点击；理由同 requestAiAction。
+    // 史料比对是 4 步串行 LLM 调用，重复触发的代价比其他动作都高。
+    // Ignore repeat clicks while a comparison runs; rationale as in
+    // requestAiAction. This one matters most — a cross-source comparison is
+    // four serial LLM calls, so a duplicate is the costliest of the lot.
+    if (compareLoading) return;
     if (!selectionText.trim()) {
       setReferenceError("请先选中一段《明史》原文。");
       return;
@@ -3605,68 +4142,73 @@ function App() {
     const target = pendingSearchNavRef.current;
     if (!target) return false;
 
-    // DB-reader path: query the rendered <p data-paragraph-id="N">
-    // Note: 多栏布局未必已 settle。如果 offsetLeft 还 = 0，先把段落 id
-    // 写进 dbAnchorParaRef，column-recompute useEffect 触发时会按它对齐；
-    // 同时仍尝试主动 scrollTo，以应对 effect 已经跑过的场景。
+    // ---- DB-reader path ----
+    // 段落都带 data-paragraph-id；直接查 DOM 元素 → 按 offsetLeft / clientWidth
+    // 算出它在 CSS columns 多栏布局里的页号 → scrollTo。
     const dbHost = dbReaderHostRef.current;
     if (dbHost) {
       const el = dbHost.querySelector<HTMLElement>(`[data-paragraph-id="${target.paragraphId}"]`);
-      console.info("[searchNav] DB-reader attempt: dbHost=present, paragraphId=" + target.paragraphId + ", el=" + (el ? "FOUND" : "MISSING"));
       if (el) {
         const cw = dbHost.clientWidth;
+        // dbAnchorParaRef 是 column-recompute effect 看的锚点。先无条件写好：
+        // 即使本次 scrollToSearchTarget 没成功 scroll，后面 recompute 跑起来
+        // 也会按这个段落 id 算页号并自动 snap 过去。
         dbAnchorParaRef.current = String(target.paragraphId);
-        console.info("[searchNav] DB-reader matched: cw=" + cw + ", offsetLeft=" + el.offsetLeft + ", scrollWidth=" + dbHost.scrollWidth);
-        if (cw > 0 && el.offsetLeft > 0) {
-          const targetPage = Math.floor(el.offsetLeft / cw);
+        // Layout settle 的判据：CSS columns 真正生效（columnWidth 已写到
+        // article 的 inline style）。章节刚渲染、recompute 还没跑过时，
+        // article 还是普通 block flow —— 这时 offsetLeft 全是 0，scrollTo
+        // 算出来都是 page 0，会跳到章节首页。务必等 columns 设好再 commit。
+        const article = dbHost.querySelector<HTMLElement>(".db-reader-article");
+        const columnsApplied = !!(article && article.style.columnWidth);
+        if (cw > 0 && columnsApplied) {
+          const targetPage = Math.floor(el.offsetLeft / Math.max(1, cw));
           dbHost.scrollTo({ left: targetPage * cw, behavior: "smooth" });
           dbTargetPageRef.current = targetPage;
           el.classList.add("search-flash");
           setTimeout(() => el.classList.remove("search-flash"), 1600);
-          console.info("[searchNav] DB-reader scrolled to page " + targetPage);
           pendingSearchNavRef.current = null;
           return true;
         }
-        // 找到段落但 layout 没 settle — 加 flash，但不清 ref，让后续重试再 scroll
-        console.info("[searchNav] DB-reader layout not settled, will retry");
+        // Columns 还没应用 —— 不要清 ref，也不要 scroll；recompute 一会就跑，
+        // 用 dbAnchorParaRef 算出正确页号并 snap；retry 队列再补一刀确认。
         el.classList.add("search-flash");
         setTimeout(() => el.classList.remove("search-flash"), 1600);
       }
-    } else {
-      // 仅 EPUB path 时才打这条；DB-reader 没渲染的时候 dbHost 自然是 null
-      // — 不一定是 bug。
     }
 
-    // EPUB path: 找到段落 → 算 CFI → rendition.display(cfi) 跳到分栏页
+    // ---- EPUB path ----
+    // 找元素的两条路：
+    // (1) doc.getElementById(target.anchor)  — anchor 是后端从 paragraphs.anchor
+    //     拆出来的 filepos…，原 EPUB 内容里通常长成 <span id="filepos…">，最稳。
+    // (2) text needle 匹配         — anchor 找不到时按段落正文前 30 个 CJK 字
+    //     在 doc 里搜（简繁双展），作为兜底。
     const rendition = renditionRef.current as unknown as EpubRenditionLike & { currentLocation?: () => unknown };
     if (rendition && rendition.getContents) {
       const contentsList = rendition.getContents() || [];
-      // iframe 内容可能被 OpenCC 转成繁体，DB 原始文本通常是简体 → 双路 needle 匹配。
-      // 同时只比 CJK 字符（去掉所有标点、空白、英数），避免因「，」/「，」、「·」/「‧」差异 false miss。
       const onlyCjk = (s: string) => (s || "").replace(/[^一-鿿㐀-䶿]/g, "");
-      const needleSimp = onlyCjk(target.text).slice(0, 18);
+      const needleSimp = onlyCjk(target.text).slice(0, 30);
       const needleTrad = toTraditional(needleSimp);
-      console.info("[searchNav] EPUB attempt", { contentsCount: contentsList.length, needleSimp, needleTrad, attempt: target.attempts });
-      if (needleSimp.length >= 6 && contentsList.length > 0) {
+      const anchor = target.anchor || "";
+      const canMatch = !!anchor || needleSimp.length >= 3;
+      if (contentsList.length > 0 && canMatch) {
         for (const contents of contentsList) {
           const doc = contents.document;
           if (!doc) continue;
-          const blocks = doc.querySelectorAll<HTMLElement>("p, div, li, h1, h2, h3, h4, h5, h6, blockquote, span");
           let foundEl: HTMLElement | null = null;
-          for (const el of Array.from(blocks)) {
-            const txt = onlyCjk(el.textContent || "");
-            if (txt.includes(needleSimp) || (needleTrad !== needleSimp && txt.includes(needleTrad))) {
-              foundEl = el; break;
+          if (anchor) {
+            try { foundEl = doc.getElementById(anchor) as HTMLElement | null; } catch { /* */ }
+          }
+          if (!foundEl && needleSimp.length >= 3) {
+            const blocks = doc.querySelectorAll<HTMLElement>("p, div, li, h1, h2, h3, h4, h5, h6, blockquote, span");
+            for (const el of Array.from(blocks)) {
+              const txt = onlyCjk(el.textContent || "");
+              if (txt.includes(needleSimp) || (needleTrad !== needleSimp && txt.includes(needleTrad))) {
+                foundEl = el; break;
+              }
             }
           }
-          if (!foundEl) {
-            // 调试：打印这个 contents 文档前 30 块的文本前缀，看实际 iframe 内容
-            const sample = Array.from(blocks).slice(0, 5).map((b) => onlyCjk(b.textContent || "").slice(0, 20));
-            console.info("[searchNav] EPUB no match (totalBlocks=" + blocks.length + ", sample blocks=", sample, ")");
-            continue;
-          }
+          if (!foundEl) continue;
           const el = foundEl;
-          console.info("[searchNav] EPUB matched", el.tagName, "text=", (el.textContent || "").slice(0, 30));
 
           let cfi: string | null = null;
           try {
@@ -3683,24 +4225,21 @@ function App() {
               console.warn("[searchNav] cfiFromNode threw", e);
             }
           }
-          console.info("[searchNav] computed cfi:", cfi ? cfi.slice(0, 100) : "(null)");
-
           el.classList.add("search-flash");
           window.setTimeout(() => el.classList.remove("search-flash"), 1600);
 
           if (cfi) {
             rendition.display(cfi).then(() => {
-              console.info("[searchNav] display(cfi) resolved");
               el.classList.add("search-flash");
               window.setTimeout(() => el.classList.remove("search-flash"), 1600);
               pendingSearchNavRef.current = null;
-            }).catch((err: unknown) => {
-              console.warn("[searchNav] display(cfi) failed:", err);
+            }).catch(() => {
+              // Fallback: assign a temp id to the element and ask epub.js to
+              // navigate via href#tmpId (some EPUBs reject CFI display).
               const tmpId = "mingshi-search-target-anchor";
               el.id = tmpId;
               const loc = rendition.currentLocation?.() as { start?: { href?: string } } | null;
               const href = loc?.start?.href || pendingLocationTargetRef.current || forcedChapterTargetRef.current;
-              console.info("[searchNav] fallback anchor approach href=", href);
               if (href) {
                 rendition.display(`${href}#${tmpId}`).finally(() => {
                   pendingSearchNavRef.current = null;
@@ -3712,18 +4251,12 @@ function App() {
             return true;
           }
 
-          console.info("[searchNav] no cfi computed, trying scrollIntoView");
+          // CFI 算不出来时退到 scrollIntoView。
           try { el.scrollIntoView({ block: "start" }); } catch { /* ignore */ }
           pendingSearchNavRef.current = null;
           return true;
         }
-      } else if (needleSimp.length < 6) {
-        console.info("[searchNav] needle too short (<6), can't text-match");
-      } else if (contentsList.length === 0) {
-        console.info("[searchNav] contentsList empty — rendition not ready");
       }
-    } else if (!rendition) {
-      console.info("[searchNav] no rendition (DB-reader path likely already returned, or both readers missing)");
     }
 
     target.attempts += 1;
@@ -3744,9 +4277,12 @@ function App() {
       pendingSearchNavRef.current = {
         paragraphId,
         text: result.text || (result.snippet || "").replace(/<[^>]+>/g, ""),
+        anchor: result.paragraphAnchor || "",
         attempts: 0,
       };
     }
+    // 即使是同书同章重点，tick 也变 → useEffect 重 fire 走 retry 队列。
+    setSearchNavTick((t) => t + 1);
 
     const targetSlug = result.bookSlug;
     const targetBook = readableBooks.find((b) => b.slug === (targetSlug || currentBookSlug));
@@ -3797,6 +4333,7 @@ function App() {
     if (targetBook?.hasEpub === false && typeof result.chapterOrder === "number") {
       const arrayIndex = await resolveDbChapterIndex();
       if (typeof arrayIndex === "number") {
+        skipNextDbScrollResetRef.current = true;
         requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
       }
     } else if (result.chapterHref && !needsBookSwitch) {
@@ -3804,18 +4341,13 @@ function App() {
     } else if (typeof result.chapterOrder === "number") {
       const arrayIndex = await resolveDbChapterIndex();
       if (typeof arrayIndex === "number") {
+        skipNextDbScrollResetRef.current = true;
         requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
       }
     }
 
-    // 兜底：当跳转目标是同书同章节（state deps 不变），effect 不会再 fire，
-    // 这里直接定时重试几次。每次成功后 scrollToSearchTarget 内部会清掉 ref。
-    if (Number.isFinite(paragraphId)) {
-      window.setTimeout(() => scrollToSearchTarget(), 200);
-      window.setTimeout(() => scrollToSearchTarget(), 700);
-      window.setTimeout(() => scrollToSearchTarget(), 1500);
-      window.setTimeout(() => scrollToSearchTarget(), 3000);
-    }
+    // 不再在这里挂硬编码 setTimeout 重试 —— 由上面 searchNavTick 驱动的
+    // useEffect 统一调度（120 / 280 / 600 / 1200 / 2200ms backoff）。
   }
 
   // v1.2 自由对话：load + save history。本地 localStorage 一份，最多保留 50 个会话。
@@ -4229,7 +4761,7 @@ function App() {
           </div>
           <h1>
             {"明史阅读器"}
-            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.3.1</button>
+            <button type="button" className="version-badge" onClick={() => setAboutOpen(true)}>v1.3.3</button>
           </h1>
           <span className="muted-text">{readingStats}</span>
         </div>
@@ -4691,206 +5223,37 @@ function App() {
             <div className="panel-scroll">
               <div className="panel-headline">
                 <Settings2 size={18} />
-                <span>AI 与阅读设置</span>
+                <span>设置</span>
               </div>
+              {/* 设置项按主题收进各自的弹窗。原先是一条几百像素的长列表，
+                  在手机上要滚很久才能找到一项。这里只留入口按钮。
+                  Settings are grouped into per-topic dialogs. This used to be
+                  one very long scrolling list, which on a phone meant scrolling
+                  a long way to reach any single control. */}
               <div className="stack-gap">
-                <label className="field-label">
-                  主模型
-                  <select className="select-input" value={aiSettings.model} onChange={(e) => setAiSettings((c) => ({ ...c, model: e.target.value }))}>
-                    {aiSettings.modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </label>
-                <label className="field-label">
-                  小模型
-                  <select className="select-input" value={aiSettings.smallModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, smallModel: e.target.value }))}>
-                    {(aiSettings.smallModelOptions || []).map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </label>
-                <label className="field-label">
-                  语音风格
-                  <select className="select-input" value={aiSettings.ttsVoice || "Ryan"} onChange={(e) => setAiSettings((c) => ({ ...c, ttsVoice: e.target.value }))}>
-                    <optgroup label="百炼 qwen3-tts">
-                      <option value="Ryan">Ryan（阳刚男声）</option>
-                      <option value="Ethan">Ethan（沉稳男声）</option>
-                      <option value="Cherry">Cherry（温柔女声）</option>
-                      <option value="Serena">Serena（知性女声）</option>
-                      <option value="Bella">Bella（优雅女声）</option>
-                      <option value="Chelsie">Chelsie（活泼女声）</option>
-                    </optgroup>
-                  </select>
-                </label>
-                <button type="button" className="secondary-button" onClick={() => setApiConfigOpen(true)}>
-                  自定义 API 配置
+                <button type="button" className="secondary-button full-width" onClick={() => setSettingsSection("ai")}>
+                  AI 设置
                 </button>
-                <div className="inline-actions">
-                  <label className="toggle-row">
-                    <input
-                      type="checkbox"
-                      checked={autoAnnotate}
-                      onChange={(event) => setAutoAnnotate(event.target.checked)}
-                    />
-                    <span>自动标注明代年号与公元对照</span>
-                  </label>
-                  <label className="toggle-row">
-                    <input
-                      type="checkbox"
-                      checked={promptSupplementEnabled}
-                      onChange={(event) => setPromptSupplementEnabled(event.target.checked)}
-                    />
-                    <span>AI 操作前弹出补充说明提示</span>
-                  </label>
-                </div>
-                <label className="field-label">
-                  正文字体转换
-                  <select className="select-input" value={scriptVariant} onChange={(event) => setScriptVariant(event.target.value as "simplified" | "traditional")}>
-                    <option value="simplified">保留原文</option>
-                    <option value="traditional">转换为繁体</option>
-                  </select>
-                </label>
-                <label className="field-label">
-                  界面字体转换
-                  <select className="select-input" value={uiScriptVariant} onChange={(event) => setUiScriptVariant(event.target.value as "simplified" | "traditional")}>
-                    <option value="simplified">简体</option>
-                    <option value="traditional">繁体</option>
-                  </select>
-                </label>
-                {/* 「虚拟翻页分栏」设置 v1.0.2 起隐藏：双栏在窄屏 / 高字号 +
-                    长行时容易把段落截到栏外、挤压可读性。state（pageSpread /
-                    setPageSpread）和持久化保留，将来要再 expose 直接把这段
-                    label 放回来即可。 */}
-                <div className="divider" />
-                <div className="panel-headline small">
-                  <Highlighter size={14} />
-                  <span>页面外观</span>
-                </div>
-                <label className="field-label">
-                  阅读主题
-                  <select className="select-input" value={readerTheme} onChange={(e) => setReaderTheme(e.target.value as "default" | "sepia" | "dark" | "green")}>
-                    <option value="default">默认（米白）</option>
-                    <option value="sepia">古籍米黄</option>
-                    <option value="dark">夜间</option>
-                    <option value="green">护眼绿</option>
-                  </select>
-                </label>
-                {/*
-                  字体下拉顺序按用户指定：
-                    系统宋体 / 系统仿宋
-                    京华老宋 / 汇文仿宋 / 汇文正楷 / 汇文明朝 / 霞鹜文楷
-                    方正永乐大典 / 方正瘦金 / 方正礼器碑
-                  正文字体默认 mingchao（汇文明朝），界面字体默认 zhengkai（汇文正楷）
-                */}
-                <label className="field-label">
-                  正文字体
-                  <select
-                    className="select-input"
-                    value={readerFontFamily}
-                    onChange={(e) => setReaderFontFamily(e.target.value as typeof readerFontFamily)}
-                  >
-                    <option value="system-songti">系统宋体</option>
-                    <option value="system-fangsong">系统仿宋</option>
-                    <option value="songti">宋體（京华老宋·内置）</option>
-                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
-                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
-                    <option value="mingchao">明體（匯文明朝·内置）</option>
-                    <option value="xiawu">霞鹜文楷（内置）</option>
-                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
-                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
-                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
-                  </select>
-                </label>
-                <label className="field-label">
-                  界面字体
-                  <select
-                    className="select-input"
-                    value={uiFontFamily}
-                    onChange={(e) => setUiFontFamily(e.target.value as typeof uiFontFamily)}
-                  >
-                    <option value="system-songti">系统宋体</option>
-                    <option value="system-fangsong">系统仿宋</option>
-                    <option value="songti">宋體（京华老宋·内置）</option>
-                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
-                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
-                    <option value="mingchao">明體（匯文明朝·内置）</option>
-                    <option value="xiawu">霞鹜文楷（内置）</option>
-                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
-                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
-                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
-                  </select>
-                </label>
-                <label className="field-label">
-                  字号 {readerFontSize}px
-                  <input
-                    type="range"
-                    min={13}
-                    max={28}
-                    step={1}
-                    value={readerFontSize}
-                    onChange={(e) => setReaderFontSize(Number(e.target.value))}
-                  />
-                </label>
-                <label className="field-label">
-                  日期显示
-                  <select className="select-input" value={dateDisplay} onChange={(e) => setDateDisplay(e.target.value as "gregorian" | "lunar" | "both")}>
-                    <option value="lunar">仅农历</option>
-                    <option value="gregorian">仅公历</option>
-                    <option value="both">公历 + 农历</option>
-                  </select>
-                </label>
-                <label className="toggle-row">
-                  <input type="checkbox" checked={showEmperor} onChange={(e) => setShowEmperor(e.target.checked)} />
-                  <span>气泡 / 模态显示在位皇帝（如 明英宗朱祁镇）</span>
-                </label>
-                <label className="toggle-row">
-                  <input type="checkbox" checked={keyboardPagingEnabled} onChange={(e) => setKeyboardPagingEnabled(e.target.checked)} />
-                  <span>键盘 ← → 翻页（默认关；开后阅读区无需手动点边缘）</span>
-                </label>
-                <div className="field-label" style={{ borderTop: "1px solid var(--ui-panel-border)", paddingTop: "0.5rem", marginTop: "0.3rem" }}>
-                  <strong style={{ fontSize: "0.85rem" }}>标记模式（v1.2）</strong>
-                  <div className="muted-text" style={{ fontSize: "0.72rem", marginTop: "0.2rem" }}>
-                    在页头工具栏点「标记」按钮启用后，选段结束直接按下方配色 / 形态打标，不再弹工具栏。Cmd/Ctrl+Z 撤销最近一次。
-                  </div>
-                </div>
-                <label className="field-label">
-                  默认勾画样式
-                  <select className="select-input" value={markStyle} onChange={(e) => setMarkStyle(e.target.value as "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle")}>
-                    <option value="h-gold">高亮 · 金笺（深黄）</option>
-                    <option value="h-jade">高亮 · 青玉（深绿）</option>
-                    <option value="h-crimson">高亮 · 绛纱（深红）</option>
-                    <option value="underline">下划线（正红）</option>
-                    <option value="circle">圈点（正红字下圆点）</option>
-                  </select>
-                </label>
-                <label className="field-label">
-                  字色（留空则跟随主题）
-                  <div className="inline-actions">
-                    <input
-                      type="color"
-                      value={readerFontColor || "#1f160f"}
-                      onChange={(e) => setReaderFontColor(e.target.value)}
-                      style={{ width: 48, height: 32, padding: 0, border: "none", background: "transparent" }}
-                    />
-                    <button type="button" className="ghost-button compact-button" onClick={() => setReaderFontColor("")}>重置</button>
-                  </div>
-                </label>
-                <button type="button" className="secondary-button" onClick={() => setOpenResourcePanel("custom-actions")}>
+                <button type="button" className="secondary-button full-width" onClick={() => setSettingsSection("appearance")}>
+                  外观设置
+                </button>
+                {/* 「我的账户」只在网站版有意义；API 配置已移入「AI 设置」，
+                    桌面版没有账号系统，这个入口整个不渲染。
+                    My account. Web build only — API configuration now lives in
+                    the AI dialog, so with no account this entry has no content. */}
+                {account && (
+                  <button type="button" className="secondary-button full-width" onClick={() => setSettingsSection("account")}>
+                    我的账户
+                  </button>
+                )}
+                <button type="button" className="secondary-button full-width" onClick={() => setOpenResourcePanel("custom-actions")}>
                   自定义 AI 操作（{customActions.length} 个）
                 </button>
-                <div className="divider" />
-                <button type="button" className="primary-button full-width" onClick={() => {
-                  // Force save all settings to localStorage then reload
-                  void writePersistedState(storageKey("ai-settings"), aiSettings);
-                  void writePersistedState(storageKey("auto-annotate"), autoAnnotate);
-                  void writePersistedState(storageKey("script-variant"), scriptVariant);
-                  void writePersistedState(storageKey("page-spread"), pageSpread);
-                  void writePersistedState(storageKey("custom-actions"), customActions);
-                  // Clear browser caches and reload
-                  if ("caches" in window) {
-                    caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
-                  }
-                  window.setTimeout(() => window.location.reload(), 200);
-                }}>
-                  保存设置并刷新页面
-                </button>
+                {/* 原「保存设置并刷新页面」按钮已删。它写的那几个键本来就有各自的
+                    持久化 effect，点不点都会存；按钮名字反倒让人以为不点就丢。
+                    The old "save settings and reload" button is gone: every key it
+                    wrote already has its own persistence effect, so settings are
+                    saved either way and the label only implied otherwise. */}
               </div>
             </div>
           )}
@@ -4962,7 +5325,13 @@ function App() {
           {bookSwitching && <div className="overlay-message">切换书目中…</div>}
           {currentBook?.hasEpub === false ? (
             <>
-              <div className="db-reader-host" ref={dbReaderHostRef} onMouseUp={handleDbReaderSelection}>
+              <div
+                className="db-reader-host"
+                ref={dbReaderHostRef}
+                onMouseUp={handleDbReaderSelection}
+                onTouchStart={onDbTouchStart}
+                onTouchEnd={onDbTouchEnd}
+              >
                 {dbReaderLoading && <div className="overlay-message">载入章节…</div>}
                 {dbReaderChapter ? (
                   <article className="db-reader-article">
@@ -5350,12 +5719,12 @@ function App() {
             </button>
           )}
           <button type="button" className="toolbar-mini" onClick={() => { setAssistantCollapsed(false); noteInputRef.current?.focus(); }}>札记</button>
-          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("pronounce")} disabled={aiLoading}>读音</button>
+          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("pronounce")}>读音</button>
           <button type="button" className="toolbar-mini" onClick={() => void handleResolveSelectionDate()}>识别日期</button>
-          <button type="button" className="toolbar-mini" onClick={() => void handleReferenceLookup()} disabled={lookupLoading}>百科</button>
-          <button type="button" className="toolbar-mini" onClick={() => void requestCrossCompare()} disabled={compareLoading}>史料比对</button>
-          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("translate")} disabled={aiLoading}>现代文</button>
-          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("punctuate")} disabled={aiLoading}>AI 句读</button>
+          <button type="button" className="toolbar-mini" onClick={() => void handleReferenceLookup()}>百科</button>
+          <button type="button" className="toolbar-mini" onClick={() => void requestCrossCompare()}>史料比对</button>
+          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("translate")}>现代文</button>
+          <button type="button" className="toolbar-mini" onClick={() => void requestAiAction("punctuate")}>AI 句读</button>
           <button type="button" className="toolbar-mini" onClick={() => void speakText(selectionText)}>朗读</button>
           {ttsStatus && (
             <>
@@ -6075,15 +6444,14 @@ function App() {
                     新窗口打开
                   </button>
                 </div>
-                <div className="muted-text" style={{ fontSize: "0.74rem", marginTop: "-0.4rem" }}>
-                  若下方嵌入页查询后跳回首页（中研院反 iframe 第三方 cookie），请用「新窗口打开」按钮在浏览器外部访问。
-                </div>
-                <iframe
+                {/* @ts-expect-error Electron <webview> 不是标准 HTML 元素 —
+                    用它而不是 <iframe> 是因为中研院反 iframe 第三方 cookie，
+                    搜索后页面会被刷回首页；<webview> 有独立 session 能正常保留搜索状态。 */}
+                <webview
                   src="https://newarchive.ihp.sinica.edu.tw/hplname/placename/basic"
                   className="hgis-iframe"
-                  title="中研院歷史地名查詢"
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
-                  referrerPolicy="no-referrer-when-downgrade"
+                  partition="persist:sinica"
+                  style={{ display: "inline-flex" }}
                 />
               </div>
             )}
@@ -6140,6 +6508,372 @@ function App() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+
+      {/* ===== 设置分组弹窗 ===== */}
+      {settingsSection === "ai" && (
+        <div className="modal-backdrop" onClick={() => setSettingsSection(null)}>
+          <div className="modal-card resource-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">AI 设置</span>
+              <button type="button" className="ghost-button compact-button" onClick={() => setSettingsSection(null)}>关闭</button>
+            </div>
+            <div className="panel-scroll">
+              <div className="stack-gap">
+                                <label className="field-label">
+                                  主模型
+                                  <select className="select-input" value={aiSettings.model} onChange={(e) => setAiSettings((c) => ({ ...c, model: e.target.value }))}>
+                                    {aiSettings.modelOptions.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  小模型
+                                  <select className="select-input" value={aiSettings.smallModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, smallModel: e.target.value }))}>
+                                    {(aiSettings.smallModelOptions || []).map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
+                                  </select>
+                                </label>
+                                <p className="muted-text" style={{ fontSize: "0.72rem", margin: "-0.3rem 0 0" }}>
+                                  标注（default）的是服务器内置模型，用站点自带的 Key，无需自行配置。
+                                  自己添加的 API Key 只服务它自己激活的模型，两者互不影响。
+                                </p>
+                                <label className="field-label">
+                                  语音风格
+                                  <select className="select-input" value={aiSettings.ttsVoice || "Ryan"} onChange={(e) => setAiSettings((c) => ({ ...c, ttsVoice: e.target.value }))}>
+                                    <optgroup label="百炼 qwen3-tts">
+                                      <option value="Ryan">Ryan（阳刚男声）</option>
+                                      <option value="Ethan">Ethan（沉稳男声）</option>
+                                      <option value="Cherry">Cherry（温柔女声）</option>
+                                      <option value="Serena">Serena（知性女声）</option>
+                                      <option value="Bella">Bella（优雅女声）</option>
+                                      <option value="Chelsie">Chelsie（活泼女声）</option>
+                                    </optgroup>
+                                  </select>
+                                </label>
+                                {/* API 配置（模型与 Key）归属 AI 设置，不在「我的账户」下。
+                                    API configuration belongs with the AI settings, not
+                                    under the account dialog. */}
+                                <button type="button" className="secondary-button full-width" onClick={() => setApiConfigOpen(true)}>
+                                  自定义 API 配置（模型与 Key）
+                                </button>
+                                {/* 年号标注、简繁转换等显示类开关已移入「外观设置」。
+                                    Annotation and script-conversion toggles moved to the
+                                    appearance dialog — they are display options, not AI ones. */}
+                                {/* 「虚拟翻页分栏」设置 v1.0.2 起隐藏：双栏在窄屏 / 高字号 +
+                                    长行时容易把段落截到栏外、挤压可读性。state（pageSpread /
+                                    setPageSpread）和持久化保留，将来要再 expose 直接把这段
+                                    label 放回来即可。 */}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {settingsSection === "appearance" && (
+        <div className="modal-backdrop" onClick={() => setSettingsSection(null)}>
+          <div className="modal-card resource-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">外观设置</span>
+              <button type="button" className="ghost-button compact-button" onClick={() => setSettingsSection(null)}>关闭</button>
+            </div>
+            <div className="panel-scroll">
+              <div className="stack-gap">
+                                <div className="panel-headline small">
+                                  <Highlighter size={14} />
+                                  <span>页面外观</span>
+                                </div>
+                                <label className="field-label">
+                                  阅读主题
+                                  <select className="select-input" value={readerTheme} onChange={(e) => setReaderTheme(e.target.value as "default" | "sepia" | "dark" | "green")}>
+                                    <option value="default">默认（米白）</option>
+                                    <option value="sepia">古籍米黄</option>
+                                    <option value="dark">夜间</option>
+                                    <option value="green">护眼绿</option>
+                                  </select>
+                                </label>
+                                {/*
+                                  字体下拉顺序按用户指定：
+                                    系统宋体 / 系统仿宋
+                                    京华老宋 / 汇文仿宋 / 汇文正楷 / 汇文明朝 / 霞鹜文楷
+                                    方正永乐大典 / 方正瘦金 / 方正礼器碑
+                                  正文字体默认 mingchao（汇文明朝），界面字体默认 kaiti（方正永樂大典）
+                                */}
+                                <label className="field-label">
+                                  正文字体
+                                  <select
+                                    className="select-input"
+                                    value={readerFontFamily}
+                                    onChange={(e) => setReaderFontFamily(e.target.value as typeof readerFontFamily)}
+                                  >
+                                    <option value="system-songti">系统宋体</option>
+                                    <option value="system-fangsong">系统仿宋</option>
+                                    <option value="songti">宋體（京华老宋·内置）</option>
+                                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
+                                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
+                                    <option value="mingchao">明體（匯文明朝·内置）</option>
+                                    <option value="xiawu">霞鹜文楷（内置）</option>
+                                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
+                                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
+                                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  正文字体转换
+                                  <select className="select-input" value={scriptVariant} onChange={(event) => setScriptVariant(event.target.value as "simplified" | "traditional")}>
+                                    <option value="simplified">保留原文</option>
+                                    <option value="traditional">转换为繁体</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  界面字体
+                                  <select
+                                    className="select-input"
+                                    value={uiFontFamily}
+                                    onChange={(e) => setUiFontFamily(e.target.value as typeof uiFontFamily)}
+                                  >
+                                    <option value="system-songti">系统宋体</option>
+                                    <option value="system-fangsong">系统仿宋</option>
+                                    <option value="songti">宋體（京华老宋·内置）</option>
+                                    <option value="fangsong">仿宋（匯文仿宋·内置）</option>
+                                    <option value="zhengkai">正楷（匯文正楷·内置）</option>
+                                    <option value="mingchao">明體（匯文明朝·内置）</option>
+                                    <option value="xiawu">霞鹜文楷（内置）</option>
+                                    <option value="kaiti">楷體（方正永樂大典·内置）</option>
+                                    <option value="shoujin">瘦金（方正瘦金·内置）</option>
+                                    <option value="lishu">漢隸（方正禮器碑·内置）</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  界面字体转换
+                                  <select className="select-input" value={uiScriptVariant} onChange={(event) => setUiScriptVariant(event.target.value as "simplified" | "traditional")}>
+                                    <option value="simplified">简体</option>
+                                    <option value="traditional">繁体</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  字号 {readerFontSize}px
+                                  <input
+                                    type="range"
+                                    min={13}
+                                    max={28}
+                                    step={1}
+                                    value={readerFontSize}
+                                    onChange={(e) => setReaderFontSize(Number(e.target.value))}
+                                  />
+                                </label>
+                                <label className="field-label">
+                                  日期显示
+                                  <select className="select-input" value={dateDisplay} onChange={(e) => setDateDisplay(e.target.value as "gregorian" | "lunar" | "both")}>
+                                    <option value="lunar">仅农历</option>
+                                    <option value="gregorian">仅公历</option>
+                                    <option value="both">公历 + 农历</option>
+                                  </select>
+                                </label>
+                                <label className="toggle-row">
+                                  <input type="checkbox" checked={showEmperor} onChange={(e) => setShowEmperor(e.target.checked)} />
+                                  <span>气泡 / 模态显示在位皇帝（如 明英宗朱祁镇）</span>
+                                </label>
+                                <label className="toggle-row">
+                                  <input type="checkbox" checked={keyboardPagingEnabled} onChange={(e) => setKeyboardPagingEnabled(e.target.checked)} />
+                                  <span>键盘 ← → 翻页（默认关；开后阅读区无需手动点边缘）</span>
+                                </label>
+                                <label className="toggle-row">
+                                  <input
+                                    type="checkbox"
+                                    checked={autoAnnotate}
+                                    onChange={(event) => setAutoAnnotate(event.target.checked)}
+                                  />
+                                  <span>自动标注明代年号与公元对照</span>
+                                </label>
+                                <label className="toggle-row">
+                                  <input
+                                    type="checkbox"
+                                    checked={promptSupplementEnabled}
+                                    onChange={(event) => setPromptSupplementEnabled(event.target.checked)}
+                                  />
+                                  <span>AI 操作前弹出补充说明提示</span>
+                                </label>
+
+                                {/* 标记设置并入外观设置，不再单开弹窗。
+                                    Marking options are folded into this dialog; they no
+                                    longer have a separate settings modal. */}
+                                <div className="divider" />
+                                <div className="panel-headline small">
+                                  <Highlighter size={14} />
+                                  <span>标记外观</span>
+                                </div>
+                                <div className="field-label">
+                                  <strong style={{ fontSize: "0.85rem" }}>标记模式（v1.2）</strong>
+                                  <div className="muted-text" style={{ fontSize: "0.72rem", marginTop: "0.2rem" }}>
+                                    在页头工具栏点「标记」按钮启用后，选段结束直接按下方配色 / 形态打标，不再弹工具栏。Cmd/Ctrl+Z 撤销最近一次。
+                                  </div>
+                                </div>
+                                <label className="field-label">
+                                  默认勾画样式
+                                  <select className="select-input" value={markStyle} onChange={(e) => setMarkStyle(e.target.value as "h-gold" | "h-jade" | "h-crimson" | "underline" | "circle")}>
+                                    <option value="h-gold">高亮 · 金笺（深黄）</option>
+                                    <option value="h-jade">高亮 · 青玉（深绿）</option>
+                                    <option value="h-crimson">高亮 · 绛纱（深红）</option>
+                                    <option value="underline">下划线（正红）</option>
+                                    <option value="circle">圈点（正红字下圆点）</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  字色（留空则跟随主题）
+                                  <div className="inline-actions">
+                                    <input
+                                      type="color"
+                                      value={readerFontColor || "#1f160f"}
+                                      onChange={(e) => setReaderFontColor(e.target.value)}
+                                      style={{ width: 48, height: 32, padding: 0, border: "none", background: "transparent" }}
+                                    />
+                                    <button type="button" className="ghost-button compact-button" onClick={() => setReaderFontColor("")}>重置</button>
+                                  </div>
+                                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {settingsSection === "account" && (
+        <div className="modal-backdrop" onClick={() => setSettingsSection(null)}>
+          <div className="modal-card resource-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">我的账户</span>
+              <button type="button" className="ghost-button compact-button" onClick={() => setSettingsSection(null)}>关闭</button>
+            </div>
+            <div className="panel-scroll">
+              <div className="stack-gap">
+                                {/* 我的账户 —— 仅网站版渲染；桌面版 /api/auth/me 取不到，account 为 null。
+                                    API 配置（模型与 Key）已移到「AI 设置」。
+                                    My account. Web deployment only: the desktop build has no
+                                    account system, /api/auth/me is unreachable there and this
+                                    entire block is omitted. */}
+                                {account && (
+                                  <>
+                                    <p className="muted-text" style={{ fontSize: "0.82rem", margin: "0 0 0.6rem" }}>
+                                      当前登录：<strong>{account.username}</strong>（{account.roleLabel}）
+                                    </p>
+
+                                    {acctMsg && (
+                                      <p
+                                        className="muted-text"
+                                        style={{
+                                          fontSize: "0.84rem",
+                                          margin: "0 0 0.6rem",
+                                          color: acctMsg.kind === "ok" ? "#3f6b46" : "#97372c",
+                                        }}
+                                      >
+                                        {acctMsg.text}
+                                      </p>
+                                    )}
+
+                                    <label className="field-label">
+                                      用户名
+                                      <input
+                                        className="text-input"
+                                        value={acctUsername}
+                                        disabled={!canRenameSelf || acctBusy}
+                                        onChange={(e) => setAcctUsername(e.target.value)}
+                                        placeholder="登录用的名字"
+                                      />
+                                    </label>
+                                    {!canRenameSelf && (
+                                      <p className="muted-text" style={{ fontSize: "0.78rem", margin: "-0.4rem 0 0.6rem" }}>
+                                        访客账号的用户名固定，如需修改请联系管理员。
+                                      </p>
+                                    )}
+
+                                    <label className="field-label">
+                                      称呼
+                                      <input
+                                        className="text-input"
+                                        value={acctDisplayName}
+                                        disabled={acctBusy}
+                                        onChange={(e) => setAcctDisplayName(e.target.value)}
+                                        placeholder="界面上显示的名字"
+                                      />
+                                    </label>
+
+                                    <label className="field-label">
+                                      当前密码
+                                      <input
+                                        className="text-input"
+                                        type="password"
+                                        autoComplete="current-password"
+                                        value={acctCurrentPw}
+                                        disabled={acctBusy}
+                                        onChange={(e) => setAcctCurrentPw(e.target.value)}
+                                        placeholder="改用户名或改密码都需要"
+                                      />
+                                    </label>
+
+                                    <button
+                                      type="button"
+                                      className="secondary-button full-width"
+                                      disabled={acctBusy}
+                                      onClick={() => void saveAccountProfile()}
+                                    >
+                                      保存用户名 / 称呼
+                                    </button>
+
+                                    <div className="divider" />
+
+                                    <label className="field-label">
+                                      新密码
+                                      <input
+                                        className="text-input"
+                                        type="password"
+                                        autoComplete="new-password"
+                                        value={acctNewPw}
+                                        disabled={acctBusy}
+                                        onChange={(e) => setAcctNewPw(e.target.value)}
+                                        placeholder="至少 6 位"
+                                      />
+                                    </label>
+                                    <label className="field-label">
+                                      确认新密码
+                                      <input
+                                        className="text-input"
+                                        type="password"
+                                        autoComplete="new-password"
+                                        value={acctNewPw2}
+                                        disabled={acctBusy}
+                                        onChange={(e) => setAcctNewPw2(e.target.value)}
+                                      />
+                                    </label>
+                                    <button
+                                      type="button"
+                                      className="secondary-button full-width"
+                                      disabled={acctBusy || !acctNewPw}
+                                      onClick={() => void saveAccountPassword()}
+                                    >
+                                      修改密码
+                                    </button>
+
+                                    <div className="divider" />
+                                    <div className="row-actions">
+                                      {account.can.manageUsers && (
+                                        <a className="ghost-button" href="/admin">后台管理</a>
+                                      )}
+                                      <button
+                                        type="button"
+                                        className="ghost-button"
+                                        onClick={async () => {
+                                          await fetch("/api/auth/logout", { method: "POST" });
+                                          window.location.href = "/login";
+                                        }}
+                                      >
+                                        退出登录
+                                      </button>
+                                    </div>
+                                  </>
+                                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -6217,14 +6951,21 @@ function App() {
               </label>
               <label className="field-label">
                 TTS API Key（留空则同主 API Key）
-                <input className="text-input" type="password" value={aiSettings.ttsApiKey || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsApiKey: e.target.value }))} placeholder="留空继承主 API Key" />
+                <input
+                  className="text-input"
+                  type="password"
+                  autoComplete="new-password"
+                  value={aiSettings.ttsApiKey || ""}
+                  onChange={(e) => setAiSettings((c) => ({ ...c, ttsApiKey: e.target.value }))}
+                  placeholder={aiSettings.ttsApiKeyConfigured ? "已配置 · 留空则不变，填入新值即替换" : "留空继承主 API Key"}
+                />
               </label>
               <label className="field-label">
                 TTS 模型
                 <input className="text-input" value={aiSettings.ttsModel || ""} onChange={(e) => setAiSettings((c) => ({ ...c, ttsModel: e.target.value }))} placeholder="qwen3-tts-flash / gpt-4o-mini-tts 等" />
               </label>
               <div className="muted-text" style={{ fontSize: "0.72rem" }}>
-                修改后点"保存设置并刷新页面"生效。
+                修改即时保存并生效。
               </div>
             </div>
           </div>
@@ -6493,7 +7234,24 @@ function App() {
               <span>关于 明史阅读器</span>
             </div>
             <div className="about-content">
-              <p><strong>版本：</strong>v1.3.1（2026-06-03）— 明实录、四库全书本明史、东林列传、菽园杂记实现基于jiayan的自动标点。新增明王室世系树，历史计算器，含日期换算、度量衡、货币汇率；修正了关于搜索结果跳转的bug。详见 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
+              {siteContent?.versionNotice?.value?.trim() && (
+                <>
+                  <p><strong>本站公告：</strong></p>
+                  <p style={{ whiteSpace: "pre-wrap" }}>{siteContent.versionNotice.value}</p>
+                  {siteContent.versionNotice.updatedAt && (
+                    <p className="muted-text" style={{ fontSize: "0.78rem" }}>
+                      由 {siteContent.versionNotice.updatedBy || "管理员"} 更新于 {siteContent.versionNotice.updatedAt}
+                    </p>
+                  )}
+                </>
+              )}
+              {siteContent?.readme?.value?.trim() && (
+                <>
+                  <p><strong>站点说明：</strong></p>
+                  <p style={{ whiteSpace: "pre-wrap" }}>{siteContent.readme.value}</p>
+                </>
+              )}
+              <p><strong>版本：</strong>v1.3.3（2026-06-08）— Windows 多处修复：世系图、人物索引、语义检索等依赖文件路径解析重写，Windows Pro 版功能与 Mac 对齐；左侧栏、上下窗口、进度条等界面更紧凑；古今地名地图改用 CDN 瓦片，国内访问更稳；中研院历史地名查询页改用独立 session 嵌入，搜索状态不再被刷掉。详见 <a href="https://github.com/CanhuiLiPhy/Reader-Mingshi" target="_blank" rel="noopener noreferrer">GitHub README</a></p>
               <p><strong>使用说明：</strong></p>
               <ul>
                 <li>首次进入软件请打开左上「设置」面板填入 AI API Key（兼容 DashScope / 火山 / DeepSeek / Kimi 等 OpenAI 兼容平台），<strong>填完即生效，无需重启</strong>。</li>
@@ -6569,7 +7327,7 @@ type PresetProviderKey =
   | "google" | "openai" | "openrouter" | "minimax";
 type PresetSpec = { label: string; baseURL: string; suggestedModels: string[] };
 const API_PRESETS: Record<PresetProviderKey, PresetSpec> = {
-  dashscope: { label: "百炼 (阿里云 DashScope)", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", suggestedModels: ["deepseek-v4-pro", "qwen3.6-flash-2026-04-16", "kimi-k2.6", "qwen3.6-max-preview"] },
+  dashscope: { label: "百炼 (阿里云 DashScope)", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", suggestedModels: ["qwen3.7-max-2026-05-20", "qwen3.7-max", "qwen3.7-max-preview", "qwen3.7-max-2026-05-17", "qwen3.7-flash", "deepseek-v4-flash-0731"] },
   ark: { label: "火山引擎 (Volcengine Ark)", baseURL: "https://ark.cn-beijing.volces.com/api/v3", suggestedModels: ["doubao-1-5-pro-32k-250115"] },
   deepseek: { label: "DeepSeek 官方", baseURL: "https://api.deepseek.com/v1", suggestedModels: ["deepseek-v4-pro", "deepseek-v4-flash"] },
   moonshot: { label: "Kimi (Moonshot)", baseURL: "https://api.moonshot.cn/v1", suggestedModels: ["kimi-k2-0905-preview", "moonshot-v1-32k"] },
@@ -6658,21 +7416,31 @@ function ApiKeyListEditor({ providers, onChange }: {
       )}
       <div style={{ display: "grid", gap: "0.4rem" }}>
         {providers.map((p, i) => {
-          const masked = p.apiKey ? `${p.apiKey.slice(0, 6)}…${p.apiKey.slice(-4)}` : "（未填）";
+          // 不再显示 key 的首尾字符：那本身就是泄露，而且网站版这里恒为空串。
+          // 只说「配没配」，值由服务端保管。
+          // No masked preview of the key: showing its first and last characters
+          // is itself a disclosure, and on the web build the field is always
+          // empty anyway. Report only whether one is configured.
+          const keyLabel = p.builtin
+            ? "系统内置"
+            : (p.apiKey || p.apiKeyConfigured) ? "已配置" : "（未填）";
           return (
             <div
               key={p.id}
               className="result-card static-card"
-              style={{ padding: "0.65rem 0.75rem", cursor: "pointer" }}
-              onClick={() => openEdit(i)}
+              style={{ padding: "0.65rem 0.75rem", cursor: p.builtin ? "default" : "pointer" }}
+              onClick={() => { if (!p.builtin) openEdit(i); }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.3rem" }}>
                 <strong style={{ color: "#603d1b" }}>{p.alias || p.baseURL || "未命名"}</strong>
                 {i === 0 && (
                   <span style={{ background: "#c0903022", color: "#8a5a1d", fontSize: "0.68rem", padding: "0.1rem 0.4rem", borderRadius: "0.3rem", border: "1px solid #c0903055" }}>优先</span>
                 )}
+                {p.builtin && (
+                  <span style={{ background: "rgba(63,107,70,0.12)", color: "#3f6b46", fontSize: "0.68rem", padding: "0.1rem 0.4rem", borderRadius: "0.3rem", border: "1px solid rgba(63,107,70,0.35)" }}>系统内置 · 不可查看</span>
+                )}
                 <span className="muted-text" style={{ fontSize: "0.7rem" }}>{p.baseURL}</span>
-                <span className="muted-text" style={{ fontSize: "0.7rem", marginLeft: "auto" }}>Key {masked}</span>
+                <span className="muted-text" style={{ fontSize: "0.7rem", marginLeft: "auto" }}>Key {keyLabel}</span>
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "0.25rem", marginBottom: "0.3rem" }}>
                 {p.models.length === 0 && <span className="muted-text" style={{ fontSize: "0.7rem" }}>未激活任何模型</span>}
@@ -6680,12 +7448,25 @@ function ApiKeyListEditor({ providers, onChange }: {
                   <span key={m} style={{ background: "rgba(110,66,23,0.08)", borderRadius: "0.35rem", padding: "0.1rem 0.4rem", fontSize: "0.72rem" }}>{m}</span>
                 ))}
               </div>
-              <div style={{ display: "flex", gap: "0.3rem" }} onClick={(e) => e.stopPropagation()}>
-                <button type="button" className="ghost-button compact-button" disabled={i === 0} onClick={() => move(i, -1)} title="上移（提高优先级）">↑</button>
-                <button type="button" className="ghost-button compact-button" disabled={i === providers.length - 1} onClick={() => move(i, 1)} title="下移">↓</button>
-                <button type="button" className="ghost-button compact-button" onClick={() => openEdit(i)}>编辑</button>
-                <button type="button" className="ghost-button compact-button danger" onClick={() => removeAt(i)}>删除</button>
-              </div>
+              {/* 系统内置条目不给任何编辑入口 —— 这是「禁止前端编辑」那条要求的落点。
+                  真正的门禁在服务端（客户端传来的 provider 一律丢弃），这里只是
+                  不误导用户去点一个改不动的东西。
+                  The built-in entry exposes no edit affordance at all. The real
+                  enforcement is server-side — client-supplied providers are
+                  discarded outright — this just avoids offering a control that
+                  cannot work. */}
+              {p.builtin ? (
+                <div className="muted-text" style={{ fontSize: "0.7rem" }}>
+                  由服务器统一配置，不可查看或修改。如需用自己的 Key，点上方「+ 新增 API Key」另加一条（会优先于内置）。
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: "0.3rem" }} onClick={(e) => e.stopPropagation()}>
+                  <button type="button" className="ghost-button compact-button" disabled={i === 0} onClick={() => move(i, -1)} title="上移（提高优先级）">↑</button>
+                  <button type="button" className="ghost-button compact-button" disabled={i === providers.length - 1} onClick={() => move(i, 1)} title="下移">↓</button>
+                  <button type="button" className="ghost-button compact-button" onClick={() => openEdit(i)}>编辑</button>
+                  <button type="button" className="ghost-button compact-button danger" onClick={() => removeAt(i)}>删除</button>
+                </div>
+              )}
             </div>
           );
         })}
@@ -6716,7 +7497,26 @@ function ApiKeyListEditor({ providers, onChange }: {
               </label>
               <label className="field-label">
                 API Key
-                <input className="text-input" type="password" value={draft.apiKey} placeholder="sk-..." onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })} />
+                {/* 只写：已配置的条目输入框是空的，留空保存 = 保持原 Key 不变，
+                    填了新值 = 覆盖。服务端 mergeAiSettingsWrite 负责兜底，
+                    所以就算这里被绕过也不会把 Key 写没。
+                    Write-only: an already-configured entry shows an empty box.
+                    Saving it blank keeps the stored key; typing replaces it.
+                    The server's mergeAiSettingsWrite enforces the same rule, so
+                    bypassing this input cannot wipe the credential either. */}
+                <input
+                  className="text-input"
+                  type="password"
+                  autoComplete="new-password"
+                  value={draft.apiKey}
+                  placeholder={draft.apiKeyConfigured ? "已配置 · 留空则不变，填入新值即替换" : "sk-..."}
+                  onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
+                />
+                {draft.apiKeyConfigured && (
+                  <small className="muted-text" style={{ fontSize: "0.72rem" }}>
+                    出于安全考虑，已保存的 Key 不会显示出来。
+                  </small>
+                )}
               </label>
               <div className="field-label">
                 <span>激活模型（这些模型名将出现在「主模型 / 小模型」下拉里）</span>
@@ -6782,13 +7582,27 @@ function MingGeographyMap({ places }: { places: GeocodePlace[] }) {
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const map = L.map(containerRef.current, { center: [33.5, 108], zoom: 4, minZoom: 3, maxZoom: 12 });
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OpenStreetMap contributors", maxZoom: 19,
+    // OSM 主源 + Carto fastly CDN 备用源（OSM 在国内不稳，Carto 通常能通）。
+    L.tileLayer("https://cartodb-basemaps-{s}.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png", {
+      subdomains: "abcd",
+      attribution: "&copy; OpenStreetMap contributors, &copy; CARTO",
+      maxZoom: 19,
     }).addTo(map);
     const markerLayer = L.layerGroup().addTo(map);
     mapRef.current = map;
     markerLayerRef.current = markerLayer;
-    return () => { map.remove(); mapRef.current = null; markerLayerRef.current = null; };
+    // 容器在面板初次展开/窗口缩放后可能尺寸变了，Leaflet 不自动重测 — 手动触发。
+    const ro = new ResizeObserver(() => { map.invalidateSize(); });
+    ro.observe(containerRef.current);
+    // 兜底：mount 之后 200ms 再叫一次（应对面板从 display:none 切到可见）
+    const tid = window.setTimeout(() => map.invalidateSize(), 200);
+    return () => {
+      window.clearTimeout(tid);
+      ro.disconnect();
+      map.remove();
+      mapRef.current = null;
+      markerLayerRef.current = null;
+    };
   }, []);
 
   useEffect(() => {

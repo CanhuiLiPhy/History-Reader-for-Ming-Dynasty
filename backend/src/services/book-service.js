@@ -2,7 +2,10 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import unzipper from "unzipper";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import Fuse from "fuse.js";
 import { XMLParser } from "fast-xml-parser";
 import { parse } from "node-html-parser";
@@ -10,7 +13,7 @@ import * as OpenCC from "opencc-js";
 import { BOOK_PATH, BOOKS_DIR, CACHE_ROOT } from "../config/defaults.js";
 import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
-import { ensureAnchorMap, translateAnchor } from "./epub-anchor-map.js";
+import { ensureAnchorMap, translateAnchor, extractAnchorFragment } from "./epub-anchor-map.js";
 import { getDb } from "./library-db.js";
 
 export const DEFAULT_BOOK_SLUG = "ming-shi";
@@ -782,6 +785,7 @@ export async function searchAcrossBooks(query, options = {}) {
     chapterId: String(row.chapterOrder ?? index),
     chapterOrder: row.chapterOrder ?? null,
     chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
+    paragraphAnchor: extractAnchorFragment(row.anchor || ""),
     chapterTitle: row.chapter || "",
     score: typeof row.rank === "number" ? Number((-row.rank).toFixed(3)) : 0,
     snippet: toSnippet(row.content, safeQuery),
@@ -888,6 +892,7 @@ export async function searchFuzzy(query, options = {}) {
     chapterId: String(row.chapterOrder ?? 0),
     chapterOrder: row.chapterOrder ?? null,
     chapterHref: translateAnchor(row.bookSlug, row.anchor || ""),
+    paragraphAnchor: extractAnchorFragment(row.anchor || ""),
     chapterTitle: row.chapter || "",
     score: Math.round((row.coverage / variants.length) * 100) / 100,
     snippet: toSnippet(row.content, safeQuery),
@@ -935,7 +940,7 @@ let _bioIndexCache = null;
 function loadBiographyIndex() {
   if (_bioIndexCache) return _bioIndexCache;
   try {
-    const file = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../data/biography-index.json");
+    const file = path.resolve(__dirname, "../data/biography-index.json");
     const raw = fsSync.readFileSync(file, "utf8");
     _bioIndexCache = JSON.parse(raw);
   } catch (e) {

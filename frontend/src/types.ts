@@ -97,6 +97,10 @@ export type SearchResult = {
   bookSlug?: string;
   bookTitle?: string;
   chapterOrder?: number | null;
+  // EPUB 段落锚（原始 anchor 的 # 后部分，如 filepos0003788693）。
+  // chapterHref 现在指向 split-EPUB 的某一章文件（不含 #），所以单独把
+  // 段落锚拆出来给前端按 ID 精确滚动用。
+  paragraphAnchor?: string;
 };
 
 export type SearchResponse = {
@@ -144,7 +148,16 @@ export type ModelProvider = {
   // 预设供应商 key（"dashscope" / "deepseek" / "ark" / ...），可空表示完全自定义
   presetProvider?: string;
   baseURL: string;
+  // 网站版下发的永远是空串：密钥只在服务端流动。填了新值才会覆盖，
+  // 留空表示「保持不变」。桌面版仍是真实值。
+  // On the web build this is always "" — credentials never reach the browser.
+  // A non-empty value means "replace it"; empty means "leave it alone".
   apiKey: string;
+  // 服务端标记：该条已配置密钥（值不下发）/ 该条是系统内置、前端不可编辑。
+  // Server-set flags: a credential exists for this entry (value withheld) /
+  // this entry comes from the server environment and is read-only in the UI.
+  apiKeyConfigured?: boolean;
+  builtin?: boolean;
   // 该 provider 激活的模型名列表 —— 这些会被合并进主/小模型下拉
   models: string[];
 };
@@ -159,6 +172,10 @@ export type AiSettings = {
   smallModelOptions?: string[];
   ttsBaseURL: string;
   ttsApiKey?: string;
+  // 同上：只写不读，服务端只告诉前端「配没配」。
+  // Write-only as above; the server reports only whether a key exists.
+  apiKeyConfigured?: boolean;
+  ttsApiKeyConfigured?: boolean;
   ttsModel: string;
   ttsVoice: string;
   systemPrompt: string;

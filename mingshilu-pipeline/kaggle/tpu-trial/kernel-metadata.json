@@ -1,0 +1,11 @@
+{
+  "id": "canhuiliphy/mingshilu-qwen-tpu-trial",
+  "title": "Mingshilu Qwen TPU Trial",
+  "code_file": "mingshi-tpu-trial.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_tpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["canhuiliphy/mingshilu-prechunked-p78"]
+}

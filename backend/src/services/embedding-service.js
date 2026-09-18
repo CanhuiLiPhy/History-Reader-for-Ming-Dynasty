@@ -10,8 +10,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { CACHE_ROOT } from "../config/defaults.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const VEC_DB_PATH = path.join(CACHE_ROOT, "paragraphs-vec-int8.sqlite");
 const EXT_DIR = path.join(CACHE_ROOT, "sqlite-vec-extensions");
@@ -22,7 +25,7 @@ const EXT_DIR = path.join(CACHE_ROOT, "sqlite-vec-extensions");
 // CACHE_ROOT 已用相同策略（dev=backend/.cache, packaged=backend-data/.cache），
 // 所以 scripts 跟它平级的 ../scripts 取即可。
 const SIDE_SCRIPT = (() => {
-  const devPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "scripts", "embed_query.py");
+  const devPath = path.resolve(__dirname, "..", "..", "scripts", "embed_query.py");
   if (fs.existsSync(devPath)) return devPath;
   // packaged: scripts/ 跟 .cache/ 同在 backend-data/ 下
   const pkgPath = path.resolve(CACHE_ROOT, "..", "scripts", "embed_query.py");
@@ -76,12 +79,17 @@ function tryOpenVecDb() {
 // absolute path to the python binary, or "python3" to inherit PATH lookup.
 function resolveBundledPython() {
   // CACHE_ROOT 在 dev=backend/.cache, packaged=Resources/backend-data/.cache —
-  // python-runtime 跟它平级（同在 dataRoot 下）
-  const candidates = [
-    path.resolve(CACHE_ROOT, "..", "python-runtime", "bin", "python3"),
-    path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "python-runtime", "bin", "python3"),
+  // python-runtime 跟它平级（同在 dataRoot 下）。
+  // Mac/Linux 走 bin/python3，Windows 嵌入版直接是根目录下 python.exe。
+  const isWin = process.platform === "win32";
+  const pyName = isWin ? "python.exe" : "python3";
+  const subPath = isWin ? [pyName] : ["bin", pyName];
+  const roots = [
+    path.resolve(CACHE_ROOT, "..", "python-runtime"),
+    path.resolve(__dirname, "..", "..", "python-runtime"),
   ];
-  for (const p of candidates) {
+  for (const root of roots) {
+    const p = path.join(root, ...subPath);
     if (fs.existsSync(p)) return p;
   }
   return null;
@@ -90,7 +98,7 @@ function resolveBundledPython() {
 function resolveBundledFastembedCache() {
   const candidates = [
     path.resolve(CACHE_ROOT, "..", "fastembed-cache"),
-    path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "fastembed-cache"),
+    path.resolve(__dirname, "..", "..", "fastembed-cache"),
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
@@ -166,6 +174,8 @@ function spawnSidecar() {
 
   proc.on("exit", (code) => {
     console.warn(`[embedding-sidecar] exited code=${code}`);
+    // 进程没了，待关闭计时就没有意义了。/ Nothing left to shut down.
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     if (proc._readyResolvers) {
       proc._readyResolvers.reject(new Error(`sidecar exited before ready (code ${code})`));
       proc._readyResolvers = null;
@@ -217,16 +227,65 @@ export function isAvailable() {
   return !!tryOpenVecDb();
 }
 
+/**
+ * 中文：空闲多久后关掉 sidecar 释放内存。0 = 常驻不退出。
+ *
+ * How long the sidecar may sit idle before it is shut down to reclaim memory.
+ *
+ * 这个进程常驻要 279 MB（实测，BGE-small 的 90 MB fp32 权重 + onnxruntime），
+ * 而网站版那台机器总共只有 414 MB。语义检索是低频操作，让它为了偶尔一次查询
+ * 长期占住三分之二的内存并不划算 —— 用完就退，下次再拉起来。
+ *
+ * The process holds 279 MB resident once loaded (measured: 90 MB of fp32
+ * BGE-small weights plus the onnxruntime session), on a host with 414 MB in
+ * total. Semantic search is infrequent, so keeping two thirds of the machine's
+ * memory tied up between queries is a bad trade: shut down and pay the reload
+ * on the next one instead.
+ *
+ * 代价是冷启动延迟（加载模型约数秒）。设 0 可关闭该行为，恢复常驻。
+ * The cost is a cold start of a few seconds. Set 0 to keep it resident.
+ */
+const SIDECAR_IDLE_MS = Number.parseInt(process.env.EMBED_SIDECAR_IDLE_MS ?? "90000", 10);
+
+let idleTimer = null;
+
+/**
+ * 中文：重置空闲计时器。有在途请求时不计时。
+ *
+ * Restart the idle countdown. Does nothing while requests are still in flight,
+ * so a slow query can never have the process pulled out from under it.
+ */
+function armIdleShutdown() {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  if (!SIDECAR_IDLE_MS || SIDECAR_IDLE_MS <= 0) return;
+  if (pendingRequests.size > 0) return;
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    if (!sidecar || pendingRequests.size > 0) return;
+    console.log(`[embedding-sidecar] idle ${SIDECAR_IDLE_MS}ms — shutting down to free memory`);
+    shutdownSidecar();
+  }, SIDECAR_IDLE_MS);
+  // 这个定时器不该拖住进程退出。/ Never keep the process alive just for this.
+  if (typeof idleTimer.unref === "function") idleTimer.unref();
+}
+
+
 export async function embedQuery(text, timeoutMs = 8000) {
+  // 有请求进来就先取消待关闭计时，避免正要用时被关掉。
+  // Cancel any pending shutdown first: the process must not be torn down
+  // between this call and the write below.
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   await startSidecar();
   const id = `r${++nextRequestId}`;
   return new Promise((resolve, reject) => {
-    pendingRequests.set(id, { resolve, reject });
+    const settle = (fn) => (value) => { fn(value); armIdleShutdown(); };
+    pendingRequests.set(id, { resolve: settle(resolve), reject: settle(reject) });
     sidecar.stdin.write(JSON.stringify({ id, text }) + "\n");
     setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
         reject(new Error(`embed query timeout (${timeoutMs}ms)`));
+        armIdleShutdown();
       }
     }, timeoutMs);
   });
@@ -326,10 +385,25 @@ export function reciprocalRankFusion(listA, listB, k = 60) {
  * Stop the sidecar gracefully. Call on backend shutdown.
  */
 export function shutdownSidecar() {
-  if (sidecar) {
-    try { sidecar.stdin.end(); } catch { /* noop */ }
-    try { sidecar.kill(); } catch { /* noop */ }
-    sidecar = null;
-    sidecarReady = null;
-  }
+  if (!sidecar) return;
+  const proc = sidecar;
+  sidecar = null;
+  sidecarReady = null;
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  // 主动关闭不算「刚失败过」。startSidecar 的 30 秒冷却是防止启动失败后疯狂
+  // 重试；空闲退出属正常生命周期，不清掉这个时间戳的话，退出后 30 秒内的下一次
+  // 查询会被冷却逻辑直接拒绝。
+  // A deliberate stop is not a failure. The 30 s cooldown in startSidecar keeps
+  // a crash-looping sidecar from being respawned on every request; leaving the
+  // timestamp set would make idle shutdown reject the next query arriving
+  // inside that window.
+  lastSidecarStartAt = 0;
+  try { proc.stdin.end(); } catch { /* noop */ }
+  try { proc.kill("SIGTERM"); } catch { /* noop */ }
+  // 赖着不走就强杀，别让它继续占着那 279 MB。
+  // Escalate if it lingers; the point of this call is to release the memory.
+  const killTimer = setTimeout(() => {
+    try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+  }, 3000);
+  if (typeof killTimer.unref === "function") killTimer.unref();
 }
