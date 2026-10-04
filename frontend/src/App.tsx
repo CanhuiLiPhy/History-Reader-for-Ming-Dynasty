@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 import { PageSlider } from "./components/PageSlider";
-import { renderedPageDelta } from "./lib/reader-pagination";
+import { jumpRenderedProgress, renderedPagination, type PaginatedManager } from "./lib/reader-pagination";
 import { ReaderViewManager, prepareEpubRenditionForDestroy } from "./lib/epubReaderManager";
 import { ShixiTree } from "./components/ShixiTree";
 import { HistoricalCalculator } from "./components/HistoricalCalculator";
@@ -209,11 +209,8 @@ type EpubRenditionLike = {
   };
   getContents?: () => EpubContentsLike[];
   reportLocation?: () => void;
-  manager?: {
-    settings: { axis?: string };
-    layout: { pageWidth: number; height: number; divisor: number };
-    scrollBy: (x: number, y: number, silent: boolean) => void;
-  };
+  q?: { enqueue: (work: () => void) => Promise<unknown> };
+  manager?: PaginatedManager;
   annotations: {
     add: (type: string, cfiRange: string, data?: object, callback?: unknown, className?: string, styles?: object) => void;
     remove: (cfiRange: string, type: string) => void;
@@ -1478,7 +1475,7 @@ function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keyboardPagingEnabled, currentBookSlug, readableBooks]);
+  }, [keyboardPagingEnabled, currentBookSlug, readableBooks, dbReaderIndex, dbReaderChapter, dbReaderLoading, bookSwitching]);
 
   useEffect(() => {
     if (!hasLoadedLocalState) return;
@@ -1680,21 +1677,15 @@ function App() {
 
     // Try to get whole-book progress from CFI
     let wholeProgress = fallbackWholeProgress;
-    let wholeLocation = 0;
     if (nextCfi && locations) {
       const pct = locations.percentageFromCfi?.(nextCfi);
       if (pct != null && pct > 0) wholeProgress = clamp(pct * 100, 0, 100);
-      const loc = locations.locationFromCfi?.(nextCfi);
-      if (loc != null && loc > 0) wholeLocation = loc;
     }
 
     if (!navigation.length) {
       return {
         label: fallbackLabel || findTocLabel(meta?.tocTree || [], nextHref) || meta?.metadata.title || "",
         wholeProgress,
-        chapterProgress: wholeProgress,
-        pageCurrent: 1,
-        pageTotal: 1,
         chapterIndex: 0,
       };
     }
@@ -1732,15 +1723,7 @@ function App() {
 
     if (chapterIndex < 0) chapterIndex = 0;
 
-    // --- Compute page info ---
     const currentChapter = navigation[chapterIndex];
-    const nextChapter = navigation[chapterIndex + 1];
-    const totalLocations = Math.max(1, locations?.total ?? 1);
-    const startLocation = currentChapter?.locationIndex ?? 0;
-    const endLocationExclusive = nextChapter?.locationIndex ?? totalLocations;
-    const pageTotal = Math.max(1, endLocationExclusive - startLocation);
-    const pageCurrent = wholeLocation > 0 ? clamp(wholeLocation - startLocation + 1, 1, pageTotal) : 1;
-    const chapterProgressValue = pageTotal <= 1 ? 0 : ((pageCurrent - 1) / Math.max(pageTotal - 1, 1)) * 100;
 
     // Fix wholeProgress if it was 0 but we know the chapter
     if (wholeProgress <= 0 && currentChapter) {
@@ -1750,9 +1733,6 @@ function App() {
     return {
       label: currentChapter?.label || fallbackLabel || meta?.metadata.title || "",
       wholeProgress,
-      chapterProgress: clamp(chapterProgressValue, 0, 100),
-      pageCurrent,
-      pageTotal,
       chapterIndex,
     };
   }
@@ -1840,7 +1820,6 @@ function App() {
       console.info(`  chapterNav[${nextItems.length-1}]: ${l.label} loc=${l.locationIndex} pct=${(l.percentage*100).toFixed(1)}%`);
     }
     (window as any).__chapterNav = { items: nextItems, totalLocations, spineStartMapSize: spineStartMap.size, locationsArrayLen: locationsArray.length };
-    (window as any).__jumpToPage = jumpToPage;
 
     if (currentCfiRef.current) {
       const liveLocation = renditionRef.current?.currentLocation?.();
@@ -1851,8 +1830,7 @@ function App() {
       const derived = deriveChapterState(currentCfiRef.current, currentHref, currentSectionLabel, liveProgress);
       setCurrentSectionLabel(derived.label);
       setProgress(derived.wholeProgress);
-      setChapterPageCurrent(liveLocation?.start?.displayed?.page || 1);
-      setChapterPageTotal(liveLocation?.start?.displayed?.total || 1);
+      syncRenderedPagination(liveLocation);
       setCurrentChapterIndex(derived.chapterIndex);
     }
   }
@@ -2012,51 +1990,43 @@ function App() {
     }
   }
 
-  // Load a chapter for DB-reader (non-EPUB books).
-  //
-  // Same-chapter short-circuit: if the requested index matches what's already
-  // loaded, return immediately. This avoids a subtle race where search nav
-  // re-clicks the SAME chapter, scrollToSearchTarget snaps to the target page
-  // and clears pendingSearchNavRef, THEN the rAF below would run with the ref
-  // already null and reset scrollLeft to 0 — slingshotting the view back to
-  // page 1. Caller can rely on `searchNavTick`-driven useEffect to (re)align
-  // scroll position within the existing chapter.
-  async function loadDbReaderChapter(index: number) {
+  // Search can navigate inside the already loaded chapter. Re-fetching it
+  // would replace the content and reset that search's page/paragraph anchor.
+  async function loadDbReaderChapter(index: number, landing: "start" | "end" = "start") {
     const chapters = dbChaptersRef.current;
     const slug = activeBookSlugRef.current;
     if (!chapters || chapters.slug !== slug || index < 0 || index >= chapters.chapters.length) return;
     chapterRequestRef.current?.abort();
     const controller = new AbortController();
     chapterRequestRef.current = controller;
-    if (dbReaderChapter?.slug === slug && dbReaderIndex === index) { setDbReaderLoading(false); return; }
+    if (dbReaderChapter?.slug === slug && dbReaderIndex === index) {
+      skipNextDbScrollResetRef.current = false;
+      chapterRequestRef.current = null;
+      setDbReaderLoading(false);
+      return;
+    }
     setBootError("");
     setDbReaderLoading(true);
     try {
       const data = await fetchReaderChapter(slug, index, controller.signal);
       if (controller.signal.aborted || activeBookSlugRef.current !== slug) return;
+      if (!skipNextDbScrollResetRef.current && !pendingSearchNavRef.current) {
+        // Recompute clamps Infinity to the new chapter's last page. Applying
+        // this before the render avoids a late rAF resetting a search/slider.
+        dbTargetPageRef.current = landing === "end" ? Number.POSITIVE_INFINITY : 0;
+        dbAnchorParaRef.current = null;
+      }
+      skipNextDbScrollResetRef.current = false;
       setDbReaderChapter(data);
       setDbReaderIndex(index);
       setDbPageIndex(0);
-      // Force scroll back to start; effect below recomputes page totals.
-      // 双重例外：
-      //   (1) skipNextDbScrollResetRef = true → 当次 chapter-load 是搜索导航
-      //       触发的，不能把 scrollLeft 清掉；
-      //   (2) pendingSearchNavRef.current 仍非空（搜索导航还没消费）→ 同上。
-      // 任一命中就消费旗子并 return；其他调用方（TOC、上下章按钮）走原 reset。
-      requestAnimationFrame(() => {
-        if (controller.signal.aborted) return;
-        if (skipNextDbScrollResetRef.current || pendingSearchNavRef.current) {
-          skipNextDbScrollResetRef.current = false;
-          return;
-        }
-        if (dbReaderHostRef.current) dbReaderHostRef.current.scrollLeft = 0;
-        dbTargetPageRef.current = 0;
-        dbAnchorParaRef.current = null;
-      });
     } catch (error) {
       if (!controller.signal.aborted) setBootError(error instanceof Error ? error.message : "加载章节失败。");
     } finally {
-      if (chapterRequestRef.current === controller) setDbReaderLoading(false);
+      if (chapterRequestRef.current === controller) {
+        chapterRequestRef.current = null;
+        setDbReaderLoading(false);
+      }
     }
   }
 
@@ -2121,25 +2091,35 @@ function App() {
 
   function flipDbPage(direction: -1 | 1) {
     const host = dbReaderHostRef.current;
-    if (!host) return;
+    if (!host || dbReaderLoading || bookSwitching || chapterRequestRef.current) return;
     const cw = host.clientWidth;
     if (!cw) return;
-    const currentTarget = dbTargetPageRef.current ?? Math.round(host.scrollLeft / cw);
-    const next = Math.max(0, Math.min(dbPageTotal - 1, currentTarget + direction));
+    const total = Math.max(1, Math.round(host.scrollWidth / cw));
+    const currentTarget = Math.max(0, Math.min(total - 1,
+      dbTargetPageRef.current ?? Math.round(host.scrollLeft / cw)));
+    const next = currentTarget + direction;
+    if (next < 0 || next >= total) {
+      void loadDbReaderChapter(dbReaderIndex + direction, direction < 0 ? "end" : "start");
+      return;
+    }
     dbTargetPageRef.current = next;
+    dbAnchorParaRef.current = null;
     host.scrollTo({ left: next * cw, behavior: "smooth" });
-    // Capture anchor after the smooth scroll finishes (not before — pre-flip
-    // captures the OLD page's anchor and we'd never advance after layout).
-    setTimeout(captureDbAnchor, 280);
+    // The scroll-settle listener captures the anchor once navigation ends.
   }
 
-  function jumpDbPage(target: number) {
+  function jumpDbPage(progress: number) {
     const host = dbReaderHostRef.current;
-    if (!host) return;
-    const clamped = Math.max(0, Math.min(dbPageTotal - 1, target));
-    dbTargetPageRef.current = clamped;
-    host.scrollTo({ left: clamped * host.clientWidth, behavior: "smooth" });
-    setTimeout(captureDbAnchor, 280);
+    if (!host || !host.clientWidth || dbReaderLoading || chapterRequestRef.current) return;
+    const total = Math.max(1, Math.round(host.scrollWidth / host.clientWidth));
+    const target = Math.round(Math.max(0, Math.min(1, progress)) * (total - 1));
+    dbTargetPageRef.current = target;
+    dbAnchorParaRef.current = null;
+    // An explicit absolute jump cancels any in-flight smooth page turn.
+    host.scrollTo({ left: target * host.clientWidth, behavior: "instant" });
+    setDbPageTotal(total);
+    setDbPageIndex(target);
+    captureDbAnchor();
   }
 
   // Recompute total pages whenever the chapter content or theme/font changes.
@@ -2154,7 +2134,7 @@ function App() {
       if (article) {
         article.style.columnWidth = cw + "px";
       }
-      const total = Math.max(1, Math.ceil(host.scrollWidth / Math.max(1, cw)));
+      const total = Math.max(1, Math.round(host.scrollWidth / Math.max(1, cw)));
       setDbPageTotal(total);
       // Anchor-based reflow: find the paragraph element we recorded as the
       // leftmost visible before the layout change, look up its NEW column
@@ -2175,7 +2155,7 @@ function App() {
       const clamped = Math.max(0, Math.min(total - 1, targetPage));
       const desired = clamped * cw;
       if (Math.abs(host.scrollLeft - desired) > 1) {
-        host.scrollLeft = desired;
+        host.scrollTo({ left: desired, behavior: "instant" });
       }
       dbTargetPageRef.current = clamped;
       setDbPageIndex(clamped);
@@ -2326,21 +2306,31 @@ function App() {
   swipeNextRef.current = goNextPage;
   swipePrevRef.current = goPrevPage;
 
-  function jumpToPage(targetPage: number) {
+  function syncRenderedPagination(location?: EpubLocationLike | null) {
+    const manager = renditionRef.current?.manager;
+    const divisor = manager?.settings.axis === "horizontal" ? manager.layout.divisor : 1;
+    const pages = renderedPagination(location?.start?.displayed, divisor);
+    setChapterPageCurrent(pages.page);
+    setChapterPageTotal(pages.total);
+  }
+
+  function jumpToPage(progress: number) {
     const rendition = renditionRef.current;
-    if (!rendition) return;
-    const loc = rendition.currentLocation?.();
-    const manager = rendition.manager;
-    if (!manager || !loc?.start?.displayed) return;
-    const { page, total } = loc.start.displayed;
-    const horizontal = manager.settings.axis === "horizontal";
-    const delta = renderedPageDelta(page ?? 1, targetPage, total ?? 1, horizontal ? manager.layout.divisor : 1);
-    if (!delta) return;
-    // scrollBy follows epub.js's own RTL convention and never loads another
-    // chapter. A double-page spread advances by its two physical columns.
-    manager.scrollBy(horizontal ? delta * manager.layout.pageWidth : 0,
-      horizontal ? 0 : delta * manager.layout.height, true);
-    rendition.reportLocation?.();
+    if (!rendition?.manager) return;
+    const chapterHref = rendition.currentLocation?.()?.start?.href;
+    const navigate = () => {
+      if (renditionRef.current !== rendition || !rendition.manager) return;
+      // A queued chapter turn takes precedence over a drag on the old chapter.
+      if (rendition.currentLocation?.()?.start?.href !== chapterHref) return;
+      if (jumpRenderedProgress(rendition.manager, progress)) {
+        rendition.reportLocation?.();
+        syncRenderedPagination(rendition.currentLocation?.());
+      }
+    };
+    // Share EPUB's navigation queue so a release cannot interrupt a pending
+    // display/next call. Read geometry at execution time after font reflow.
+    if (rendition.q) void rendition.q.enqueue(navigate).catch(() => {});
+    else navigate();
   }
 
 
@@ -2650,8 +2640,6 @@ function App() {
 
     rendition.on("relocated", (location: EpubLocationLike) => {
       if (disposed) return;
-      // Debug: dump raw location to see what epubjs reports
-      (window as any).__lastLocation = location;
       const nextCfi = location?.start?.cfi || "";
       const nextHref = location?.start?.href || "";
       const nextProgress =
@@ -2670,18 +2658,11 @@ function App() {
         pendingLocationTargetRef.current || forcedChapterTargetRef.current
       );
 
-      // epubjs directly reports page/total for the current section via displayed.
-      // Use it when available — it's more accurate than our location-based calc.
-      const epubjsPage = location?.start?.displayed?.page;
-      const epubjsTotal = location?.start?.displayed?.total;
-      const finalPageCurrent = (epubjsTotal && epubjsTotal > 1 && epubjsPage) ? epubjsPage : derived.pageCurrent;
-      const finalPageTotal = (epubjsTotal && epubjsTotal > 1) ? epubjsTotal : derived.pageTotal;
       setCurrentCfi(nextCfi);
       setCurrentHref(nextHref);
       setCurrentSectionLabel(derived.label);
       setProgress(derived.wholeProgress);
-      setChapterPageCurrent(finalPageCurrent);
-      setChapterPageTotal(finalPageTotal);
+      syncRenderedPagination(location);
       setCurrentChapterIndex(derived.chapterIndex);
       setLastLocation(nextCfi);
       pendingLocationLabelRef.current = "";
@@ -2739,16 +2720,11 @@ function App() {
           livePct,
           forcedChapterTargetRef.current
         );
-        const epubjsPage = live?.start?.displayed?.page;
-        const epubjsTotal = live?.start?.displayed?.total;
-        const finalPage = (epubjsTotal && epubjsTotal > 1 && epubjsPage) ? epubjsPage : derived.pageCurrent;
-        const finalTotal = (epubjsTotal && epubjsTotal > 1) ? epubjsTotal : derived.pageTotal;
         setCurrentCfi(liveCfi);
         setCurrentHref(liveHref);
         setCurrentSectionLabel(derived.label);
         setProgress(derived.wholeProgress);
-        setChapterPageCurrent(finalPage);
-        setChapterPageTotal(finalTotal);
+        syncRenderedPagination(live);
         setCurrentChapterIndex(derived.chapterIndex);
       }, 50);
       delayedUpdates.add(timer);
@@ -2783,9 +2759,7 @@ function App() {
                 const liveProgress = (book.locations.percentageFromCfi(currentCfiRef.current) || 0) * 100;
                 const derived = deriveChapterState(currentCfiRef.current, currentHref, currentSectionLabel, liveProgress);
                 setProgress(derived.wholeProgress);
-                const displayed = rendition.currentLocation?.()?.start?.displayed;
-                setChapterPageCurrent(displayed?.page || 1);
-                setChapterPageTotal(displayed?.total || 1);
+                syncRenderedPagination(rendition.currentLocation?.());
                 setCurrentChapterIndex(derived.chapterIndex);
                 setCurrentSectionLabel(derived.label);
               }
@@ -2901,8 +2875,7 @@ function App() {
     const derived = deriveChapterState(currentCfi, currentHref, currentSectionLabel, liveProgress, forcedChapterTargetRef.current);
     setCurrentSectionLabel(derived.label);
     setProgress(derived.wholeProgress);
-    setChapterPageCurrent(derived.pageCurrent);
-    setChapterPageTotal(derived.pageTotal);
+    syncRenderedPagination(liveLocation);
     setCurrentChapterIndex(derived.chapterIndex);
     forcedChapterTargetRef.current = "";
   // 这里基于当前 EPUB runtime 快照推导页面状态，不能把推导函数加入依赖导致重复定位。
@@ -5354,10 +5327,10 @@ function App() {
                 </div>
               </div>
               <div className="toolbar-actions">
-                <button type="button" className="ghost-button" onClick={() => flipDbPage(-1)} disabled={dbPageIndex <= 0}>
+                <button type="button" className="ghost-button" onClick={() => flipDbPage(-1)} disabled={dbReaderLoading || bookSwitching || (dbPageIndex <= 0 && dbReaderIndex <= 0)}>
                   上一页
                 </button>
-                <button type="button" className="ghost-button" onClick={() => flipDbPage(1)} disabled={dbPageIndex >= dbPageTotal - 1}>
+                <button type="button" className="ghost-button" onClick={() => flipDbPage(1)} disabled={dbReaderLoading || bookSwitching || (dbPageIndex >= dbPageTotal - 1 && dbReaderIndex >= (dbReaderChapters?.chapters.length ?? 1) - 1)}>
                   下一页
                 </button>
                 <button type="button" className="ghost-button" disabled={dbReaderIndex <= 0 || dbReaderLoading} onClick={() => void loadDbReaderChapter(dbReaderIndex - 1)}>
@@ -5447,7 +5420,7 @@ function App() {
             page={currentBook?.hasEpub === false ? dbPageIndex + 1 : chapterPageCurrent}
             total={currentBook?.hasEpub === false ? dbPageTotal : chapterPageTotal}
             disabled={loadingBoot || bookSwitching || dbReaderLoading || (currentBook?.hasEpub !== false && !readerReady)}
-            onCommit={(page) => currentBook?.hasEpub === false ? jumpDbPage(page - 1) : jumpToPage(page)}
+            onCommit={(progress) => currentBook?.hasEpub === false ? jumpDbPage(progress) : jumpToPage(progress)}
           />
           <div className="footer-meta">
             <span>当前位置已自动保存{currentBook?.hasEpub === false || locationsReady ? "" : " · 正在准备章节定位"}</span>
