@@ -246,7 +246,7 @@ export async function fetchHtml(url) {
       headers: {
         "User-Agent": "MingshiReaderAI/1.0 (+https://localhost)"
       },
-      signal: AbortSignal.timeout(30000)
+      signal: AbortSignal.timeout(60000)
     });
 
     if (!response.ok) {

@@ -16,7 +16,7 @@ async function fetchHtml(url, body = "") {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
       },
       body: body || undefined,
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(10000)
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return await response.text();

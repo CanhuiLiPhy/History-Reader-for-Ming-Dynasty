@@ -23,7 +23,7 @@ import type {
   TimelineResponse,
 } from "../types";
 
-async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit, timeoutMs = 35000) {
+async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit, timeoutMs = 70000) {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
 
@@ -129,7 +129,7 @@ export async function fetchAiChronology(person: string, aiSettings: AiSettings):
       person,
       aiSettings,
     }),
-  }, 600000);
+  }, 900000);
   return parseJsonResponse<ChronologyResponse>(response);
 }
 
@@ -150,7 +150,7 @@ export async function runPersonConversation(payload: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }, 600000);
+  }, 900000);
   return parseJsonResponse<PersonConversationResponse>(response);
 }
 
@@ -163,7 +163,7 @@ export async function runFreeConversation(payload: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }, 600000);
+  }, 900000);
   return parseJsonResponse<PersonConversationResponse>(response);
 }
 
@@ -179,7 +179,7 @@ export async function runAiAction(payload: {
   // to 300s after the timeout bump; with multi-model fallback the whole chain
   // can take 10+ minutes on a slow primary. Give the frontend abort enough
   // headroom that we never beat the backend's own retry chain.
-  const timeoutMs = payload.type === "qa" ? 900000 : 600000;
+  const timeoutMs = payload.type === "qa" ? 900000 : 900000;
   const response = await fetchWithTimeout("/api/ai/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -196,7 +196,7 @@ export async function synthesizeSpeech(text: string, aiSettings: AiSettings): Pr
       text,
       voice: aiSettings.ttsVoice || "",
     }),
-  }, 60000);
+  }, 120000);
 
   if (!response.ok) {
     const detail = await response.text();
@@ -261,7 +261,7 @@ export async function geocodePlaces(query: string, aiSettings?: AiSettings): Pro
     if (aiSettings.model) url.searchParams.set("model", aiSettings.model);
   }
   // 60s timeout: AI lookup can be slow for unfamiliar place names.
-  const response = await fetchWithTimeout(url, undefined, 60000);
+  const response = await fetchWithTimeout(url, undefined, 120000);
   return parseJsonResponse<GeocodeResponse>(response);
 }
 

@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { ACTION_PROMPTS, DEFAULT_CUSTOM_ACTIONS } from "../config/prompts.js";
 import { DEFAULT_AI_SETTINGS, NO_THINKING_AS_SMALL } from "../config/defaults.js";
 
-const CHAT_COMPLETION_TIMEOUT_MS = 300000;  // 单模型超时 5 分钟（之前 3 分钟）
+const CHAT_COMPLETION_TIMEOUT_MS = 600000;  // 单模型超时 10 分钟（2026-09-18 放宽一倍，原 5 分钟）
 
 function normalizeBaseUrl(url) {
   return (url || "").replace(/\/+$/, "");
@@ -517,7 +517,7 @@ export async function synthesizeSpeech(text, aiSettings) {
   const ttsBase = settings.ttsBaseURL || settings.baseURL;
   const response = await fetch(`${ttsBase}/audio/speech`, {
     method: "POST",
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(60000),
     headers: {
       Authorization: `Bearer ${ttsKey}`,
       "Content-Type": "application/json"

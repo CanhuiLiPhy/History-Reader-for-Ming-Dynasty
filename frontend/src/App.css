@@ -2149,17 +2149,34 @@ g.reader-circle line {
 
 .map-shell {
   position: relative;
+  display: grid;
+  gap: 0.75rem;
   min-height: 25rem;
   border-radius: 1rem;
-  overflow: hidden;
   border: 1px solid rgba(113, 73, 28, 0.14);
   background: rgba(249, 243, 233, 0.9);
+  /* 这里刻意不写 overflow: hidden。
+     Leaflet 自己已经在 .leaflet-container 上裁剪（leaflet.css 第 17 行），
+     祖先再裁一层是多余的；而 Leaflet 拖动时用 translate3d 移动 marker，
+     会把它提升成独立合成层，祖先上的「圆角 + overflow:hidden」对合成层
+     的裁剪各浏览器实现不一致 —— 贴近边缘的 marker 会整个消失而不是被
+     裁掉一半。把裁剪留给 Leaflet 自己那一层，行为才确定。
+
+     Deliberately no overflow: hidden here. Leaflet already clips at
+     .leaflet-container (leaflet.css line 17), so an ancestor clip is
+     redundant — and it is actively harmful: dragging moves each marker with
+     translate3d, which promotes it to its own compositing layer, and a
+     rounded-corner ancestor clip is applied inconsistently to composited
+     descendants. Markers near the edge vanish outright instead of being
+     clipped. Leave the clipping to the element that owns it. */
+  isolation: isolate;
 }
 
 .leaflet-map {
   height: 25rem;
   width: 100%;
   z-index: 1;
+  border-radius: inherit;
 }
 
 .map-empty {
@@ -2256,11 +2273,6 @@ g.reader-circle line {
 .timeline-item.is-current {
   background: linear-gradient(135deg, rgba(148, 94, 42, 0.18), rgba(224, 192, 147, 0.28));
   border-color: rgba(148, 94, 42, 0.28);
-}
-
-.map-shell {
-  display: grid;
-  gap: 0.75rem;
 }
 
 .map-layout {

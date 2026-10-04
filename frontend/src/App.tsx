@@ -7574,6 +7574,77 @@ function TocNode({ item, onSelect }: { item: TocItem; onSelect: (href: string) =
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// WGS-84 → GCJ-02
+// ---------------------------------------------------------------------------
+
+/**
+ * 中文：判断坐标是否落在中国境外——境外不做偏移。
+ *
+ * Test whether a coordinate lies outside the region where the GCJ-02 offset is
+ * applied. The published algorithm leaves points beyond China's bounding box
+ * untouched, and so must any implementation that wants its output to line up
+ * with the tiles.
+ *
+ * @param {number} lat - Latitude in degrees, WGS-84.
+ * @param {number} lng - Longitude in degrees, WGS-84.
+ * @returns {boolean} True when the point is outside the offset region.
+ */
+function outOfChina(lat: number, lng: number): boolean {
+  return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271;
+}
+
+function gcjTransformLat(x: number, y: number): number {
+  let ret = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  ret += ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
+  ret += ((20 * Math.sin(y * Math.PI) + 40 * Math.sin((y / 3) * Math.PI)) * 2) / 3;
+  ret += ((160 * Math.sin((y / 12) * Math.PI) + 320 * Math.sin((y * Math.PI) / 30)) * 2) / 3;
+  return ret;
+}
+
+function gcjTransformLng(x: number, y: number): number {
+  let ret = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  ret += ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
+  ret += ((20 * Math.sin(x * Math.PI) + 40 * Math.sin((x / 3) * Math.PI)) * 2) / 3;
+  ret += ((150 * Math.sin((x / 12) * Math.PI) + 300 * Math.sin((x / 30) * Math.PI)) * 2) / 3;
+  return ret;
+}
+
+/**
+ * 中文：把 WGS-84 经纬度转成高德瓦片用的 GCJ-02，境外坐标原样返回。
+ *
+ * Convert a WGS-84 coordinate to GCJ-02, the datum every Chinese map provider
+ * serves tiles in. Skipping this step does not fail loudly — it silently places
+ * every marker 300–700 m away from where it belongs, which on a historical
+ * gazetteer looks like a sourcing error rather than a projection one.
+ *
+ * @param {number} lat - Latitude in degrees, WGS-84.
+ * @param {number} lng - Longitude in degrees, WGS-84.
+ * @returns {[number, number]} `[lat, lng]` in GCJ-02, or the input unchanged
+ *   when the point lies outside China.
+ *
+ * Math:
+ *   dLat, dLng come from the published polynomial + sinusoidal series in the
+ *   Krasovsky 1940 ellipsoid (a = 6378245 m, e² = 0.00669342162296594323):
+ *     lat' = lat + dLat * 180 / ((a * (1 - e²)) / (M * sqrt(M)) * pi)
+ *     lng' = lng + dLng * 180 / (a / sqrt(M) * cos(radLat) * pi)
+ *   where M = 1 - e² * sin²(radLat).
+ */
+function wgs84ToGcj02(lat: number, lng: number): [number, number] {
+  if (outOfChina(lat, lng)) return [lat, lng];
+  const a = 6378245.0;
+  const ee = 0.00669342162296594323;
+  let dLat = gcjTransformLat(lng - 105.0, lat - 35.0);
+  let dLng = gcjTransformLng(lng - 105.0, lat - 35.0);
+  const radLat = (lat / 180.0) * Math.PI;
+  const magic = 1 - ee * Math.sin(radLat) * Math.sin(radLat);
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180.0) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI);
+  dLng = (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI);
+  return [lat + dLat, lng + dLng];
+}
+
 function MingGeographyMap({ places }: { places: GeocodePlace[] }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -7581,12 +7652,20 @@ function MingGeographyMap({ places }: { places: GeocodePlace[] }) {
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
-    const map = L.map(containerRef.current, { center: [33.5, 108], zoom: 4, minZoom: 3, maxZoom: 12 });
-    // OSM 主源 + Carto fastly CDN 备用源（OSM 在国内不稳，Carto 通常能通）。
-    L.tileLayer("https://cartodb-basemaps-{s}.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png", {
-      subdomains: "abcd",
-      attribution: "&copy; OpenStreetMap contributors, &copy; CARTO",
-      maxZoom: 19,
+    const map = L.map(containerRef.current, {
+      center: wgs84ToGcj02(33.5, 108),
+      zoom: 4, minZoom: 3, maxZoom: 12,
+    });
+    // 高德矢量底图。境内访问最快，且带中文注记；代价是它以 GCJ-02 出图，
+    // 所以本组件的每个坐标都要先过 wgs84ToGcj02。
+    // AutoNavi vector tiles: the fastest basemap from inside China and the only
+    // one already labelled in Chinese. It is served in GCJ-02, so every
+    // coordinate this component hands to Leaflet goes through wgs84ToGcj02
+    // first — the gazetteer itself stores WGS-84.
+    L.tileLayer("https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}", {
+      subdomains: ["1", "2", "3", "4"],
+      attribution: "&copy; 高德地图",
+      maxZoom: 18,
     }).addTo(map);
     const markerLayer = L.layerGroup().addTo(map);
     mapRef.current = map;
@@ -7613,7 +7692,7 @@ function MingGeographyMap({ places }: { places: GeocodePlace[] }) {
     const valid = places.filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
     const bounds: L.LatLngTuple[] = [];
     for (const p of valid) {
-      const ll: L.LatLngTuple = [Number(p.lat), Number(p.lng)];
+      const ll: L.LatLngTuple = wgs84ToGcj02(Number(p.lat), Number(p.lng));
       bounds.push(ll);
       L.marker(ll, {
         icon: L.divIcon({ className: "ming-marker", html: `<span>${p.source === "local" ? "古" : "今"}</span>`, iconSize: [30, 30], iconAnchor: [15, 15] }),

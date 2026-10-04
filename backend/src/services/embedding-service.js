@@ -207,7 +207,7 @@ function startSidecar() {
 
   sidecarReady = new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
-      reject(new Error("sidecar ready timeout (60s)"));
+      reject(new Error("sidecar ready timeout (120s)"));
       if (sidecar) sidecar._readyResolvers = null;
     }, 60_000);
     sidecar._readyResolvers = {
@@ -270,7 +270,7 @@ function armIdleShutdown() {
 }
 
 
-export async function embedQuery(text, timeoutMs = 8000) {
+export async function embedQuery(text, timeoutMs = 16000) {
   // 有请求进来就先取消待关闭计时，避免正要用时被关掉。
   // Cancel any pending shutdown first: the process must not be torn down
   // between this call and the write below.

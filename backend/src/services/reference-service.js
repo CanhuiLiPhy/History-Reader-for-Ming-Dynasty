@@ -1317,7 +1317,7 @@ async function geocodeWithNominatim(term) {
     try {
       const response = await fetch(url, {
         headers: { "User-Agent": "MingshiReaderAI/1.0" },
-        signal: AbortSignal.timeout(8000)
+        signal: AbortSignal.timeout(16000)
       });
       if (!response.ok) return null;
       rows = await response.json();
