@@ -20,12 +20,41 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ui-scroll-thumb) transparent;
+}
+
+/* Keep a visible, theme-aware grip on long tables, results and chapter lists. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--ui-scroll-thumb);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--ui-scroll-thumb-hover);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html, body {
   margin: 0;
   padding: 0;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -47,6 +76,49 @@ textarea {
   font: inherit;
 }
 
+button,
+input,
+select,
+textarea,
+summary,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:where(button, input, select, textarea, summary, a):focus-visible {
+  outline: 2px solid var(--ui-accent, #955f2d);
+  outline-offset: 3px;
+}
+
+input[type="range"] {
+  min-width: 0;
+  min-height: 28px;
+  accent-color: var(--ui-accent, #955f2d);
+  cursor: pointer;
+}
+
+input[type="range"]:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 a {
   color: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  * {
+    scrollbar-color: auto;
+  }
 }

@@ -26,6 +26,9 @@ import type {
 async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit, timeoutMs = 70000) {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const cancel = () => controller.abort(init?.signal?.reason);
+  if (init?.signal?.aborted) cancel();
+  else init?.signal?.addEventListener("abort", cancel, { once: true });
 
   try {
     return await fetch(input, {
@@ -33,12 +36,14 @@ async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit, ti
       signal: controller.signal,
     });
   } catch (error) {
+    if (init?.signal?.aborted) throw error;
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new Error("请求超时，请稍后重试。", { cause: error });
     }
     throw error;
   } finally {
     window.clearTimeout(timeoutId);
+    init?.signal?.removeEventListener("abort", cancel);
   }
 }
 
@@ -62,10 +67,10 @@ export async function fetchDefaults(): Promise<DefaultsPayload> {
   return parseJsonResponse<DefaultsPayload>(response);
 }
 
-export async function fetchBookMeta(slug?: string): Promise<BookMeta> {
+export async function fetchBookMeta(slug?: string, signal?: AbortSignal): Promise<BookMeta> {
   const url = new URL("/api/book/meta", window.location.origin);
   if (slug) url.searchParams.set("slug", slug);
-  const response = await fetchWithTimeout(url);
+  const response = await fetchWithTimeout(url, { signal });
   return parseJsonResponse<BookMeta>(response);
 }
 
@@ -74,13 +79,13 @@ export async function fetchLibraryBooks(): Promise<{ books: ReadableBook[] }> {
   return parseJsonResponse<{ books: ReadableBook[] }>(response);
 }
 
-export async function fetchReaderChapters(slug: string): Promise<DbReaderChaptersPayload> {
-  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapters`);
+export async function fetchReaderChapters(slug: string, signal?: AbortSignal): Promise<DbReaderChaptersPayload> {
+  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapters`, { signal });
   return parseJsonResponse<DbReaderChaptersPayload>(response);
 }
 
-export async function fetchReaderChapter(slug: string, index: number): Promise<DbReaderChapterPayload> {
-  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapter/${index}`);
+export async function fetchReaderChapter(slug: string, index: number, signal?: AbortSignal): Promise<DbReaderChapterPayload> {
+  const response = await fetchWithTimeout(`/api/library/books/${encodeURIComponent(slug)}/chapter/${index}`, { signal });
   return parseJsonResponse<DbReaderChapterPayload>(response);
 }
 

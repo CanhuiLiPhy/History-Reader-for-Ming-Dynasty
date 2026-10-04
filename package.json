@@ -10,6 +10,7 @@
     "dev:backend": "npm --prefix backend run dev",
     "dev:frontend": "npm --prefix frontend run dev -- --host 127.0.0.1",
     "build": "npm --prefix frontend run build",
+    "test": "node --experimental-vm-modules --test backend/test/*.test.mjs frontend/tests/*.test.mjs",
     "start": "npm --prefix backend run start",
     "import:sources": "npm --prefix backend run import:sources",
     "import:targeted": "npm --prefix backend run import:targeted",

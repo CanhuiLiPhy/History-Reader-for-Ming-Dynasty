@@ -537,6 +537,7 @@ const UNIT_GROUPS: UnitGroup[] = [
 
 function MeasureSection() {
   const [groupKey, setGroupKey] = useState<string>(UNIT_GROUPS[0].key);
+  const [value, setValue] = useState<string>("1");
 
   return (
     <div className="calc-unit-root" data-no-convert>
@@ -552,25 +553,23 @@ function MeasureSection() {
           </button>
         ))}
       </div>
-      <MeasureConverter groupKey={groupKey} />
+      {/* Reset unit choices for a new category while preserving the amount. */}
+      <MeasureConverter key={groupKey} groupKey={groupKey} value={value} onValueChange={setValue} />
     </div>
   );
 }
 
-function MeasureConverter({ groupKey }: { groupKey: string }) {
+function MeasureConverter({ groupKey, value, onValueChange }: {
+  groupKey: string;
+  value: string;
+  onValueChange: (value: string) => void;
+}) {
   const group = useMemo(() => UNIT_GROUPS.find((g) => g.key === groupKey) ?? UNIT_GROUPS[0], [groupKey]);
   const [fromUnit, setFromUnit] = useState<string>(group.units[0].id);
   const [toUnit, setToUnit] = useState<string>(group.units[group.units.length - 1].id);
-  const [value, setValue] = useState<string>("1");
-
-  // Reset units when group changes
-  useMemo(() => {
-    if (!group.units.find((u) => u.id === fromUnit)) setFromUnit(group.units[0].id);
-    if (!group.units.find((u) => u.id === toUnit)) setToUnit(group.units[group.units.length - 1].id);
-  }, [group, fromUnit, toUnit]);
 
   const fromUnitObj = useMemo(() => group.units.find((u) => u.id === fromUnit) ?? group.units[0], [group, fromUnit]);
-  const toUnitObj = useMemo(() => group.units.find((u) => u.id === toUnit) ?? group.units[1], [group, toUnit]);
+  const toUnitObj = useMemo(() => group.units.find((u) => u.id === toUnit) ?? group.units[group.units.length - 1], [group, toUnit]);
 
   const v = Number.parseFloat(value);
   const baseAmount = Number.isFinite(v) ? v * fromUnitObj.toBase : 0;
@@ -584,7 +583,7 @@ function MeasureConverter({ groupKey }: { groupKey: string }) {
           type="number"
           className="text-input"
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => onValueChange(e.target.value)}
           step="any"
         />
         <select className="text-input" value={fromUnit} onChange={(e) => setFromUnit(e.target.value)}>

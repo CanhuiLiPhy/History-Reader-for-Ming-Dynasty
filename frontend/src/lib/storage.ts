@@ -36,8 +36,9 @@ type Backend =
 
 let backendPromise: Promise<Backend> | null = null;
 
-/** Keys written since the last successful flush. / 待同步的键。 */
-const dirtyKeys = new Set<string>();
+/** Pending keys and their write revisions. / 待同步的键及写入版本。 */
+const dirtyKeys = new Map<string, number>();
+let nextWriteRevision = 0;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let flushInFlight: Promise<void> | null = null;
 
@@ -175,6 +176,13 @@ export async function readPersistedState<T>(key: string, fallback: T): Promise<T
 export async function writePersistedState<T>(key: string, value: T): Promise<void> {
   const backend = await resolveBackend();
 
+  // Update before awaiting IndexedDB: an older, slower cache write must not
+  // replace a newer value in the account snapshot when it finishes.
+  if (backend.mode === "account") {
+    backend.snapshot[key] = value;
+    dirtyKeys.set(key, ++nextWriteRevision);
+  }
+
   try {
     await backend.store.setItem(key, value);
   } catch {
@@ -182,11 +190,7 @@ export async function writePersistedState<T>(key: string, value: T): Promise<voi
     // push below is the authoritative save, so this is not fatal.
   }
 
-  if (backend.mode !== "account") return;
-
-  backend.snapshot[key] = value;
-  dirtyKeys.add(key);
-  scheduleFlush();
+  if (backend.mode === "account" && dirtyKeys.has(key)) scheduleFlush();
 }
 
 /**
@@ -216,14 +220,22 @@ function scheduleFlush(): void {
  *   Promise<void>: resolves when the push finishes, successfully or not.
  */
 export async function flushPersistedState(): Promise<void> {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
   if (flushInFlight) return flushInFlight;
 
-  const backend = await resolveBackend();
-  if (backend.mode !== "account" || !dirtyKeys.size) return;
-
+  let attemptedRevisions = new Map<string, number>();
+  // Claim the in-flight slot before the first await so concurrent explicit
+  // flushes (pagehide, visibilitychange, debounce) cannot issue duplicate PUTs.
   flushInFlight = (async () => {
+    const backend = await resolveBackend();
+    if (backend.mode !== "account" || !dirtyKeys.size) return;
+
     for (let attempt = 1; attempt <= MAX_FLUSH_RETRIES; attempt += 1) {
-      const keys = [...dirtyKeys];
+      attemptedRevisions = new Map(dirtyKeys);
+      const keys = [...attemptedRevisions.keys()];
       if (!keys.length) return;
 
       const entries: StateMap = {};
@@ -244,9 +256,14 @@ export async function flushPersistedState(): Promise<void> {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const result = await response.json();
-        // Retire only the keys the server actually accepted.
+        // A response acknowledges the submitted revision, not a newer edit
+        // of the same key that arrived while this request was in flight.
         const refused = new Set<string>(result?.skipped ?? []);
-        for (const key of keys) if (!refused.has(key)) dirtyKeys.delete(key);
+        for (const key of keys) {
+          if (!refused.has(key) && dirtyKeys.get(key) === attemptedRevisions.get(key)) {
+            dirtyKeys.delete(key);
+          }
+        }
 
         if (refused.size) {
           onSyncError?.(
@@ -258,13 +275,25 @@ export async function flushPersistedState(): Promise<void> {
         return;
       } catch {
         if (attempt === MAX_FLUSH_RETRIES) {
-          onSyncError?.("改动暂时未能同步到服务器，已保存在本机，稍后自动重试。");
+          onSyncError?.("改动暂时未能同步到服务器，已保存在本机，下次修改时重试。");
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
       }
     }
-  })().finally(() => { flushInFlight = null; });
+  })().finally(() => {
+    flushInFlight = null;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    // A debounce may have fired during the request and joined it. Preserve
+    // those newer writes, but do not endlessly retry unchanged failures or
+    // oversized/refused entries after the bounded retry loop finishes.
+    if ([...dirtyKeys].some(([key, revision]) => attemptedRevisions.get(key) !== revision)) {
+      scheduleFlush();
+    }
+  });
 
   return flushInFlight;
 }

@@ -9,7 +9,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { CACHE_ROOT } from "../config/defaults.js";
@@ -57,8 +56,9 @@ function tryOpenVecDb() {
     console.warn(`[embedding-service] sqlite-vec extension not found at ${extPath} — hybrid retrieval disabled.`);
     return null;
   }
+  let db;
   try {
-    const db = new Database(VEC_DB_PATH, { readonly: true });
+    db = new Database(VEC_DB_PATH, { readonly: true });
     db.loadExtension(extPath.replace(/\.(dylib|so|dll)$/, ""));
     db.pragma("temp_store=MEMORY");
     // Sanity: confirm table exists
@@ -67,6 +67,7 @@ function tryOpenVecDb() {
     console.log(`[embedding-service] loaded vec DB ${VEC_DB_PATH} + extension ${extPath}`);
     return db;
   } catch (err) {
+    try { db?.close(); } catch { /* initialization already failed */ }
     console.warn(`[embedding-service] failed to open vec DB: ${err.message}`);
     return null;
   }
@@ -159,8 +160,7 @@ function spawnSidecar() {
         continue;
       }
       const handler = pendingRequests.get(obj.id);
-      if (handler) {
-        pendingRequests.delete(obj.id);
+      if (handler?.proc === proc) {
         if (obj.error) handler.reject(new Error(obj.error));
         else handler.resolve(obj.embedding);
       }
@@ -172,23 +172,56 @@ function spawnSidecar() {
     if (s.trim()) console.warn(`[embedding-sidecar stderr] ${s.trim()}`);
   });
 
+  proc.on("error", (err) => {
+    failSidecar(proc, err);
+    stopProcess(proc);
+  });
+  // Broken stdin can otherwise emit an unhandled EPIPE error and crash Node.
+  proc.stdin.on("error", (err) => {
+    failSidecar(proc, err);
+    stopProcess(proc);
+  });
   proc.on("exit", (code) => {
     console.warn(`[embedding-sidecar] exited code=${code}`);
-    // 进程没了，待关闭计时就没有意义了。/ Nothing left to shut down.
-    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    if (proc._readyResolvers) {
-      proc._readyResolvers.reject(new Error(`sidecar exited before ready (code ${code})`));
-      proc._readyResolvers = null;
-    }
-    sidecar = null;
-    sidecarReady = null;
-    for (const [id, handler] of pendingRequests) {
-      handler.reject(new Error(`sidecar exited before response (code ${code})`));
-      pendingRequests.delete(id);
-    }
+    failSidecar(proc, new Error(`sidecar exited before response (code ${code})`));
   });
 
   return proc;
+}
+
+function failSidecar(proc, error) {
+  if (proc._readyResolvers) {
+    proc._readyResolvers.reject(error);
+    proc._readyResolvers = null;
+  }
+  // A deliberately stopped process may exit after its replacement has started.
+  // Only clear this process's state and requests, never the replacement's.
+  if (sidecar === proc) {
+    sidecar = null;
+    sidecarReady = null;
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  }
+  for (const handler of pendingRequests.values()) {
+    if (handler.proc === proc) handler.reject(error);
+  }
+}
+
+function stopProcess(proc) {
+  if (proc._stopPromise) return proc._stopPromise;
+  if (proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
+  let didStop;
+  proc._stopPromise = new Promise((resolve) => { didStop = resolve; });
+  proc.once("close", () => { clearTimeout(killTimer); didStop(); });
+  const killTimer = setTimeout(() => {
+    if (proc.exitCode == null && proc.signalCode == null) {
+      try { proc.kill("SIGKILL"); } catch { /* already exited */ }
+    }
+    didStop();
+  }, 3000);
+  killTimer.unref?.();
+  try { proc.stdin.end(); } catch { /* already closed */ }
+  try { proc.kill("SIGTERM"); } catch { /* already exited */ }
+  return proc._stopPromise;
 }
 
 function startSidecar() {
@@ -203,21 +236,24 @@ function startSidecar() {
     return Promise.reject(new Error(`sidecar script missing: ${SIDE_SCRIPT}`));
   }
 
-  sidecar = spawnSidecar();
+  const proc = spawnSidecar();
+  sidecar = proc;
 
   sidecarReady = new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
-      reject(new Error("sidecar ready timeout (120s)"));
-      if (sidecar) sidecar._readyResolvers = null;
+      failSidecar(proc, new Error("sidecar ready timeout (60s)"));
+      stopProcess(proc);
     }, 60_000);
-    sidecar._readyResolvers = {
-      resolve: () => { clearTimeout(timeoutId); resolve(); },
-      reject: (err) => { clearTimeout(timeoutId); reject(err); },
+    proc._readyResolvers = {
+      resolve: () => { clearTimeout(timeoutId); resolve(proc); },
+      reject: (err) => {
+        clearTimeout(timeoutId);
+        reject(err);
+        // Includes explicit startup errors reported on stdout.
+        if (sidecar === proc) { sidecar = null; sidecarReady = null; }
+        stopProcess(proc);
+      },
     };
-    sidecar.once("error", (err) => {
-      clearTimeout(timeoutId);
-      reject(err);
-    });
   });
 
   return sidecarReady;
@@ -258,7 +294,7 @@ let idleTimer = null;
 function armIdleShutdown() {
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   if (!SIDECAR_IDLE_MS || SIDECAR_IDLE_MS <= 0) return;
-  if (pendingRequests.size > 0) return;
+  if (!sidecar || pendingRequests.size > 0) return;
   idleTimer = setTimeout(() => {
     idleTimer = null;
     if (!sidecar || pendingRequests.size > 0) return;
@@ -275,19 +311,27 @@ export async function embedQuery(text, timeoutMs = 16000) {
   // Cancel any pending shutdown first: the process must not be torn down
   // between this call and the write below.
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-  await startSidecar();
+  const proc = await startSidecar();
+  if (proc !== sidecar || proc.stdin.destroyed) throw new Error("sidecar stopped before request");
   const id = `r${++nextRequestId}`;
   return new Promise((resolve, reject) => {
-    const settle = (fn) => (value) => { fn(value); armIdleShutdown(); };
-    pendingRequests.set(id, { resolve: settle(resolve), reject: settle(reject) });
-    sidecar.stdin.write(JSON.stringify({ id, text }) + "\n");
-    setTimeout(() => {
-      if (pendingRequests.has(id)) {
-        pendingRequests.delete(id);
-        reject(new Error(`embed query timeout (${timeoutMs}ms)`));
-        armIdleShutdown();
-      }
-    }, timeoutMs);
+    let timeoutId;
+    const settle = (fn) => (value) => {
+      if (!pendingRequests.delete(id)) return;
+      clearTimeout(timeoutId);
+      fn(value);
+      armIdleShutdown();
+    };
+    const handler = { proc, resolve: settle(resolve), reject: settle(reject) };
+    pendingRequests.set(id, handler);
+    timeoutId = setTimeout(() => handler.reject(new Error(`embed query timeout (${timeoutMs}ms)`)), timeoutMs);
+    try {
+      proc.stdin.write(JSON.stringify({ id, text }) + "\n", (error) => {
+        if (error) handler.reject(error);
+      });
+    } catch (error) {
+      handler.reject(error);
+    }
   });
 }
 
@@ -387,9 +431,7 @@ export function reciprocalRankFusion(listA, listB, k = 60) {
 export function shutdownSidecar() {
   if (!sidecar) return;
   const proc = sidecar;
-  sidecar = null;
-  sidecarReady = null;
-  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  failSidecar(proc, new Error("sidecar stopped"));
   // 主动关闭不算「刚失败过」。startSidecar 的 30 秒冷却是防止启动失败后疯狂
   // 重试；空闲退出属正常生命周期，不清掉这个时间戳的话，退出后 30 秒内的下一次
   // 查询会被冷却逻辑直接拒绝。
@@ -398,12 +440,5 @@ export function shutdownSidecar() {
   // timestamp set would make idle shutdown reject the next query arriving
   // inside that window.
   lastSidecarStartAt = 0;
-  try { proc.stdin.end(); } catch { /* noop */ }
-  try { proc.kill("SIGTERM"); } catch { /* noop */ }
-  // 赖着不走就强杀，别让它继续占着那 279 MB。
-  // Escalate if it lingers; the point of this call is to release the memory.
-  const killTimer = setTimeout(() => {
-    try { proc.kill("SIGKILL"); } catch { /* already gone */ }
-  }, 3000);
-  if (typeof killTimer.unref === "function") killTimer.unref();
+  return stopProcess(proc);
 }

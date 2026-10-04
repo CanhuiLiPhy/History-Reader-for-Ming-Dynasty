@@ -15,6 +15,7 @@ import { extractYearMentions } from "../data/reign-map.js";
 import { ensureSplitEpub } from "./epub-splitter.js";
 import { ensureAnchorMap, translateAnchor, extractAnchorFragment } from "./epub-anchor-map.js";
 import { getDb } from "./library-db.js";
+import { createBookCache } from "./book-cache.js";
 
 export const DEFAULT_BOOK_SLUG = "ming-shi";
 
@@ -65,8 +66,9 @@ const parser = new XMLParser({
   trimValues: true
 });
 
-// Per-slug in-memory cache so multi-book mode can keep multiple parsed EPUBs hot.
-const bookCacheBySlug = new Map();
+// Parsed text and search indexes are large. Keep two recent books and release
+// them after five minutes without use; disk EPUB caches remain untouched.
+const bookCache = createBookCache(loadBook);
 const MAX_SEARCH_QUERY_LENGTH = 120;
 const MAX_RETRIEVAL_QUERY_LENGTH = 32;
 const MAX_FUSE_QUERY_LENGTH = 24;
@@ -528,15 +530,7 @@ async function loadBook(slug = DEFAULT_BOOK_SLUG) {
     spineHtmlByHref
   });
   const segments = buildSegments(chapters);
-  const fuse = new Fuse(segments, {
-    includeScore: true,
-    ignoreLocation: true,
-    threshold: 0.48,
-    keys: [
-      { name: "text", weight: 0.8 },
-      { name: "chapterTitle", weight: 0.2 }
-    ]
-  });
+  let fuse = null;
 
   return {
     slug,
@@ -549,15 +543,24 @@ async function loadBook(slug = DEFAULT_BOOK_SLUG) {
     inPageToc,
     chapters,
     segments,
-    fuse
+    // Metadata and exact searches do not need a second full-text index.
+    get fuse() {
+      fuse ??= new Fuse(segments, {
+        includeScore: true,
+        ignoreLocation: true,
+        threshold: 0.48,
+        keys: [
+          { name: "text", weight: 0.8 },
+          { name: "chapterTitle", weight: 0.2 }
+        ]
+      });
+      return fuse;
+    }
   };
 }
 
 export async function getBookData(slug = DEFAULT_BOOK_SLUG) {
-  if (!bookCacheBySlug.has(slug)) {
-    bookCacheBySlug.set(slug, await loadBook(slug));
-  }
-  return bookCacheBySlug.get(slug);
+  return bookCache.get(slug);
 }
 
 export async function getBookMeta(slug = DEFAULT_BOOK_SLUG) {

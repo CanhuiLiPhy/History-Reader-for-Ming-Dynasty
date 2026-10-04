@@ -25,6 +25,9 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { PageSlider } from "./components/PageSlider";
+import { renderedPageDelta } from "./lib/reader-pagination";
+import { ReaderViewManager, prepareEpubRenditionForDestroy } from "./lib/epubReaderManager";
 import { ShixiTree } from "./components/ShixiTree";
 import { HistoricalCalculator } from "./components/HistoricalCalculator";
 import {
@@ -205,6 +208,12 @@ type EpubRenditionLike = {
     override?: (key: string, value: string, priority?: boolean) => void;
   };
   getContents?: () => EpubContentsLike[];
+  reportLocation?: () => void;
+  manager?: {
+    settings: { axis?: string };
+    layout: { pageWidth: number; height: number; divisor: number };
+    scrollBy: (x: number, y: number, silent: boolean) => void;
+  };
   annotations: {
     add: (type: string, cfiRange: string, data?: object, callback?: unknown, className?: string, styles?: object) => void;
     remove: (cfiRange: string, type: string) => void;
@@ -470,6 +479,7 @@ function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const noteInputRef = useRef<HTMLTextAreaElement | null>(null);
   const audioUrlRef = useRef("");
+  const speechRequestRef = useRef(0);
   const initialLocationRef = useRef("");
   const currentCfiRef = useRef("");
   const currentHrefRef = useRef("");
@@ -482,6 +492,7 @@ function App() {
   const pendingSearchNavRef = useRef<{ paragraphId: number; text: string; anchor: string; attempts: number } | null>(null);
   // 每次点搜索结果都 +1，让 useEffect 即使在同书同章重复点击时也能重 fire。
   const [searchNavTick, setSearchNavTick] = useState(0);
+  const searchNavigationIdRef = useRef(0);
   // 搜索导航触发的 loadDbReaderChapter，要禁掉 chapter 加载完后那次 scrollLeft=0
   // 的 reset，否则会跟 scrollToSearchTarget 算好的页位置打架（先滚到目标页又被
   // 拉回首页）。其他调用方（TOC、上/下章）保持原 reset 行为。
@@ -519,7 +530,19 @@ function App() {
   // Multi-book reading state (v0.3)
   const [readableBooks, setReadableBooks] = useState<ReadableBook[]>([]);
   const [currentBookSlug, setCurrentBookSlug] = useState<string>("ming-shi");
+  const activeBookSlugRef = useRef("ming-shi");
+  const dbChaptersRef = useRef<DbReaderChaptersPayload | null>(null);
   const [bookSwitching, setBookSwitching] = useState(false);
+  const bookRequestRef = useRef<AbortController | null>(null);
+  const chapterRequestRef = useRef<AbortController | null>(null);
+  useEffect(() => () => {
+    bookRequestRef.current?.abort();
+    chapterRequestRef.current?.abort();
+    speechRequestRef.current += 1;
+    audioRef.current?.pause();
+    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  }, []);
   const [bookMenuOpen, setBookMenuOpen] = useState(false);
   const [dbReaderChapters, setDbReaderChapters] = useState<DbReaderChaptersPayload | null>(null);
   const [dbReaderChapter, setDbReaderChapter] = useState<DbReaderChapterPayload | null>(null);
@@ -1054,6 +1077,8 @@ function App() {
 
         setDefaults(defaultsData);
         setReadableBooks(libraryBooksData.books);
+        activeBookSlugRef.current = initialSlug;
+        dbChaptersRef.current = initialDbChapters;
         setCurrentBookSlug(initialSlug);
         setMeta(initialMeta);
         setDbReaderChapters(initialDbChapters);
@@ -1826,8 +1851,8 @@ function App() {
       const derived = deriveChapterState(currentCfiRef.current, currentHref, currentSectionLabel, liveProgress);
       setCurrentSectionLabel(derived.label);
       setProgress(derived.wholeProgress);
-      setChapterPageCurrent(derived.pageCurrent);
-      setChapterPageTotal(derived.pageTotal);
+      setChapterPageCurrent(liveLocation?.start?.displayed?.page || 1);
+      setChapterPageTotal(liveLocation?.start?.displayed?.total || 1);
       setCurrentChapterIndex(derived.chapterIndex);
     }
   }
@@ -1909,15 +1934,31 @@ function App() {
   }
 
   // Switch to a different book; tears down current rendition and refetches data.
-  async function switchBook(slug: string) {
-    if (slug === currentBookSlug) {
+  async function switchBook(slug: string, preserveSearch = false) {
+    if (!preserveSearch) {
+      searchNavigationIdRef.current += 1;
+      pendingSearchNavRef.current = null;
+      skipNextDbScrollResetRef.current = false;
+    }
+    if (slug === activeBookSlugRef.current && !bootError) {
       setBookMenuOpen(false);
       return;
     }
     const target = readableBooks.find((b) => b.slug === slug);
     if (!target) return;
     setBookMenuOpen(false);
+    bookRequestRef.current?.abort();
+    chapterRequestRef.current?.abort();
+    const controller = new AbortController();
+    bookRequestRef.current = controller;
+    activeBookSlugRef.current = slug;
+    dbChaptersRef.current = null;
+    setMeta(null);
     setBookSwitching(true);
+    setDbReaderLoading(false);
+    setBootError("");
+    clearSelectionAndPinned();
+    stopSpeech();
     try {
       // Reset reader-related transient state. Setting meta to null first forces
       // the EPUB reader effect to tear down BEFORE the new slug arrives — avoids
@@ -1936,6 +1977,7 @@ function App() {
       // where the user left off in THAT book instead of dropping them at
       // the in-page TOC every switch.
       const savedForTarget = await readPersistedState<string>(storageKey(`last-location:${slug}`), "");
+      if (controller.signal.aborted) return;
       initialLocationRef.current = savedForTarget;
       setLastLocation(savedForTarget);
       pendingAnchorRef.current = "";
@@ -1944,23 +1986,29 @@ function App() {
       setDbReaderChapters(null);
       setDbReaderChapter(null);
       setDbReaderIndex(0);
+      setDbPageIndex(0);
+      setDbPageTotal(1);
+      dbTargetPageRef.current = 0;
+      dbAnchorParaRef.current = null;
       setCurrentBookSlug(slug);
 
       if (target.hasEpub) {
-        const newMeta = await fetchBookMeta(slug);
+        const newMeta = await fetchBookMeta(slug, controller.signal);
+        if (controller.signal.aborted) return;
         setMeta(newMeta);
       } else {
-        const chaptersData = await fetchReaderChapters(slug);
+        const chaptersData = await fetchReaderChapters(slug, controller.signal);
+        if (controller.signal.aborted) return;
+        dbChaptersRef.current = chaptersData;
         setDbReaderChapters(chaptersData);
         if (chaptersData.chapters.length > 0) {
-          const firstChapter = await fetchReaderChapter(slug, 0);
-          setDbReaderChapter(firstChapter);
+          await loadDbReaderChapter(0);
         }
       }
     } catch (error) {
-      setBootError(error instanceof Error ? error.message : "切换书籍失败。");
+      if (!controller.signal.aborted) setBootError(error instanceof Error ? error.message : "切换书籍失败。");
     } finally {
-      setBookSwitching(false);
+      if (bookRequestRef.current === controller) setBookSwitching(false);
     }
   }
 
@@ -1974,11 +2022,18 @@ function App() {
   // page 1. Caller can rely on `searchNavTick`-driven useEffect to (re)align
   // scroll position within the existing chapter.
   async function loadDbReaderChapter(index: number) {
-    if (!dbReaderChapters || index < 0 || index >= dbReaderChapters.chapters.length) return;
-    if (dbReaderChapter && dbReaderIndex === index) return;
+    const chapters = dbChaptersRef.current;
+    const slug = activeBookSlugRef.current;
+    if (!chapters || chapters.slug !== slug || index < 0 || index >= chapters.chapters.length) return;
+    chapterRequestRef.current?.abort();
+    const controller = new AbortController();
+    chapterRequestRef.current = controller;
+    if (dbReaderChapter?.slug === slug && dbReaderIndex === index) { setDbReaderLoading(false); return; }
+    setBootError("");
     setDbReaderLoading(true);
     try {
-      const data = await fetchReaderChapter(currentBookSlug, index);
+      const data = await fetchReaderChapter(slug, index, controller.signal);
+      if (controller.signal.aborted || activeBookSlugRef.current !== slug) return;
       setDbReaderChapter(data);
       setDbReaderIndex(index);
       setDbPageIndex(0);
@@ -1989,6 +2044,7 @@ function App() {
       //   (2) pendingSearchNavRef.current 仍非空（搜索导航还没消费）→ 同上。
       // 任一命中就消费旗子并 return；其他调用方（TOC、上下章按钮）走原 reset。
       requestAnimationFrame(() => {
+        if (controller.signal.aborted) return;
         if (skipNextDbScrollResetRef.current || pendingSearchNavRef.current) {
           skipNextDbScrollResetRef.current = false;
           return;
@@ -1998,9 +2054,9 @@ function App() {
         dbAnchorParaRef.current = null;
       });
     } catch (error) {
-      setBootError(error instanceof Error ? error.message : "加载章节失败。");
+      if (!controller.signal.aborted) setBootError(error instanceof Error ? error.message : "加载章节失败。");
     } finally {
-      setDbReaderLoading(false);
+      if (chapterRequestRef.current === controller) setDbReaderLoading(false);
     }
   }
 
@@ -2125,15 +2181,18 @@ function App() {
       setDbPageIndex(clamped);
     };
     // Wait one frame so CSS columns have finished laying out
-    const id = requestAnimationFrame(recompute);
-    const onResize = () => recompute();
+    let frame = requestAnimationFrame(recompute);
+    const onResize = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(recompute);
+    };
     window.addEventListener("resize", onResize);
     // Watch the host itself — sidebar / assistant collapse triggers a
     // grid-template-columns transition (150ms). The deps-driven recompute
     // fires when state changes but the host's clientWidth is still mid-
     // transition; ResizeObserver fires throughout, so the final snap to a
     // valid page boundary actually lands on the new viewport size.
-    const ro = new ResizeObserver(() => recompute());
+    const ro = new ResizeObserver(onResize);
     ro.observe(host);
     // Stabilizer: after smooth-scroll bursts settle (220 ms of no scroll
     // events), snap scrollLeft to the nearest column boundary. Catches any
@@ -2157,7 +2216,7 @@ function App() {
     };
     host.addEventListener("scroll", onScroll, { passive: true });
     return () => {
-      cancelAnimationFrame(id);
+      cancelAnimationFrame(frame);
       window.removeEventListener("resize", onResize);
       host.removeEventListener("scroll", onScroll);
       ro.disconnect();
@@ -2190,7 +2249,8 @@ function App() {
   }, [dbReaderChapter, dbReaderIndex, readerReady, currentBookSlug, searchNavTick]);
 
   async function openLocation(target: string) {
-    if (!renditionRef.current) return;
+    const rendition = renditionRef.current;
+    if (!rendition) return;
 
     // Look up chapter info from navigation map (for label & forced index)
     const navigation = chapterNavigationRef.current;
@@ -2207,7 +2267,7 @@ function App() {
     // CFI target (from progress bar, bookmarks, saved location)
     if (target.startsWith("epubcfi(")) {
       try {
-        await renditionRef.current.display(target);
+        await rendition.display(target);
         return;
       } catch { /* fall through to href attempts */ }
     }
@@ -2225,9 +2285,12 @@ function App() {
       `OEBPS/${stripFirstDir}`,
     ]);
     for (const candidate of candidates) {
+      if (renditionRef.current !== rendition) return;
       try {
-        await renditionRef.current.display(candidate);
-        window.setTimeout(() => scrollPendingAnchorIntoView(), 60);
+        await rendition.display(candidate);
+        window.setTimeout(() => {
+          if (renditionRef.current === rendition) scrollPendingAnchorIntoView();
+        }, 60);
         return;
       } catch {
         // Try next candidate
@@ -2235,7 +2298,8 @@ function App() {
     }
     // Final fallback: just display the first spine item (no target).
     try {
-      await renditionRef.current.display();
+      if (renditionRef.current !== rendition) return;
+      await rendition.display();
     } catch {
       // give up
     }
@@ -2263,64 +2327,29 @@ function App() {
   swipePrevRef.current = goPrevPage;
 
   function jumpToPage(targetPage: number) {
-    if (!renditionRef.current || jumpingRef.current) return;
     const rendition = renditionRef.current;
-    const book = bookRef.current;
-
-    const loc = rendition.currentLocation?.() as EpubLocationLike | null;
-    const liveTotal = loc?.start?.displayed?.total || 1;
-    const livePage = loc?.start?.displayed?.page || 1;
-    if (liveTotal <= 1) return;
-
-    const safePage = clamp(targetPage, 1, liveTotal);
-    if (safePage === livePage) return;
-
-    // Direct CFI jump: convert (current chapter start CFI + page offset)
-    // into a CFI via book.locations.cfiFromLocation(), then display it.
-    // Falls back to step-by-step next/prev if locations API isn't ready.
-    const navigation = chapterNavigationRef.current;
-    const currentChapter = navigation[currentChapterIndex];
-    const startLoc = currentChapter?.locationIndex;
-    const cfiFromLocation = book?.locations?.cfiFromLocation;
-    if (
-      book &&
-      typeof cfiFromLocation === "function" &&
-      typeof startLoc === "number" &&
-      Number.isFinite(startLoc)
-    ) {
-      try {
-        const targetLocation = startLoc + (safePage - 1);
-        const targetCfi = cfiFromLocation.call(book.locations, targetLocation);
-        if (targetCfi && typeof targetCfi === "string") {
-          jumpingRef.current = true;
-          rendition.display(targetCfi)
-            .catch(() => { /* swallow; relocated event won't fire on failure */ })
-            .finally(() => { jumpingRef.current = false; });
-          return;
-        }
-      } catch { /* fall through to stepping */ }
-    }
-
-    // Fallback: legacy step-by-step (slow, still here in case CFI jump
-    // fails for an unusual book whose locations index hasn't loaded).
-    const stepsNeeded = safePage - livePage;
-    jumpingRef.current = true;
-    const step = stepsNeeded > 0 ? () => rendition.next?.() : () => rendition.prev?.();
-    let remaining = Math.abs(stepsNeeded);
-    const doStep = () => {
-      if (remaining <= 0) { jumpingRef.current = false; return; }
-      remaining--;
-      step();
-      if (remaining > 0) window.setTimeout(doStep, 60);
-      else jumpingRef.current = false;
-    };
-    doStep();
+    if (!rendition) return;
+    const loc = rendition.currentLocation?.();
+    const manager = rendition.manager;
+    if (!manager || !loc?.start?.displayed) return;
+    const { page, total } = loc.start.displayed;
+    const horizontal = manager.settings.axis === "horizontal";
+    const delta = renderedPageDelta(page ?? 1, targetPage, total ?? 1, horizontal ? manager.layout.divisor : 1);
+    if (!delta) return;
+    // scrollBy follows epub.js's own RTL convention and never loads another
+    // chapter. A double-page spread advances by its two physical columns.
+    manager.scrollBy(horizontal ? delta * manager.layout.pageWidth : 0,
+      horizontal ? 0 : delta * manager.layout.height, true);
+    rendition.reportLocation?.();
   }
 
 
   useEffect(() => {
     if (!meta || !hasLoadedLocalState || !readerHostRef.current || bookRef.current) return;
 
+    let disposed = false;
+    let resizeFrame = 0;
+    const delayedUpdates = new Set<number>();
     const host = readerHostRef.current;
     host.innerHTML = "";
 
@@ -2336,7 +2365,7 @@ function App() {
       height: hostHeight,
       flow: "paginated",
       spread: getRenditionSpread(),
-      manager: "default",
+      manager: ReaderViewManager,
       // allowScriptedContent 必须为 true，否则 Safari 里选不中字。
       // epub.js 把每章渲染进带 sandbox 的 srcdoc iframe；不给 allow-scripts
       // 时，它注入到 iframe 里的事件监听脚本会被拦掉。Chromium 对此宽容，
@@ -2500,6 +2529,7 @@ function App() {
     type RenditionHooks = { hooks?: { content?: { register?: (cb: (contents: EpubContentsLike) => void) => void } } };
     const hooksHost = rendition as unknown as RenditionHooks;
     hooksHost.hooks?.content?.register?.((contents: EpubContentsLike) => {
+      if (disposed) return;
       const doc = contents.document;
 
       // 触摸滑动翻页。监听必须挂在 iframe 自己的 document 上 —— 正文渲染在
@@ -2565,6 +2595,7 @@ function App() {
     });
 
     rendition.on("selected", (cfiRange: string, contents: EpubContentsLike) => {
+      if (disposed) return;
       // Safari sometimes delivers the event with a stale or empty selection.
       // Defer reading the selection until the next microtask so the browser
       // has finished updating it.
@@ -2618,6 +2649,7 @@ function App() {
     });
 
     rendition.on("relocated", (location: EpubLocationLike) => {
+      if (disposed) return;
       // Debug: dump raw location to see what epubjs reports
       (window as any).__lastLocation = location;
       const nextCfi = location?.start?.cfi || "";
@@ -2658,6 +2690,7 @@ function App() {
     });
 
     rendition.on("rendered", (section: unknown, contents: EpubContentsLike) => {
+      if (disposed) return;
       const doc = contents.document as Document;
       applyReaderDocumentPreferences(doc);
       scrollPendingAnchorIntoView(doc);
@@ -2685,8 +2718,10 @@ function App() {
       if (sameSection) return; // relocated will fire (or already did) — no rescue needed
 
       // Wait for epub.js to settle, then read the live location.
-      window.setTimeout(() => {
-        const live = renditionRef.current?.currentLocation?.() as EpubLocationLike | null;
+      const timer = window.setTimeout(() => {
+        delayedUpdates.delete(timer);
+        if (disposed) return;
+        const live = rendition.currentLocation?.() as EpubLocationLike | null;
         const liveCfi = live?.start?.cfi || "";
         const liveHref = live?.start?.href || renderedHref;
         if (!liveCfi) return;
@@ -2716,6 +2751,7 @@ function App() {
         setChapterPageTotal(finalTotal);
         setCurrentChapterIndex(derived.chapterIndex);
       }, 50);
+      delayedUpdates.add(timer);
     });
 
     const init = async () => {
@@ -2724,10 +2760,12 @@ function App() {
         const startTarget = normalizeDisplayTarget(preferredStart);
         pendingAnchorRef.current = extractAnchor(preferredStart);
         await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
+        if (disposed) return;
         if (import.meta.env.DEV) {
           console.info("epub:display:start", startTarget || "default");
         }
         await openLocation(startTarget || "");
+        if (disposed) return;
         if (import.meta.env.DEV) {
           console.info("epub:display:done");
         }
@@ -2735,15 +2773,19 @@ function App() {
         void book.ready
           .then(async () => {
             try {
+              if (disposed) return;
               await book.locations.generate?.(CHAPTER_LOCATION_BREAK_SIZE);
+              if (disposed) return;
               setLocationsReady(true);
               await buildChapterNavigationMap();
+              if (disposed) return;
               if (currentCfiRef.current && book.locations.percentageFromCfi) {
                 const liveProgress = (book.locations.percentageFromCfi(currentCfiRef.current) || 0) * 100;
                 const derived = deriveChapterState(currentCfiRef.current, currentHref, currentSectionLabel, liveProgress);
                 setProgress(derived.wholeProgress);
-                setChapterPageCurrent(derived.pageCurrent);
-                setChapterPageTotal(derived.pageTotal);
+                const displayed = rendition.currentLocation?.()?.start?.displayed;
+                setChapterPageCurrent(displayed?.page || 1);
+                setChapterPageTotal(displayed?.total || 1);
                 setCurrentChapterIndex(derived.chapterIndex);
                 setCurrentSectionLabel(derived.label);
               }
@@ -2758,7 +2800,7 @@ function App() {
             // Ignore readiness failures and keep the core reading flow working.
           });
       } catch (error) {
-        setBootError(error instanceof Error ? error.message : "阅读器初始化失败。");
+        if (!disposed) setBootError(error instanceof Error ? error.message : "阅读器初始化失败。");
       }
     };
 
@@ -2772,10 +2814,11 @@ function App() {
     let lastH = 0;
     let resizePending = false;
     const onResize = () => {
-      if (resizePending) return;
+      if (disposed || resizePending) return;
       resizePending = true;
-      window.requestAnimationFrame(() => {
+      resizeFrame = window.requestAnimationFrame(() => {
         resizePending = false;
+        if (disposed) return;
         const rect = host.getBoundingClientRect();
         const w = Math.round(rect.width) || 800;
         const h = Math.round(rect.height) || 600;
@@ -2804,21 +2847,30 @@ function App() {
     }
 
     return () => {
+      disposed = true;
+      window.cancelAnimationFrame(resizeFrame);
+      delayedUpdates.forEach((timer) => window.clearTimeout(timer));
+      delayedUpdates.clear();
+      selectionContentsRef.current = null;
+      clearDudouOverlay();
+      jumpingRef.current = false;
+      chapterNavigationRef.current = [];
       window.removeEventListener("resize", onResize);
       resizeObserver?.disconnect();
       if (chapterJumpTimerRef.current) {
         window.clearTimeout(chapterJumpTimerRef.current);
       }
       try {
-        rendition.destroy();
+        prepareEpubRenditionForDestroy(rendition);
       } catch {
-        // ignore destroy errors
+        // Continue releasing the book even if a partly initialized view fails.
       }
-      try {
-        book.destroy?.();
-      } catch {
-        // ignore destroy errors
-      }
+      const destroyBook = () => {
+        try { book.destroy?.(); } catch { /* partially initialized EPUB */ }
+      };
+      // Download/unpack callbacks still use the book's spine and loading map.
+      // Stop its view immediately, then release the archive after opening ends.
+      void Promise.all([book.opened, book.ready]).then(destroyBook, destroyBook);
       audioRef.current?.pause();
       if (audioUrlRef.current) {
         URL.revokeObjectURL(audioUrlRef.current);
@@ -4270,6 +4322,8 @@ function App() {
   // 点搜索结果：跨书时先 switchBook 再跳章节；同本书直接跳。
   // 跳转到具体段落用 pendingSearchNavRef：chapter 加载完成后会被消费。
   async function navigateToSearchResult(result: SearchResult) {
+    const navigationId = ++searchNavigationIdRef.current;
+    const isCurrentNavigation = () => navigationId === searchNavigationIdRef.current;
     // 解析 paragraph_id：result.id 格式为 `${bookSlug}-${paragraph_id}`
     const lastDash = (result.id || "").lastIndexOf("-");
     const paragraphId = lastDash >= 0 ? parseInt(result.id.slice(lastDash + 1), 10) : NaN;
@@ -4289,7 +4343,8 @@ function App() {
     const needsBookSwitch = !!targetSlug && targetSlug !== currentBookSlug;
 
     if (needsBookSwitch) {
-      await switchBook(targetSlug);
+      await switchBook(targetSlug, true);
+      if (!isCurrentNavigation() || activeBookSlugRef.current !== targetSlug || bookRequestRef.current?.signal.aborted) return;
       // 跨书跳转 EPUB 必须在 switchBook 之后再设 initialLocationRef，
       // 因为 switchBook 内部会读 last-location:<slug> 并写入这个 ref，
       // 在它之前赋值会被覆盖掉，导致 rendition init 仍然用上次保存位置 →
@@ -4306,10 +4361,10 @@ function App() {
     // for siku-mingshi etc they're off by one or more.
     async function resolveDbChapterIndex(): Promise<number | null> {
       if (typeof result.chapterOrder !== "number") return null;
-      let chs = dbReaderChapters?.chapters;
+      let chs = dbChaptersRef.current?.chapters;
       // After switchBook the closure still sees the OLD dbReaderChapters; fetch
       // fresh in that case.
-      if (needsBookSwitch || !chs) {
+      if (!chs) {
         try {
           const data = await fetchReaderChapters(targetSlug || currentBookSlug);
           chs = data.chapters;
@@ -4332,17 +4387,23 @@ function App() {
     // DB-reader 跨书只加载了 chapter 0，目标章节 != 0 时这里补一次）
     if (targetBook?.hasEpub === false && typeof result.chapterOrder === "number") {
       const arrayIndex = await resolveDbChapterIndex();
+      if (!isCurrentNavigation()) return;
       if (typeof arrayIndex === "number") {
         skipNextDbScrollResetRef.current = true;
-        requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
+        requestAnimationFrame(() => {
+          if (isCurrentNavigation() && activeBookSlugRef.current === (targetSlug || currentBookSlug)) void loadDbReaderChapter(arrayIndex);
+        });
       }
     } else if (result.chapterHref && !needsBookSwitch) {
       void openLocation(result.chapterHref);
     } else if (typeof result.chapterOrder === "number") {
       const arrayIndex = await resolveDbChapterIndex();
+      if (!isCurrentNavigation()) return;
       if (typeof arrayIndex === "number") {
         skipNextDbScrollResetRef.current = true;
-        requestAnimationFrame(() => { void loadDbReaderChapter(arrayIndex); });
+        requestAnimationFrame(() => {
+          if (isCurrentNavigation() && activeBookSlugRef.current === (targetSlug || currentBookSlug)) void loadDbReaderChapter(arrayIndex);
+        });
       }
     }
 
@@ -4517,27 +4578,36 @@ function App() {
 
   async function speakText(sourceText: string) {
     if (!sourceText.trim()) return;
+    stopSpeech();
+    const request = speechRequestRef.current;
     setAiError("");
     setTtsStatus("正在生成朗读…");
 
     // Always try server TTS first (server uses its own config)
     try {
       const blob = await synthesizeSpeech(sourceText, aiSettings);
+      if (request !== speechRequestRef.current) return;
       const url = URL.createObjectURL(blob);
       audioRef.current?.pause();
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
       audioUrlRef.current = url;
       const audio = new Audio(url);
       audioRef.current = audio;
-      audio.onended = () => { setTtsStatus("朗读完成"); URL.revokeObjectURL(url); if (audioUrlRef.current === url) audioUrlRef.current = ""; };
+      audio.onended = () => {
+        releaseAudio();
+        if (request === speechRequestRef.current) setTtsStatus("朗读完成");
+      };
       audio.onpause = () => { if (!audio.ended) setTtsStatus("朗读已暂停"); };
       await audio.play();
+      if (request !== speechRequestRef.current) return;
       setTtsStatus("正在播放朗读");
       return;
     } catch {
       // Fall through to browser TTS
     }
 
+    if (request !== speechRequestRef.current) return;
+    releaseAudio();
     // Browser fallback
     if (!("speechSynthesis" in window)) { setTtsStatus("当前环境不支持朗读"); return; }
     const utterance = new SpeechSynthesisUtterance(sourceText);
@@ -4546,7 +4616,7 @@ function App() {
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utterance);
     setTtsStatus("浏览器朗读中");
-    utterance.onend = () => setTtsStatus("朗读完成");
+    utterance.onend = () => { if (request === speechRequestRef.current) setTtsStatus("朗读完成"); };
   }
 
   function pauseOrResumeSpeech() {
@@ -4556,9 +4626,22 @@ function App() {
     if ("speechSynthesis" in window && window.speechSynthesis.paused) { window.speechSynthesis.resume(); setTtsStatus("浏览器朗读中"); }
   }
 
-  function stopSpeech() {
-    audioRef.current?.pause(); audioRef.current = null;
+  function releaseAudio() {
+    const audio = audioRef.current;
+    audioRef.current = null;
+    if (audio) {
+      audio.onended = null;
+      audio.onpause = null;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
     if (audioUrlRef.current) { URL.revokeObjectURL(audioUrlRef.current); audioUrlRef.current = ""; }
+  }
+
+  function stopSpeech() {
+    speechRequestRef.current += 1;
+    releaseAudio();
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setTtsStatus("");
   }
@@ -5359,30 +5442,15 @@ function App() {
         </section>
 
         <footer className="reader-footer">
-          {currentBook?.hasEpub === false ? (
-            <input
-              type="range"
-              min={1}
-              max={Math.max(1, dbPageTotal)}
-              step={1}
-              value={dbPageIndex + 1}
-              onChange={(event) => jumpDbPage(Number.parseInt(event.target.value, 10) - 1)}
-            />
-          ) : (
-            <input
-              type="range"
-              min={1}
-              max={chapterPageTotal}
-              step={1}
-              value={chapterPageCurrent}
-              onChange={(event) => {
-                const targetPage = Number.parseInt(event.target.value, 10);
-                jumpToPage(targetPage);
-              }}
-            />
-          )}
+          <PageSlider
+            key={`${currentBookSlug}:${currentBook?.hasEpub === false ? dbReaderIndex : currentHref}`}
+            page={currentBook?.hasEpub === false ? dbPageIndex + 1 : chapterPageCurrent}
+            total={currentBook?.hasEpub === false ? dbPageTotal : chapterPageTotal}
+            disabled={loadingBoot || bookSwitching || dbReaderLoading || (currentBook?.hasEpub !== false && !readerReady)}
+            onCommit={(page) => currentBook?.hasEpub === false ? jumpDbPage(page - 1) : jumpToPage(page)}
+          />
           <div className="footer-meta">
-            <span>当前位置已自动保存{locationsReady ? "" : " · 正在生成章节定位映射"}</span>
+            <span>当前位置已自动保存{currentBook?.hasEpub === false || locationsReady ? "" : " · 正在准备章节定位"}</span>
             <span>{ttsStatus || "AI / 浏览器朗读已就绪"}</span>
           </div>
         </footer>
@@ -6444,15 +6512,16 @@ function App() {
                     新窗口打开
                   </button>
                 </div>
-                {/* @ts-expect-error Electron <webview> 不是标准 HTML 元素 —
-                    用它而不是 <iframe> 是因为中研院反 iframe 第三方 cookie，
-                    搜索后页面会被刷回首页；<webview> 有独立 session 能正常保留搜索状态。 */}
-                <webview
-                  src="https://newarchive.ihp.sinica.edu.tw/hplname/placename/basic"
-                  className="hgis-iframe"
-                  partition="persist:sinica"
-                  style={{ display: "inline-flex" }}
-                />
+                {navigator.userAgent.includes("Electron/") ? (
+                  <webview
+                    src="https://newarchive.ihp.sinica.edu.tw/hplname/placename/basic"
+                    className="hgis-iframe"
+                    partition="persist:sinica"
+                    style={{ display: "inline-flex" }}
+                  />
+                ) : (
+                  <p className="muted-text">点击「新窗口打开」使用历史地名检索。</p>
+                )}
               </div>
             )}
 

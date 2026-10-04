@@ -32,7 +32,7 @@ import {
   searchOfficeReferences,
   filterRelevantReferences
 } from "./services/reference-service.js";
-import { searchByEmbedding, isAvailable as embeddingAvailable } from "./services/embedding-service.js";
+import { searchByEmbedding, isAvailable as embeddingAvailable, shutdownSidecar } from "./services/embedding-service.js";
 import { ROLES, getSiteContent, initializeAuth } from "./auth/auth-db.js";
 import { attachUser, requireAuth, requireRole } from "./auth/middleware.js";
 import { createAuthRouter } from "./auth/auth-routes.js";
@@ -611,6 +611,7 @@ app.post("/api/reference/lookup", async (req, res, next) => {
 });
 
 app.post("/api/reference/compare", async (req, res, _next) => {
+  let deadlineTimer;
   try {
     const { selectedText = "", aiSettings: clientAiSettings = {}, currentBookSlug = DEFAULT_BOOK_SLUG } = req.body || {};
     if (!String(selectedText).trim()) {
@@ -624,12 +625,17 @@ app.post("/api/reference/compare", async (req, res, _next) => {
     // 前端 fetchWithTimeout 是 900s，这里设 850s 留 50s 给响应序列化。
     const result = await Promise.race([
       runCrossSourceComparison(String(selectedText).trim(), aiSettings, String(currentBookSlug || DEFAULT_BOOK_SLUG)),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 850000))
+      new Promise((_, reject) => {
+        deadlineTimer = setTimeout(() => reject(new Error("史料比对超时，请稍后再试或缩短选段。")), 850000);
+        deadlineTimer.unref?.();
+      })
     ]);
     res.json(result);
   } catch (error) {
     const msg = error instanceof Error ? error.message : "史料比对失败";
     res.status(msg.includes("超时") ? 504 : 500).json({ error: msg });
+  } finally {
+    clearTimeout(deadlineTimer);
   }
 });
 
@@ -1091,6 +1097,17 @@ app.use((error, _req, res, _next) => {
 // to 0.0.0.0 only when running without a reverse proxy.
 const HOST = process.env.MINGSHI_HOST || "127.0.0.1";
 
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   console.log(`Mingshi Reader backend running at http://${HOST}:${PORT}`);
 });
+
+// Electron stops this backend with SIGTERM. Stop the model child as well so
+// closing the desktop app cannot leave its memory resident in an orphan process.
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    const sidecarStopped = shutdownSidecar();
+    server.close(async () => { await sidecarStopped; process.exit(0); });
+    // Allow stopProcess's SIGKILL fallback to run if the model ignores SIGTERM.
+    setTimeout(() => process.exit(0), 4000).unref();
+  });
+}
