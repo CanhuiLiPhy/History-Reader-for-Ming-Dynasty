@@ -28,6 +28,7 @@ import "./App.css";
 import { PageSlider } from "./components/PageSlider";
 import { jumpRenderedProgress, renderedPagination, type PaginatedManager } from "./lib/reader-pagination";
 import { ReaderViewManager, prepareEpubRenditionForDestroy } from "./lib/epubReaderManager";
+import { WheelPageGesture, type WheelPagingMode } from "./lib/wheel-paging";
 import { ShixiTree } from "./components/ShixiTree";
 import { HistoricalCalculator } from "./components/HistoricalCalculator";
 import {
@@ -238,6 +239,16 @@ type EpubBookLike = {
   ready: Promise<unknown>;
   destroy?: () => void;
 };
+
+/**
+ * 中文：校验持久化读回的翻页手势模式。
+ *
+ * @param value - A value read from persisted settings.
+ * @returns `value` when it is a {@link WheelPagingMode}, else `"horizontal"`.
+ */
+function toWheelPagingMode(value: unknown): WheelPagingMode {
+  return value === "off" || value === "all" ? value : "horizontal";
+}
 
 declare global {
   interface Window {
@@ -898,6 +909,11 @@ function App() {
   // The footer (page slider + status) follows this same flag.
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
+  // Trackpad two-finger swipe / mouse wheel paging, mirrored into a ref for the
+  // native listeners (they live outside React's render cycle).
+  // 双指滑动 / 滚轮翻页；原生监听在 React 渲染之外，用 ref 读最新值。
+  const [wheelPagingMode, setWheelPagingMode] = useState<WheelPagingMode>("horizontal");
+  const wheelPagingModeRef = useRef<WheelPagingMode>("horizontal");
   // v1.2: 键盘翻页 — 默认关闭；开启后 ←/→ 翻页（在 input/textarea 聚焦时不触发）。
   const [keyboardPagingEnabled, setKeyboardPagingEnabled] = useState(true);
   // v1.2: 标记模式 — 默认关闭；开启后选段直接按当前 default 颜色/形态打标，不弹工具栏；Cmd+Z 撤销最近一次。
@@ -1005,6 +1021,7 @@ function App() {
           savedKeyboardPaging,
           savedMarkMode,
           savedMarkStyle,
+          savedWheelPagingMode,
         ] =
           await Promise.all([
             fetchDefaults(),
@@ -1033,6 +1050,7 @@ function App() {
             readPersistedState<boolean>(storageKey("keyboard-paging-enabled"), true),
             readPersistedState<boolean>(storageKey("mark-mode-enabled"), false),
             readPersistedState<"h-gold" | "h-jade" | "h-crimson" | "underline" | "circle">(storageKey("mark-style"), "h-gold"),
+            readPersistedState<string>(storageKey("wheel-paging-mode"), "horizontal"),
           ]);
 
         if (cancelled) return;
@@ -1137,6 +1155,8 @@ function App() {
         setKeyboardPagingEnabled(savedKeyboardPaging);
         setMarkModeEnabled(savedMarkMode);
         setMarkStyle(savedMarkStyle);
+        setWheelPagingMode(toWheelPagingMode(savedWheelPagingMode));
+        wheelPagingModeRef.current = toWheelPagingMode(savedWheelPagingMode);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -1427,6 +1447,8 @@ function App() {
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("keyboard-paging-enabled"), keyboardPagingEnabled); }, [keyboardPagingEnabled, hasLoadedLocalState]);
   useEffect(() => { markModeRef.current = markModeEnabled; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-mode-enabled"), markModeEnabled); }, [markModeEnabled, hasLoadedLocalState]);
   useEffect(() => { markStyleRef.current = markStyle; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-style"), markStyle); }, [markStyle, hasLoadedLocalState]);
+  // Swipe paging preference. / 滑动翻页设置的持久化。
+  useEffect(() => { wheelPagingModeRef.current = wheelPagingMode; if (hasLoadedLocalState) void writePersistedState(storageKey("wheel-paging-mode"), wheelPagingMode); }, [wheelPagingMode, hasLoadedLocalState]);
 
   // v1.2 Cmd/Ctrl+Z 撤销最近一次勾画（不论是否在标记模式都生效，只要有 stack）
   useEffect(() => {
@@ -2306,6 +2328,56 @@ function App() {
   swipeNextRef.current = goNextPage;
   swipePrevRef.current = goPrevPage;
 
+  // ---- Trackpad two-finger swipe / mouse wheel paging ----
+  // One recogniser serves the reader card and every EPUB section iframe, so a
+  // swipe that crosses the iframe edge is still one gesture. Like the swipe
+  // refs above, the handler is re-pointed on every render so listeners that
+  // were registered once (inside iframes) always see the current book.
+  // 触控板双指滑动 / 滚轮翻页。阅读区和每个 EPUB 章节 iframe 共用一个识别器，
+  // 滑过 iframe 边界仍算同一次手势；处理函数每次渲染都重新指向最新闭包。
+  const wheelGestureRef = useRef<WheelPageGesture | null>(null);
+  const readerWheelRef = useRef<((event: WheelEvent) => void) | null>(null);
+  readerWheelRef.current = (event: WheelEvent) => {
+    const mode = wheelPagingModeRef.current;
+    if (mode === "off") return;
+    if (!wheelGestureRef.current) wheelGestureRef.current = new WheelPageGesture();
+    const isDbReaderActive = readableBooks.find((b) => b.slug === currentBookSlug)?.hasEpub === false;
+    const manager = renditionRef.current?.manager;
+    const rtl = !isDbReaderActive && manager?.settings.axis === "horizontal" && manager.settings.direction === "rtl";
+    const decision = wheelGestureRef.current.handle({
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode,
+      ctrlKey: event.ctrlKey,
+      // One clock for both documents: iframe timeStamps use another origin. / 两个文档共用一个时钟：iframe 的 timeStamp 起点不同。
+      time: performance.now(),
+    }, mode, rtl);
+    if (decision.consume && event.cancelable) event.preventDefault();
+    if (!decision.turn) return;
+    // Same paths as the toolbar buttons: chapter boundaries and loading guards apply.
+    // 与工具栏按钮走同一路径：跨章、加载中禁止翻页等规则照常生效。
+    if (isDbReaderActive) flipDbPage(decision.turn);
+    else if (decision.turn > 0) goNextPage();
+    else goPrevPage();
+  };
+
+  /**
+   * 中文：挂到阅读卡片上的回调 ref：注册非 passive 的 wheel 监听（React 的 onWheel 是 passive，无法阻止默认行为）。
+   *
+   * Callback ref for the reader card. React registers `onWheel` as passive,
+   * which cannot `preventDefault()`, so the listener is attached natively and
+   * removed again through React 19's ref cleanup.
+   *
+   * @param card - The `.reader-card` element, or `null` on unmount.
+   * @returns Cleanup that removes the listener.
+   */
+  const attachReaderCard = useCallback((card: HTMLElement | null) => {
+    if (!card) return;
+    const onWheel = (event: WheelEvent) => readerWheelRef.current?.(event);
+    card.addEventListener("wheel", onWheel, { passive: false });
+    return () => card.removeEventListener("wheel", onWheel);
+  }, []);
+
   function syncRenderedPagination(location?: EpubLocationLike | null) {
     const manager = renditionRef.current?.manager;
     const divisor = manager?.settings.axis === "horizontal" ? manager.layout.divisor : 1;
@@ -2558,6 +2630,17 @@ function App() {
           if (dx < 0) swipeNextRef.current?.();
           else swipePrevRef.current?.();
         }, { passive: true });
+      }
+
+      // Trackpad two-finger swipes and wheels over the text arrive in the
+      // section iframe too; route them to the shared recogniser. Non-passive
+      // so the handler may stop the browser's own "swipe to go back".
+      // 正文上的双指滑动 / 滚轮事件同样只发到 iframe 里，交给同一个识别器；
+      // 不设 passive，才能阻止浏览器自己的「滑动返回上一页」。
+      const marks = doc as unknown as { __mingshiWheel?: boolean };
+      if (!marks.__mingshiWheel) {
+        marks.__mingshiWheel = true;
+        doc.addEventListener("wheel", (event: WheelEvent) => readerWheelRef.current?.(event), { passive: false });
       }
 
       if (!doc.querySelector("#mingshi-injected-fonts")) {
@@ -5375,7 +5458,7 @@ function App() {
           )}
         </header>
 
-        <section className="reader-card">
+        <section className="reader-card" ref={attachReaderCard}>
           {loadingBoot && <div className="overlay-message">正在载入书籍与本地资料…</div>}
           {bootError && <div className="overlay-message error-box">{bootError}</div>}
           {bookSwitching && <div className="overlay-message">切换书目中…</div>}
@@ -6736,6 +6819,21 @@ function App() {
                                     onChange={(event) => setPromptSupplementEnabled(event.target.checked)}
                                   />
                                   <span>AI 操作前弹出补充说明提示</span>
+                                </label>
+
+                                {/* 双指滑动翻页。 / Swipe paging. */}
+                                <div className="divider" />
+                                <div className="panel-headline small">
+                                  <BookOpenText size={14} />
+                                  <span>翻页</span>
+                                </div>
+                                <label className="field-label">
+                                  触控板双指滑动翻页
+                                  <select className="select-input" value={wheelPagingMode} onChange={(e) => setWheelPagingMode(toWheelPagingMode(e.target.value))}>
+                                    <option value="horizontal">左右滑动翻页</option>
+                                    <option value="all">左右、上下滑动及鼠标滚轮都翻页</option>
+                                    <option value="off">关闭</option>
+                                  </select>
                                 </label>
 
                                 {/* 标记设置并入外观设置，不再单开弹窗。
