@@ -6,6 +6,13 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+// The anchored algorithm's DOM-free core runs for real inside the harness.
+// 锚定重排算法与 DOM 无关的核心部分在测试环境中真实运行。
+const anchorSource = readFileSync(new URL("../src/lib/reflow-anchor.ts", import.meta.url), "utf8");
+const anchorModule = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(anchorSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString("base64")}`);
+
 const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const app = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "App");
@@ -42,7 +49,8 @@ function keyboardEffect() {
   assert.fail("reader keyboard effect exists");
 }
 
-const functions = ["loadDbReaderChapter", "captureDbAnchor", "flipDbPage", "jumpDbPage", "scrollToSearchTarget"];
+const functions = ["loadDbReaderChapter", "captureDbAnchor", "flipDbPage", "jumpDbPage", "scrollToSearchTarget",
+  "dbChapterKey", "captureDbTextAnchor", "usableDbTextAnchor", "resolveDbTextAnchorPage"];
 const keyboard = keyboardEffect();
 const javascript = ts.transpileModule([
   ...functions.map(appFunction),
@@ -126,6 +134,29 @@ function createHarness({ index = 1, totalChapters = 3, page = 1, totalPages = 3 
     chapterRequestRef: { current: null },
     dbTargetPageRef: { current: page },
     dbAnchorParaRef: { current: null },
+    // Existing tests exercise the legacy algorithm; anchored tests switch it.
+    // 既有用例测试旧算法；锚定用例会切换到新算法。
+    reflowAlgorithmRef: { current: "legacy" },
+    dbTextAnchorRef: { current: null },
+    findFirstTextPositionOnPage: anchorModule.findFirstTextPositionOnPage,
+    textAnchorAt: anchorModule.textAnchorAt,
+    resolveTextAnchor: anchorModule.resolveTextAnchor,
+    pageOfTextPosition: anchorModule.pageOfTextPosition,
+    // Synthetic text layout: the article's characters fill pages of width / 10.
+    // 模拟排版：正文字符按「页宽 / 10」个一页依次排满。
+    collectAnchorTextNodes: (article) => article.textNodes ?? [],
+    dbCharMeasurer(target) {
+      const perPage = Math.max(1, Math.floor(target.clientWidth / 10));
+      const nodes = article.textNodes ?? [];
+      return (node, offset) => {
+        let before = 0;
+        for (const candidate of nodes) {
+          if (candidate === node) return Math.floor((before + offset) / perPage);
+          before += candidate.data.length;
+        }
+        return null;
+      };
+    },
     skipNextDbScrollResetRef: { current: false },
     pendingSearchNavRef: { current: null },
     renditionRef: { current: null },
@@ -183,7 +214,7 @@ function createHarness({ index = 1, totalChapters = 3, page = 1, totalPages = 3 
     windowListeners.get("keydown")?.({ key, target: null, preventDefault() {} });
   }
   return { api: context.navigation, context, state, host, article, requests, scrolls, chapter,
-    frames, timers, paragraph, render, flushFrames, layout, commitKeyboardEffect, pressKey };
+    frames, timers, listeners, paragraph, render, flushFrames, layout, commitKeyboardEffect, pressKey };
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -387,4 +418,76 @@ test("a consumed search target is not reset by the chapter loading frame", async
   h.layout();
   assert.equal(h.host.scrollLeft, 1000);
   assert.equal(h.context.dbTargetPageRef.current, 2);
+});
+
+/** Give the harness 1,000 characters of text laid out at width / 10 per page. */
+function useTextLayout(h, width = 500) {
+  h.article.textNodes = Array.from({ length: 10 }, (_, i) => ({ data: String(i).repeat(100) }));
+  resizeHost(h, width);
+}
+
+/** Resize the fake host the way a docked panel opening or closing would. */
+function resizeHost(h, width) {
+  const perPage = Math.floor(width / 10);
+  h.host.clientWidth = width;
+  h.host.scrollWidth = Math.ceil(1000 / perPage) * width;
+}
+
+test("anchored reflow: narrowing and widening repeatedly returns to the original page", () => {
+  const h = createHarness({ page: 7, totalPages: 20 });
+  h.context.reflowAlgorithmRef.current = "anchored";
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 7 * 500;
+  h.layout();
+  // First character of page 7 at 50 characters per page. / 每页 50 字时第 7 页页首是第 350 字。
+  assert.equal(h.context.dbTextAnchorRef.current.offset, 350);
+  for (let round = 0; round < 3; round += 1) {
+    resizeHost(h, 400);
+    h.layout();
+    assert.equal(h.state.page, 8, "350 / 40 per page lands on page 8");
+    assert.equal(h.host.scrollLeft, 8 * 400);
+    resizeHost(h, 500);
+    h.layout();
+    assert.equal(h.state.page, 7);
+    assert.equal(h.host.scrollLeft, 7 * 500);
+    assert.equal(h.context.dbTextAnchorRef.current.offset, 350, "re-pagination never replaces the anchor");
+  }
+});
+
+test("anchored reflow: a page turn replaces the anchor once the scroll settles", () => {
+  const h = createHarness({ page: 7, totalPages: 20 });
+  h.context.reflowAlgorithmRef.current = "anchored";
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 7 * 500;
+  h.render();
+  const cleanup = h.context.navigation.runPaginationEffect();
+  h.flushFrames();
+  h.api.flipDbPage(1);
+  h.listeners.get("scroll")();
+  for (const [id, settle] of Array.from(h.timers)) { h.timers.delete(id); settle(); }
+  assert.equal(h.context.dbTextAnchorRef.current.offset, 400);
+  assert.equal(h.context.dbTextAnchorRef.current.page, 8);
+  cleanup();
+  resizeHost(h, 400);
+  h.layout();
+  assert.equal(h.state.page, 10);
+  resizeHost(h, 500);
+  h.layout();
+  assert.equal(h.state.page, 8);
+});
+
+test("anchored reflow: a navigation that has not settled yet keeps its target page", () => {
+  const h = createHarness({ page: 7, totalPages: 20 });
+  h.context.reflowAlgorithmRef.current = "anchored";
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 7 * 500;
+  h.layout();
+  h.api.jumpDbPage(0); // the panel toggles before this jump's scroll settles
+  resizeHost(h, 400);
+  h.layout();
+  assert.equal(h.state.page, 0);
+  assert.equal(h.context.dbTextAnchorRef.current.offset, 0);
+  resizeHost(h, 500);
+  h.layout();
+  assert.equal(h.state.page, 0);
 });

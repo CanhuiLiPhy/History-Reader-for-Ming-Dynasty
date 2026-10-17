@@ -1508,6 +1508,13 @@ g.reader-circle line {
   overflow: hidden;
 }
 
+/* 新重排算法：EPUB 重新排版、校正到原阅读处之前先不显示正文（visibility 仍保留版面，测量不受影响）。
+   Anchored re-pagination: keep the text invisible until it sits on the
+   anchor's page; visibility keeps layout, so measuring still works. */
+.reader-host.is-repaginating .epub-container {
+  visibility: hidden;
+}
+
 .overlay-message {
   position: absolute;
   inset: 1rem;

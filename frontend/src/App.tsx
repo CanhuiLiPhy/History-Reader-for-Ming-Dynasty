@@ -30,6 +30,16 @@ import { PageSlider } from "./components/PageSlider";
 import { jumpRenderedProgress, renderedPagination, type PaginatedManager } from "./lib/reader-pagination";
 import { ReaderViewManager, prepareEpubRenditionForDestroy } from "./lib/epubReaderManager";
 import { WheelPageGesture, type WheelPagingMode } from "./lib/wheel-paging";
+import {
+  collectAnchorTextNodes,
+  createRangeCharMeasurer,
+  findFirstTextPositionOnPage,
+  pageOfTextPosition,
+  resolveTextAnchor,
+  textAnchorAt,
+  type CharPageMeasurer,
+  type TextAnchor,
+} from "./lib/reflow-anchor";
 import { ShixiTree } from "./components/ShixiTree";
 import { HistoricalCalculator } from "./components/HistoricalCalculator";
 import {
@@ -192,7 +202,7 @@ type EpubContentsLike = {
   // column/page where the paragraph lives. Available on epub.js Contents
   // class; typed as optional since some builds may lack it.
   cfiFromNode?: (node: Node) => string;
-  cfiFromRange?: (range: Range) => string;
+  cfiFromRange?: (range: Range, ignoreClass?: string) => string;
 };
 
 type EpubRenditionLike = {
@@ -201,7 +211,9 @@ type EpubRenditionLike = {
   prev: () => Promise<void> | void;
   destroy: () => void;
   spread?: (spread: "none" | "always" | "auto", min?: number) => void;
-  resize?: (width: number, height: number) => void;
+  // The optional CFI replaces the location epub.js re-displays after resizing.
+  // 可选的 CFI 指定重排后 epub.js 重新显示的位置。
+  resize?: (width: number, height: number, epubcfi?: string) => void;
   currentLocation?: () => EpubLocationLike | null;
   themes: {
     default: (styles: Record<string, Record<string, string>>) => void;
@@ -242,6 +254,34 @@ type EpubBookLike = {
 };
 
 /**
+ * 中文：epub.js 一个已渲染章节视图里本模块用到的部分。
+ *
+ * The parts of an epub.js 0.3.93 IframeView used by the anchored reflow.
+ * `document` is the section iframe's document; `iframe` is its element, whose
+ * left edge is the origin of that document's client coordinates.
+ */
+type EpubViewLike = {
+  section?: { index?: number; href?: string };
+  document?: Document;
+  iframe?: HTMLIFrameElement;
+  element?: HTMLElement;
+  contents?: EpubContentsLike;
+};
+
+/**
+ * 中文：分页 manager 上锚定重排要读取的内部字段。
+ *
+ * Paginated manager internals read by the anchored reflow, on top of the
+ * fields {@link PaginatedManager} already declares. `_stageSize` is the size
+ * epub.js last laid out for; a resize to the same size is a no-op upstream.
+ */
+type EpubPagedManager = PaginatedManager & {
+  container?: HTMLElement;
+  views?: { first?: () => EpubViewLike | undefined };
+  _stageSize?: { width: number; height: number };
+};
+
+/**
  * 中文：侧栏显示方式：并排（正文让位）/ 浮在正文上 / 浮在正文上且点正文自动收起。
  *
  * How a side panel is shown on wide screens.
@@ -250,6 +290,64 @@ type EpubBookLike = {
  * - `"floating-dismiss"`: as floating, and a plain tap on the page closes it.
  */
 type SidePanelMode = "docked" | "floating" | "floating-dismiss";
+
+/**
+ * 中文：页面重排算法：旧算法 / 锚定阅读位置的新算法。
+ *
+ * Re-pagination algorithm. `"legacy"` keeps the previous behaviour untouched;
+ * `"anchored"` uses the sticky first-character anchor of `lib/reflow-anchor`.
+ */
+type ReflowAlgorithm = "legacy" | "anchored";
+
+/**
+ * 中文：段落书籍的锚点：锚点本身 + 所属章节 + 当前所在页号。
+ *
+ * Anchor for paragraph (non-EPUB) books.
+ *
+ * @property key - `${slug}:${chapterIndex}` of the chapter it belongs to.
+ * @property page - Page the anchor sits on in the current layout. It is kept
+ *   in step after every re-pagination, so a mismatch with the reader's
+ *   logical target page means the reader navigated and the anchor is stale.
+ */
+type DbTextAnchor = TextAnchor & { key: string; page: number };
+
+/**
+ * 中文：EPUB 书籍的锚点：锚点本身 + 章节序号 + 当前所在屏 + 供 epub.js 初排用的 CFI。
+ *
+ * Anchor for EPUB books.
+ *
+ * @property sectionIndex - Spine index of the section holding the anchor.
+ * @property screen - Screen the anchor sits on in the current layout (kept in
+ *   step after each re-pagination, like {@link DbTextAnchor.page}).
+ * @property displayCfi - Character-level CFI computed while ignoring the
+ *   year-annotation wrappers, so epub.js can resolve it in the freshly
+ *   rendered, not yet annotated document it lays out first.
+ * @property serial - Value of the EPUB navigation serial when captured; an
+ *   explicit navigation since then makes the anchor stale.
+ */
+type EpubTextAnchor = TextAnchor & { sectionIndex: number; screen: number; displayCfi: string; serial: number };
+
+/**
+ * 中文：重排进行中锁定的 EPUB 锚点：锁定期内连续多次重排（如拖动窗口）都沿用同一个锚点。
+ *
+ * The anchor held while a burst of layout changes is in progress (window
+ * drags, font-size slider). Until `until` (a `performance.now()` time) no
+ * intermediate layout may replace it, because its `screen` is only brought up
+ * to date by the correction that follows each re-pagination.
+ */
+type EpubAnchorLock = { anchor: EpubTextAnchor; until: number };
+
+/** 中文：EPUB 锚点在最后一次版面变化后保持锁定的时长（ms）。 / How long an EPUB anchor stays locked after the last layout change. */
+const EPUB_ANCHOR_LOCK_MS = 1500;
+
+/** 中文：EPUB 重排后（首次即时校正之外）再校正的时机（ms），应对渲染后版面仍在变化。 / Follow-up correction delays after an EPUB section re-renders. */
+const EPUB_REFLOW_CORRECTIONS = [160, 480];
+
+/** 中文：EPUB 改字号/字体后分几次校正位置（ms）。 / Correction delays after an EPUB font change. */
+const EPUB_FONT_CORRECTIONS = [80, 260, 700, 1400];
+
+/** 中文：年号标注外层 span 的类名。 / Class of the year-annotation wrapper spans. */
+const YEAR_ANNOTATION_CLASS = "mingshi-year-annotation";
 
 /** 中文：浮动侧栏「点正文收起」判定为点按的最大位移（px）。 / Max pointer travel for a dismissing tap. */
 const DISMISS_TAP_SLOP = 6;
@@ -275,6 +373,16 @@ function toSidePanelMode(value: unknown): SidePanelMode {
  */
 function toWheelPagingMode(value: unknown): WheelPagingMode {
   return value === "off" || value === "all" ? value : "horizontal";
+}
+
+/**
+ * 中文：校验持久化读回的重排算法。
+ *
+ * @param value - A value read from persisted settings.
+ * @returns `"anchored"` when stored, else `"legacy"`.
+ */
+function toReflowAlgorithm(value: unknown): ReflowAlgorithm {
+  return value === "anchored" ? "anchored" : "legacy";
 }
 
 declare global {
@@ -946,6 +1054,10 @@ function App() {
   // 双指滑动 / 滚轮翻页；原生监听在 React 渲染之外，用 ref 读最新值。
   const [wheelPagingMode, setWheelPagingMode] = useState<WheelPagingMode>("horizontal");
   const wheelPagingModeRef = useRef<WheelPagingMode>("horizontal");
+  // Re-pagination algorithm; "legacy" is the default until the new one is adopted.
+  // 重排算法：默认仍用旧算法，新算法需在外观设置里手动切换。
+  const [reflowAlgorithm, setReflowAlgorithm] = useState<ReflowAlgorithm>("legacy");
+  const reflowAlgorithmRef = useRef<ReflowAlgorithm>("legacy");
   // Whether each panel is open as a grid column, i.e. actually narrows the page.
   // 侧栏是否以并排方式打开（只有这种情况才会挤窄正文）。
   const sidebarDocked = !sidebarCollapsed && sidebarPanelMode === "docked";
@@ -1060,6 +1172,7 @@ function App() {
           savedSidebarPanelMode,
           savedAssistantPanelMode,
           savedWheelPagingMode,
+          savedReflowAlgorithm,
         ] =
           await Promise.all([
             fetchDefaults(),
@@ -1091,6 +1204,7 @@ function App() {
             readPersistedState<string>(storageKey("sidebar-panel-mode"), "docked"),
             readPersistedState<string>(storageKey("assistant-panel-mode"), "docked"),
             readPersistedState<string>(storageKey("wheel-paging-mode"), "horizontal"),
+            readPersistedState<string>(storageKey("reflow-algorithm"), "legacy"),
           ]);
 
         if (cancelled) return;
@@ -1199,6 +1313,8 @@ function App() {
         setAssistantPanelMode(toSidePanelMode(savedAssistantPanelMode));
         setWheelPagingMode(toWheelPagingMode(savedWheelPagingMode));
         wheelPagingModeRef.current = toWheelPagingMode(savedWheelPagingMode);
+        setReflowAlgorithm(toReflowAlgorithm(savedReflowAlgorithm));
+        reflowAlgorithmRef.current = toReflowAlgorithm(savedReflowAlgorithm);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -1370,6 +1486,18 @@ function App() {
 
     // Apply to live epub.js rendition if present.
     const rendition = renditionRef.current;
+    // Anchored algorithm: a font family/size change re-flows the section
+    // without any resize, so lock the anchor before the new CSS lands and
+    // correct to it afterwards. The legacy algorithm keeps its behaviour of
+    // staying on the same screen index.
+    // 新算法：换字体或字号会在尺寸不变的情况下让章节重排。先在新样式生效前锁定锚点，
+    // 生效后再校正回去；旧算法仍保持原来「停在同一屏序号」的做法。
+    const fontKey = `${readerFontFamily}|${readerFontSize}`;
+    const fontChanged = lastEpubFontKeyRef.current !== null && lastEpubFontKeyRef.current !== fontKey;
+    lastEpubFontKeyRef.current = fontKey;
+    const fontAnchor = fontChanged && rendition && readerReady && reflowAlgorithmRef.current === "anchored"
+      ? lockEpubAnchor(rendition)
+      : null;
     if (rendition?.themes) {
       try {
         rendition.themes.default({
@@ -1408,7 +1536,17 @@ function App() {
         // contents not yet available; the contents.register hook will inject
         // themeCssRef.current when each section first renders
       }
+      if (fontAnchor) {
+        scheduleEpubAnchorCorrections(rendition, fontAnchor, EPUB_FONT_CORRECTIONS);
+        // A newly chosen web font finishes loading later and re-flows again.
+        // 新选的网络字体稍后才加载完，届时会再次重排，再校正一次。
+        const fontDoc = epubPagedGeometry(rendition)?.doc;
+        window.setTimeout(() => {
+          void fontDoc?.fonts?.ready.then(() => scheduleEpubAnchorCorrections(rendition, fontAnchor, [0]));
+        }, 120);
+      }
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readerTheme, readerFontFamily, readerFontSize, readerFontColor, readerReady]);
 
   useEffect(() => {
@@ -1489,7 +1627,7 @@ function App() {
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("keyboard-paging-enabled"), keyboardPagingEnabled); }, [keyboardPagingEnabled, hasLoadedLocalState]);
   useEffect(() => { markModeRef.current = markModeEnabled; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-mode-enabled"), markModeEnabled); }, [markModeEnabled, hasLoadedLocalState]);
   useEffect(() => { markStyleRef.current = markStyle; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-style"), markStyle); }, [markStyle, hasLoadedLocalState]);
-  // Side panel and swipe paging preferences. / 侧栏显示方式与滑动翻页设置的持久化。
+  // Side panel, swipe paging and re-pagination preferences. / 侧栏显示方式、滑动翻页、重排算法的持久化。
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("sidebar-panel-mode"), sidebarPanelMode); }, [sidebarPanelMode, hasLoadedLocalState]);
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("assistant-panel-mode"), assistantPanelMode); }, [assistantPanelMode, hasLoadedLocalState]);
   useEffect(() => { wheelPagingModeRef.current = wheelPagingMode; if (hasLoadedLocalState) void writePersistedState(storageKey("wheel-paging-mode"), wheelPagingMode); }, [wheelPagingMode, hasLoadedLocalState]);
@@ -2125,6 +2263,97 @@ function App() {
     dbAnchorParaRef.current = anchor?.dataset.paragraphId ?? null;
   }
 
+  // ---- Anchored re-pagination for paragraph books (opt-in) ----
+  // The legacy paragraph anchor above and its use in the recompute effect stay
+  // exactly as they were; the text anchor below is consulted only when the
+  // reader chose the anchored algorithm in the appearance settings.
+  // 段落书籍的「锚定阅读位置」重排（需在外观设置中开启）。上面的旧段落锚点及其在
+  // recompute 里的用法原样保留，下面的逐字锚点只在选用新算法时生效。
+  const dbTextAnchorRef = useRef<DbTextAnchor | null>(null);
+
+  /**
+   * 中文：段落书籍的逐字测量器：把字的版面矩形换算成第几页（第几栏）。
+   *
+   * Character → page measurer for the paragraph reader. Its CSS columns are
+   * exactly `clientWidth` wide with no gap, so a character's page is the
+   * horizontal centre of its box, in scroll-content coordinates, divided by
+   * that width. The result does not depend on the current scroll position.
+   *
+   * @param host - The horizontally scrolling `.db-reader-host` element.
+   * @returns A measurer valid for the host's current layout.
+   */
+  function dbCharMeasurer(host: HTMLElement): CharPageMeasurer {
+    const width = Math.max(1, host.clientWidth);
+    // Viewport x of the scroll content's origin. / 滚动内容原点在视口中的 x 坐标。
+    const origin = host.getBoundingClientRect().left + host.clientLeft - host.scrollLeft;
+    return createRangeCharMeasurer(document, (rect) => Math.floor((rect.left + rect.width / 2 - origin) / width));
+  }
+
+  /**
+   * 中文：当前章节的锚点键（书 slug + 章序号）。
+   *
+   * @returns `${slug}:${chapterIndex}` of the loaded chapter, or "" before one loads.
+   */
+  function dbChapterKey(): string {
+    return dbReaderChapter ? `${dbReaderChapter.slug}:${dbReaderChapter.chapterIndex}` : "";
+  }
+
+  /**
+   * 中文：取第 page 页页首的那个字作为段落书籍的锚点并记下。
+   *
+   * Capture the first character rendered on `page` as the paragraph reader's
+   * anchor and store it in `dbTextAnchorRef`.
+   *
+   * @param page - Zero-based page index in the current layout.
+   * @returns The stored anchor, or `null` when no chapter is laid out.
+   */
+  function captureDbTextAnchor(page: number): DbTextAnchor | null {
+    const host = dbReaderHostRef.current;
+    const article = host?.querySelector<HTMLElement>(".db-reader-article");
+    const key = dbChapterKey();
+    if (!host || !article || !key || !host.clientWidth || !Number.isFinite(page)) return null;
+    const nodes = collectAnchorTextNodes(article);
+    const position = findFirstTextPositionOnPage(nodes, dbCharMeasurer(host), Math.max(0, page));
+    if (!position) return null;
+    const anchor: DbTextAnchor = { ...textAnchorAt(nodes, position), key, page };
+    dbTextAnchorRef.current = anchor;
+    return anchor;
+  }
+
+  /**
+   * 中文：锚点是否仍代表读者所在位置；换过章、正在跳转检索结果或翻过页时都不再可用。
+   *
+   * The stored anchor if it still describes where the reader is, else `null`.
+   * It is stale when the chapter changed, a search jump is pending, or the
+   * logical target page moved off the page the anchor is kept on: every
+   * navigation path (page turn, slider, chapter load, search) moves
+   * `dbTargetPageRef`, whereas re-pagination keeps the two in step.
+   *
+   * @returns The usable anchor or `null`.
+   */
+  function usableDbTextAnchor(): DbTextAnchor | null {
+    const anchor = dbTextAnchorRef.current;
+    if (!anchor || pendingSearchNavRef.current || anchor.key !== dbChapterKey()) return null;
+    const target = dbTargetPageRef.current;
+    return target === null || target === anchor.page ? anchor : null;
+  }
+
+  /**
+   * 中文：在当前版面里找出锚点字所在的页。
+   *
+   * @param anchor - The anchor to locate.
+   * @returns Its zero-based page in the current layout, or `null` when the
+   *   chapter is not laid out.
+   */
+  function resolveDbTextAnchorPage(anchor: DbTextAnchor): number | null {
+    const host = dbReaderHostRef.current;
+    const article = host?.querySelector<HTMLElement>(".db-reader-article");
+    if (!host || !article || !host.clientWidth) return null;
+    const nodes = collectAnchorTextNodes(article);
+    const position = resolveTextAnchor(nodes, anchor);
+    return position ? pageOfTextPosition(nodes, position, dbCharMeasurer(host)) : null;
+  }
+
   // DB-reader（无 EPUB 的书）的滑动翻页。这类书直接渲染在主文档里，不在
   // iframe 中，所以用 React 的 onTouchStart / onTouchEnd 即可。
   //
@@ -2170,6 +2399,10 @@ function App() {
     }
     dbTargetPageRef.current = next;
     dbAnchorParaRef.current = null;
+    // Anchored algorithm: the destination's first character is known now,
+    // so a layout change during the smooth scroll still lands correctly.
+    // 新算法：目标页页首字此刻即可确定，平滑滚动途中版面变化也能落对位置。
+    if (reflowAlgorithmRef.current === "anchored") captureDbTextAnchor(next);
     host.scrollTo({ left: next * cw, behavior: "smooth" });
     // The scroll-settle listener captures the anchor once navigation ends.
   }
@@ -2186,6 +2419,7 @@ function App() {
     setDbPageTotal(total);
     setDbPageIndex(target);
     captureDbAnchor();
+    if (reflowAlgorithmRef.current === "anchored") captureDbTextAnchor(target);
   }
 
   // Recompute total pages whenever the chapter content or theme/font changes.
@@ -2218,6 +2452,13 @@ function App() {
           targetPage = Math.floor(anchorEl.offsetLeft / Math.max(1, cw));
         }
       }
+      // Anchored algorithm (opt-in): while the reader has not navigated, the
+      // page holding the sticky character anchor overrides the estimate above.
+      // 新算法（需手动开启）：读者没有翻页时，以锚点字所在页为准，取代上面的段落估算。
+      const anchoredReflow = reflowAlgorithmRef.current === "anchored";
+      const textAnchor = anchoredReflow ? usableDbTextAnchor() : null;
+      const anchoredPage = textAnchor ? resolveDbTextAnchorPage(textAnchor) : null;
+      if (anchoredPage !== null) targetPage = anchoredPage;
       const clamped = Math.max(0, Math.min(total - 1, targetPage));
       const desired = clamped * cw;
       if (Math.abs(host.scrollLeft - desired) > 1) {
@@ -2225,6 +2466,13 @@ function App() {
       }
       dbTargetPageRef.current = clamped;
       setDbPageIndex(clamped);
+      if (anchoredReflow) {
+        // Same reading position, now kept on this page; otherwise a navigation
+        // just landed here and this page's first character becomes the anchor.
+        // 阅读位置不变，只记下它现在所在的页；否则是刚跳转到这里，以本页页首字为新锚点。
+        if (textAnchor && anchoredPage !== null) textAnchor.page = clamped;
+        else captureDbTextAnchor(clamped);
+      }
     };
     // Wait one frame so CSS columns have finished laying out
     let frame = requestAnimationFrame(recompute);
@@ -2258,6 +2506,11 @@ function App() {
         // layout-change recomputes start from a clean state.
         dbTargetPageRef.current = Math.round(nearest / Math.max(1, cw));
         captureDbAnchor();
+        // Anchored algorithm: a page the reader navigated to gets a new anchor.
+        // 新算法：读者翻到了新的一页，就以该页页首字为新锚点。
+        if (reflowAlgorithmRef.current === "anchored" && !usableDbTextAnchor()) {
+          captureDbTextAnchor(dbTargetPageRef.current);
+        }
       }, 220);
     };
     host.addEventListener("scroll", onScroll, { passive: true });
@@ -2300,6 +2553,7 @@ function App() {
   async function openLocation(target: string) {
     const rendition = renditionRef.current;
     if (!rendition) return;
+    epubNavSerialRef.current += 1;
 
     // Look up chapter info from navigation map (for label & forced index)
     const navigation = chapterNavigationRef.current;
@@ -2355,10 +2609,12 @@ function App() {
   }
 
   function goNextPage() {
+    epubNavSerialRef.current += 1;
     renditionRef.current?.next?.();
   }
 
   function goPrevPage() {
+    epubNavSerialRef.current += 1;
     renditionRef.current?.prev?.();
   }
 
@@ -2497,6 +2753,24 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [sidebarPanelMode, assistantPanelMode, sidebarCollapsed, assistantCollapsed]);
 
+  // Switching algorithms starts from a fresh anchor taken from the page on
+  // screen, so the very next layout change already uses it.
+  // 切换重排算法后，从当前屏重新取锚点，下一次版面变化即可用上。
+  useEffect(() => {
+    reflowAlgorithmRef.current = reflowAlgorithm;
+    epubTextAnchorRef.current = null;
+    epubAnchorLockRef.current = null;
+    epubPendingReflowRef.current = null;
+    dbTextAnchorRef.current = null;
+    if (!hasLoadedLocalState) return;
+    void writePersistedState(storageKey("reflow-algorithm"), reflowAlgorithm);
+    const host = dbReaderHostRef.current;
+    if (reflowAlgorithm === "anchored" && host?.clientWidth && dbReaderChapter) {
+      captureDbTextAnchor(dbTargetPageRef.current ?? Math.round(host.scrollLeft / host.clientWidth));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reflowAlgorithm, hasLoadedLocalState]);
+
   function syncRenderedPagination(location?: EpubLocationLike | null) {
     const manager = renditionRef.current?.manager;
     const divisor = manager?.settings.axis === "horizontal" ? manager.layout.divisor : 1;
@@ -2508,6 +2782,7 @@ function App() {
   function jumpToPage(progress: number) {
     const rendition = renditionRef.current;
     if (!rendition?.manager) return;
+    epubNavSerialRef.current += 1;
     const chapterHref = rendition.currentLocation?.()?.start?.href;
     const navigate = () => {
       if (renditionRef.current !== rendition || !rendition.manager) return;
@@ -2524,6 +2799,238 @@ function App() {
     else navigate();
   }
 
+  // ---- Anchored re-pagination for EPUB books (opt-in) ----
+  // The legacy path (rendition.resize re-displaying epub.js's own page-start
+  // CFI) is untouched; everything below runs only when the anchored algorithm
+  // is selected and the book uses horizontal left-to-right pagination.
+  // EPUB 的「锚定阅读位置」重排（需手动开启）。旧路径（rendition.resize 让 epub.js
+  // 按它自己的页首 CFI 重新显示）保持不变；下面的逻辑只在选用新算法且横排从左到右分页时运行。
+  const epubTextAnchorRef = useRef<EpubTextAnchor | null>(null);
+  const epubAnchorLockRef = useRef<EpubAnchorLock | null>(null);
+  // Anchor wanted by the re-render a resize just started. / 刚发起的重排在等章节渲染完成后校正到这个锚点。
+  const epubPendingReflowRef = useRef<EpubTextAnchor | null>(null);
+  // Last font family|size applied to EPUB sections, to tell font changes from colour changes.
+  // 上次应用的「字体|字号」，用来区分会重排的字体变化和不重排的配色变化。
+  const lastEpubFontKeyRef = useRef<string | null>(null);
+  const repaginationRevealTimerRef = useRef(0);
+  // Bumped by every explicit EPUB navigation, so a correction still queued
+  // from a re-pagination never undoes a page turn made in the meantime.
+  // 每次主动翻页 / 跳转都加一；排队中的校正发现读者已翻页就放弃，不会把页翻回去。
+  const epubNavSerialRef = useRef(0);
+
+  /**
+   * 中文：重排期间先隐藏 EPUB 正文，校正到锚点后再显示，避免先闪出一页错页。
+   *
+   * Hide the EPUB text while an anchored resize re-paginates it, and show it
+   * again once it sits on the anchor's page. epub.js positions the fresh
+   * section before year annotation reshapes it, so without this the reader
+   * could glimpse a neighbouring page for a frame. A timer always reveals the
+   * text again, even if no render is ever reported.
+   *
+   * @param on - True to hide, false to show.
+   */
+  function setEpubRepaginating(on: boolean) {
+    window.clearTimeout(repaginationRevealTimerRef.current);
+    const host = readerHostRef.current;
+    if (!host) return;
+    host.classList.toggle("is-repaginating", on);
+    if (on) repaginationRevealTimerRef.current = window.setTimeout(() => host.classList.remove("is-repaginating"), 1200);
+  }
+
+  /**
+   * 中文：EPUB 当前的分页几何：manager、当前章节视图、每屏宽度、正在显示第几屏。
+   *
+   * Paginated geometry of the EPUB section on screen. Only horizontal,
+   * left-to-right pagination inside the embedded container is supported; any
+   * other mode returns `null` so callers keep the legacy behaviour.
+   *
+   * @param rendition - The live rendition, or `null`.
+   * @returns `{ manager, view, doc, container, delta, screen }` or `null`,
+   *   where `doc` is the section iframe's document, `container` the element
+   *   epub.js scrolls, `delta` the screen width in the document's x
+   *   coordinates and `screen` the zero-based screen index shown.
+   */
+  function epubPagedGeometry(rendition: EpubRenditionLike | null) {
+    const manager = rendition?.manager as EpubPagedManager | undefined;
+    if (!manager || manager.settings.fullsize || manager.settings.axis !== "horizontal" || manager.settings.direction === "rtl") return null;
+    const view = manager.views?.first?.();
+    const doc = view?.document ?? view?.contents?.document;
+    const frame = view?.iframe ?? view?.element;
+    const delta = manager.layout.delta;
+    const container = manager.container;
+    if (!view || !doc?.body || !frame || !container || !delta || !Number.isFinite(delta)) return null;
+    // The container scrolls; the section document itself never does.
+    // 滚动的是外层容器，章节文档本身不滚动。
+    const start = container.getBoundingClientRect().left - frame.getBoundingClientRect().left;
+    return { manager, view, doc, container, delta, screen: Math.max(0, Math.round(start / delta)) };
+  }
+
+  /**
+   * 中文：EPUB 逐字测量器：字在章节文档中的横向中点 ÷ 每屏宽度 = 第几屏。
+   *
+   * Character → screen measurer for an EPUB section document. epub.js lays the
+   * section out in CSS columns whose screen stride is `layout.delta`.
+   *
+   * @param doc - The section iframe's document.
+   * @param delta - Screen width in that document's x coordinates.
+   * @returns A measurer valid for the current layout.
+   */
+  function epubCharMeasurer(doc: Document, delta: number): CharPageMeasurer {
+    return createRangeCharMeasurer(doc, (rect) => Math.floor((rect.left + rect.width / 2) / delta));
+  }
+
+  /**
+   * 中文：取 EPUB 锚点：读者自上次取锚后没有翻页（同一章、同一屏）就沿用，否则取当前屏的页首字。
+   *
+   * Return the EPUB anchor for the screen on display, reusing the stored one
+   * while it is still valid — no explicit navigation since it was taken, and
+   * still in the same section on the same screen (this also catches in-book
+   * link jumps, which bypass the navigation serial). Otherwise capture the
+   * first character of the current screen, plus a CFI for epub.js's own
+   * initial positioning.
+   *
+   * @param rendition - The live rendition.
+   * @returns The anchor, or `null` when the geometry is unsupported or empty.
+   */
+  function ensureEpubTextAnchor(rendition: EpubRenditionLike | null): EpubTextAnchor | null {
+    const geometry = epubPagedGeometry(rendition);
+    if (!geometry) return null;
+    const sectionIndex = geometry.view.section?.index ?? -1;
+    const serial = epubNavSerialRef.current;
+    const kept = epubTextAnchorRef.current;
+    if (kept && kept.serial === serial && kept.sectionIndex === sectionIndex && kept.screen === geometry.screen) return kept;
+    const nodes = collectAnchorTextNodes(geometry.doc.body);
+    const position = findFirstTextPositionOnPage(nodes, epubCharMeasurer(geometry.doc, geometry.delta), geometry.screen);
+    if (!position) return null;
+    const displayCfi = (() => {
+      try {
+        const range = geometry.doc.createRange();
+        range.setStart(nodes[position.nodeIndex], position.offset);
+        range.collapse(true);
+        return geometry.view.contents?.cfiFromRange?.(range, YEAR_ANNOTATION_CLASS) ?? "";
+      } catch {
+        // No CFI only costs epub.js a less precise first placement. / 算不出 CFI 只会让 epub.js 的初排不够准，校正会补上。
+        return "";
+      }
+    })();
+    const anchor: EpubTextAnchor = { ...textAnchorAt(nodes, position), sectionIndex, screen: geometry.screen, displayCfi, serial };
+    epubTextAnchorRef.current = anchor;
+    return anchor;
+  }
+
+  /**
+   * 中文：版面将要变化：锁定（或沿用已锁定的）锚点，锁定期内的连续重排都用它。
+   *
+   * Lock the anchor ahead of a layout change. During a burst of changes the
+   * locked anchor is reused, so no intermediate layout can replace it.
+   *
+   * @param rendition - The live rendition.
+   * @returns The anchor to restore after the change, or `null` if unsupported.
+   */
+  function lockEpubAnchor(rendition: EpubRenditionLike): EpubTextAnchor | null {
+    const now = performance.now();
+    const lock = epubAnchorLockRef.current;
+    const anchor = lock && lock.until > now && lock.anchor.serial === epubNavSerialRef.current
+      ? lock.anchor
+      : ensureEpubTextAnchor(rendition);
+    if (!anchor) return null;
+    epubAnchorLockRef.current = { anchor, until: now + EPUB_ANCHOR_LOCK_MS };
+    return anchor;
+  }
+
+  /**
+   * 中文：把 EPUB 翻到锚点字所在的屏，并记下锚点现在所在的屏。
+   *
+   * Scroll the section so the anchor character is on screen, then record that
+   * screen on the anchor (re-pagination keeps it in step) and report the new
+   * location only if the page actually moved.
+   *
+   * @param rendition - The live rendition.
+   * @param anchor - The anchor to restore.
+   * @returns True when the anchor was found in the section on display.
+   */
+  function moveEpubToAnchor(rendition: EpubRenditionLike, anchor: EpubTextAnchor): boolean {
+    const geometry = epubPagedGeometry(rendition);
+    if (!geometry || (geometry.view.section?.index ?? -1) !== anchor.sectionIndex) return false;
+    const nodes = collectAnchorTextNodes(geometry.doc.body);
+    const position = resolveTextAnchor(nodes, anchor);
+    const target = position ? pageOfTextPosition(nodes, position, epubCharMeasurer(geometry.doc, geometry.delta)) : null;
+    if (target === null) return false;
+    anchor.screen = target;
+    if (target === geometry.screen) return true;
+    const maxOffset = Math.max(0, geometry.container.scrollWidth - geometry.container.clientWidth);
+    geometry.manager.scrollTo(Math.min(target * geometry.delta, maxOffset), 0, true);
+    rendition.reportLocation?.();
+    return true;
+  }
+
+  /**
+   * 中文：分几次把 EPUB 校正到锚点所在屏；任何一次之前读者翻了页就全部放弃。
+   *
+   * Correct the EPUB position to the anchor several times, because the layout
+   * keeps settling after a section renders (annotation spans, web fonts, the
+   * iframe widening). Corrections are idempotent and go through epub.js's own
+   * queue; all of them stop once the reader navigates.
+   *
+   * @param rendition - The rendition the anchor belongs to.
+   * @param anchor - The anchor to restore.
+   * @param delays - Milliseconds after now for each correction.
+   */
+  function scheduleEpubAnchorCorrections(rendition: EpubRenditionLike, anchor: EpubTextAnchor, delays: readonly number[]) {
+    const correct = () => {
+      if (renditionRef.current === rendition && epubNavSerialRef.current === anchor.serial) moveEpubToAnchor(rendition, anchor);
+    };
+    for (const delay of delays) {
+      window.setTimeout(() => {
+        if (renditionRef.current !== rendition || epubNavSerialRef.current !== anchor.serial) return;
+        if (rendition.q) void rendition.q.enqueue(correct).catch(() => {});
+        else correct();
+      }, delay);
+    }
+  }
+
+  /**
+   * 中文：按新算法调整 EPUB 尺寸；返回 false 表示不适用，调用方改走旧算法。
+   *
+   * Resize the EPUB rendition with the anchored algorithm: lock the anchor,
+   * let epub.js re-render at a CFI near it, and leave the exact correction to
+   * the `rendered` handler (which runs after year annotation has reshaped the
+   * text). A fallback correction covers renders that report nothing.
+   *
+   * @param rendition - The live rendition.
+   * @param width - New stage width in CSS pixels.
+   * @param height - New stage height in CSS pixels.
+   * @returns False when the anchored path does not apply.
+   */
+  function resizeEpubAnchored(rendition: EpubRenditionLike, width: number, height: number): boolean {
+    const geometry = epubPagedGeometry(rendition);
+    if (!geometry) return false;
+    const stage = geometry.manager._stageSize;
+    if (stage && stage.width === width && stage.height === height) return true;
+    const anchor = lockEpubAnchor(rendition);
+    if (!anchor) return false;
+    epubPendingReflowRef.current = anchor;
+    setEpubRepaginating(true);
+    rendition.resize?.(width, height, anchor.displayCfi || undefined);
+    scheduleEpubAnchorCorrections(rendition, anchor, [1000]);
+    return true;
+  }
+
+  /**
+   * 中文：统一的 EPUB 尺寸调整入口：新算法适用时走新算法，否则走原来的 rendition.resize。
+   *
+   * Single entry point for EPUB resizes; legacy unless the anchored algorithm
+   * is selected and applicable.
+   *
+   * @param rendition - The live rendition.
+   * @param width - New stage width in CSS pixels.
+   * @param height - New stage height in CSS pixels.
+   */
+  function resizeEpubRendition(rendition: EpubRenditionLike, width: number, height: number) {
+    if (reflowAlgorithmRef.current === "anchored" && resizeEpubAnchored(rendition, width, height)) return;
+    rendition.resize?.(width, height);
+  }
+
 
   useEffect(() => {
     if (!meta || !hasLoadedLocalState || !readerHostRef.current || bookRef.current) return;
@@ -2533,6 +3040,12 @@ function App() {
     const delayedUpdates = new Set<number>();
     const host = readerHostRef.current;
     host.innerHTML = "";
+    // A re-pagination of the previous book must not leave this one hidden.
+    // 上一本书未完成的重排不能让这本书一直处于隐藏状态。
+    setEpubRepaginating(false);
+    epubPendingReflowRef.current = null;
+    epubAnchorLockRef.current = null;
+    epubTextAnchorRef.current = null;
 
     // epubjs needs concrete pixel dimensions for paginated flow to work.
     // "100%" makes it unable to calculate page breaks → total=1 for every section.
@@ -2882,6 +3395,23 @@ function App() {
       applyReaderDocumentPreferences(doc);
       scrollPendingAnchorIntoView(doc);
 
+      // Anchored re-pagination: the section a resize re-rendered now carries
+      // its final text (year annotation and script conversion just ran), so
+      // move to the page holding the locked anchor.
+      // 锚定重排：重排后重新渲染的章节此刻已完成年号标注和繁简转换，翻到锚点字所在页。
+      // epub.js has already positioned and shown the view (its move runs
+      // before this event), so correct right away, then reveal the text, and
+      // keep a few later corrections for layout that is still settling.
+      // epub.js 已先完成定位并显示（它的定位早于本事件），所以立即校正、再显示正文，
+      // 并保留几次稍后的校正，应对仍在变化的版面。
+      const pendingReflow = epubPendingReflowRef.current;
+      if (pendingReflow && (section as { index?: number } | undefined)?.index === pendingReflow.sectionIndex) {
+        epubPendingReflowRef.current = null;
+        if (epubNavSerialRef.current === pendingReflow.serial) moveEpubToAnchor(rendition, pendingReflow);
+        setEpubRepaginating(false);
+        scheduleEpubAnchorCorrections(rendition, pendingReflow, EPUB_REFLOW_CORRECTIONS);
+      }
+
       // Defensive re-sync: epub.js doesn't always fire `relocated` after a
       // display() call (in particular when navigating to a fresh anchor in
       // the SAME spine section it sometimes treats the move as a no-op).
@@ -3013,7 +3543,7 @@ function App() {
         // blank reading area. Skip until the manager is up.
         if (!(rendition as unknown as { manager?: unknown }).manager) return;
         try {
-          rendition.resize?.(w, h);
+          resizeEpubRendition(rendition, w, h);
         } catch {
           // Swallow late resize errors during teardown.
         }
@@ -3028,6 +3558,7 @@ function App() {
 
     return () => {
       disposed = true;
+      setEpubRepaginating(false);
       window.cancelAnimationFrame(resizeFrame);
       delayedUpdates.forEach((timer) => window.clearTimeout(timer));
       delayedUpdates.clear();
@@ -3303,9 +3834,9 @@ function App() {
     const timer = window.setTimeout(() => {
       const rect = readerHostRef.current?.getBoundingClientRect();
       if (rect && renditionRef.current) {
-        const r = renditionRef.current as unknown as { manager?: unknown; resize?: (w: number, h: number) => void };
+        const r = renditionRef.current;
         if (r.manager) {
-          try { r.resize?.(Math.round(rect.width), Math.round(rect.height)); } catch { /* ignore */ }
+          try { resizeEpubRendition(r, Math.round(rect.width), Math.round(rect.height)); } catch { /* ignore */ }
         }
         window.setTimeout(() => setHighlightRedrawTick((t) => t + 1), 80);
       }
@@ -3313,6 +3844,7 @@ function App() {
     return () => window.clearTimeout(timer);
   // Floating panels never change the reader's width, so only docked ones count.
   // 浮动侧栏不改变正文宽度，只有并排侧栏的开合才需要重新调整尺寸。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sidebarDocked, assistantDocked, readerReady]);
 
   function clearSelection() {
@@ -6946,8 +7478,8 @@ function App() {
                                   <span>AI 操作前弹出补充说明提示</span>
                                 </label>
 
-                                {/* 侧栏显示方式（左右各自设置）与双指滑动翻页。
-                                    Side panel presentation per side and swipe paging. */}
+                                {/* 侧栏显示方式（左右各自设置）、双指滑动翻页、页面重排方式。
+                                    Side panel presentation per side, swipe paging and re-pagination. */}
                                 <div className="divider" />
                                 <div className="panel-headline small">
                                   <PanelLeft size={14} />
@@ -6979,6 +7511,16 @@ function App() {
                                     <option value="all">左右、上下滑动及鼠标滚轮都翻页</option>
                                     <option value="off">关闭</option>
                                   </select>
+                                </label>
+                                <label className="field-label">
+                                  页面重排方式
+                                  <select className="select-input" value={reflowAlgorithm} onChange={(e) => setReflowAlgorithm(toReflowAlgorithm(e.target.value))}>
+                                    <option value="legacy">原方式</option>
+                                    <option value="anchored">回到原阅读处（新，试用）</option>
+                                  </select>
+                                  <div className="muted-text" style={{ fontSize: "0.72rem", marginTop: "0.2rem" }}>
+                                    并排侧栏开合、窗口大小或字号改变时页面会重新排版。新方式翻到原来页首那个字所在的页，侧栏来回开合后回到原页。
+                                  </div>
                                 </label>
 
                                 {/* 标记设置并入外观设置，不再单开弹窗。
