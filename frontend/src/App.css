@@ -2476,6 +2476,102 @@ g.reader-circle line {
   text-align: center;
 }
 
+/* 浮动侧栏（外观设置 → 侧栏与翻页）：侧栏浮在正文之上，正文列宽不变、不重排。
+   只作用于宽屏；窄屏下两侧栏本来就是浮层抽屉（见下方 max-width: 1100px）。
+
+   Floating side panels (Appearance → 侧栏与翻页): the panel floats above the
+   page, whose column keeps its width, so nothing re-paginates. Wide screens
+   only; below 1100px both panels are overlay drawers already. */
+@media (min-width: 1101px) {
+  /* A fixed panel leaves the grid flow, which would let auto-placement pull
+     the reader into the zero-width first column. Pin every item to its track.
+     浮动（fixed）的侧栏会脱离网格，自动排布会把正文挤进宽度为 0 的第一列，因此固定各自的列。 */
+  .app-shell > .sidebar { grid-column: 1; grid-row: 1; }
+  .app-shell > .reader-column { grid-column: 2; grid-row: 1; }
+  .app-shell > .assistant-panel { grid-column: 3; grid-row: 1; }
+
+  /* A floating side never takes a column, open or closed — same tracks as collapsed.
+     浮动的一侧无论开合都不占列，网格与该侧收起时相同。 */
+  .app-shell.sidebar-floating {
+    grid-template-columns: 0 minmax(0, 1fr) var(--assistant-width);
+    gap: 0 1rem;
+  }
+
+  .app-shell.assistant-floating {
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) 0;
+    gap: 1rem 0;
+  }
+
+  .app-shell.sidebar-floating.assistant-floating,
+  .app-shell.sidebar-floating.assistant-collapsed,
+  .app-shell.sidebar-collapsed.assistant-floating {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
+    gap: 0;
+  }
+
+  /* Keep the toolbar's room for the corner toggle buttons whether or not the
+     panel is open, so opening it does not shift the chapter title either.
+     无论开合都给角落的展开按钮留位，打开浮动侧栏时标题栏也不移动。 */
+  .app-shell.sidebar-floating .reader-toolbar {
+    padding-left: 2.8rem;
+  }
+
+  .app-shell.assistant-floating .reader-toolbar {
+    padding-right: 2.8rem;
+  }
+
+  .app-shell.sidebar-floating > .sidebar:not(.is-collapsed),
+  .app-shell.assistant-floating > .assistant-panel:not(.is-collapsed) {
+    position: fixed;
+    z-index: 40;
+    box-shadow: 0 22px 60px rgba(48, 30, 12, 0.3), 0 2px 10px rgba(48, 30, 12, 0.12);
+  }
+
+  /* The left panel is a stack of separate cards; a sheet behind them keeps
+     the page from showing through the gaps. Its insets put the cards exactly
+     where the docked column would.
+     左栏由几张卡片叠成，衬一层底板免得正文从缝隙透出；底板留白使卡片位置与并排时一致。 */
+  .app-shell.sidebar-floating > .sidebar:not(.is-collapsed) {
+    top: 0.4rem;
+    bottom: 0.4rem;
+    left: 0.4rem;
+    width: calc(var(--sidebar-width) + 1.2rem);
+    padding: 0.6rem;
+    border: 1px solid var(--ui-panel-border);
+    border-radius: 2.1rem;
+    background: var(--ui-page-bg);
+    animation: floating-panel-in-left 0.18s ease-out;
+  }
+
+  /* Translucent panel colours get an opaque base so text never shows through.
+     半透明的面板底色下垫一层不透明底色，正文不会透出来。 */
+  .app-shell.assistant-floating > .assistant-panel:not(.is-collapsed) {
+    top: 1rem;
+    right: 1rem;
+    bottom: 1rem;
+    width: var(--assistant-width);
+    background: var(--ui-panel-bg), var(--ui-popover-bg);
+    animation: floating-panel-in-right 0.18s ease-out;
+  }
+}
+
+@keyframes floating-panel-in-left {
+  from { opacity: 0; transform: translateX(-14px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes floating-panel-in-right {
+  from { opacity: 0; transform: translateX(14px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-shell > .sidebar,
+  .app-shell > .assistant-panel {
+    animation: none !important;
+  }
+}
+
 @media (max-width: 1360px) {
   .app-shell {
     --assistant-width: 320px;

@@ -18,6 +18,7 @@ import {
   LibraryBig,
   MapPinned,
   NotebookPen,
+  PanelLeft,
   Search,
   Settings2,
   Sparkles,
@@ -239,6 +240,32 @@ type EpubBookLike = {
   ready: Promise<unknown>;
   destroy?: () => void;
 };
+
+/**
+ * 中文：侧栏显示方式：并排（正文让位）/ 浮在正文上 / 浮在正文上且点正文自动收起。
+ *
+ * How a side panel is shown on wide screens.
+ * - `"docked"`: a grid column; opening it narrows and re-paginates the page.
+ * - `"floating"`: a sheet above the page; the page keeps its layout.
+ * - `"floating-dismiss"`: as floating, and a plain tap on the page closes it.
+ */
+type SidePanelMode = "docked" | "floating" | "floating-dismiss";
+
+/** 中文：浮动侧栏「点正文收起」判定为点按的最大位移（px）。 / Max pointer travel for a dismissing tap. */
+const DISMISS_TAP_SLOP = 6;
+
+/** 中文：浮动侧栏「点正文收起」判定为点按的最长时长（ms）。 / Max press duration for a dismissing tap. */
+const DISMISS_TAP_MAX_MS = 600;
+
+/**
+ * 中文：校验持久化读回的侧栏显示方式。
+ *
+ * @param value - A value read from persisted settings.
+ * @returns `value` when it is a {@link SidePanelMode}, else `"docked"`.
+ */
+function toSidePanelMode(value: unknown): SidePanelMode {
+  return value === "floating" || value === "floating-dismiss" ? value : "docked";
+}
 
 /**
  * 中文：校验持久化读回的翻页手势模式。
@@ -909,11 +936,20 @@ function App() {
   // The footer (page slider + status) follows this same flag.
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
+  // Wide-screen side panel presentation, per side: docked columns narrow the
+  // page; floating sheets cover it and leave its layout alone.
+  // 宽屏下左右侧栏各自的显示方式：并排会挤窄正文并重排，浮动则盖在正文上、不动版面。
+  const [sidebarPanelMode, setSidebarPanelMode] = useState<SidePanelMode>("docked");
+  const [assistantPanelMode, setAssistantPanelMode] = useState<SidePanelMode>("docked");
   // Trackpad two-finger swipe / mouse wheel paging, mirrored into a ref for the
   // native listeners (they live outside React's render cycle).
   // 双指滑动 / 滚轮翻页；原生监听在 React 渲染之外，用 ref 读最新值。
   const [wheelPagingMode, setWheelPagingMode] = useState<WheelPagingMode>("horizontal");
   const wheelPagingModeRef = useRef<WheelPagingMode>("horizontal");
+  // Whether each panel is open as a grid column, i.e. actually narrows the page.
+  // 侧栏是否以并排方式打开（只有这种情况才会挤窄正文）。
+  const sidebarDocked = !sidebarCollapsed && sidebarPanelMode === "docked";
+  const assistantDocked = !assistantCollapsed && assistantPanelMode === "docked";
   // v1.2: 键盘翻页 — 默认关闭；开启后 ←/→ 翻页（在 input/textarea 聚焦时不触发）。
   const [keyboardPagingEnabled, setKeyboardPagingEnabled] = useState(true);
   // v1.2: 标记模式 — 默认关闭；开启后选段直接按当前 default 颜色/形态打标，不弹工具栏；Cmd+Z 撤销最近一次。
@@ -1021,6 +1057,8 @@ function App() {
           savedKeyboardPaging,
           savedMarkMode,
           savedMarkStyle,
+          savedSidebarPanelMode,
+          savedAssistantPanelMode,
           savedWheelPagingMode,
         ] =
           await Promise.all([
@@ -1050,6 +1088,8 @@ function App() {
             readPersistedState<boolean>(storageKey("keyboard-paging-enabled"), true),
             readPersistedState<boolean>(storageKey("mark-mode-enabled"), false),
             readPersistedState<"h-gold" | "h-jade" | "h-crimson" | "underline" | "circle">(storageKey("mark-style"), "h-gold"),
+            readPersistedState<string>(storageKey("sidebar-panel-mode"), "docked"),
+            readPersistedState<string>(storageKey("assistant-panel-mode"), "docked"),
             readPersistedState<string>(storageKey("wheel-paging-mode"), "horizontal"),
           ]);
 
@@ -1155,6 +1195,8 @@ function App() {
         setKeyboardPagingEnabled(savedKeyboardPaging);
         setMarkModeEnabled(savedMarkMode);
         setMarkStyle(savedMarkStyle);
+        setSidebarPanelMode(toSidePanelMode(savedSidebarPanelMode));
+        setAssistantPanelMode(toSidePanelMode(savedAssistantPanelMode));
         setWheelPagingMode(toWheelPagingMode(savedWheelPagingMode));
         wheelPagingModeRef.current = toWheelPagingMode(savedWheelPagingMode);
         readerLayoutRef.current = savedReaderLayout;
@@ -1447,7 +1489,9 @@ function App() {
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("keyboard-paging-enabled"), keyboardPagingEnabled); }, [keyboardPagingEnabled, hasLoadedLocalState]);
   useEffect(() => { markModeRef.current = markModeEnabled; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-mode-enabled"), markModeEnabled); }, [markModeEnabled, hasLoadedLocalState]);
   useEffect(() => { markStyleRef.current = markStyle; if (hasLoadedLocalState) void writePersistedState(storageKey("mark-style"), markStyle); }, [markStyle, hasLoadedLocalState]);
-  // Swipe paging preference. / 滑动翻页设置的持久化。
+  // Side panel and swipe paging preferences. / 侧栏显示方式与滑动翻页设置的持久化。
+  useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("sidebar-panel-mode"), sidebarPanelMode); }, [sidebarPanelMode, hasLoadedLocalState]);
+  useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("assistant-panel-mode"), assistantPanelMode); }, [assistantPanelMode, hasLoadedLocalState]);
   useEffect(() => { wheelPagingModeRef.current = wheelPagingMode; if (hasLoadedLocalState) void writePersistedState(storageKey("wheel-paging-mode"), wheelPagingMode); }, [wheelPagingMode, hasLoadedLocalState]);
 
   // v1.2 Cmd/Ctrl+Z 撤销最近一次勾画（不论是否在标记模式都生效，只要有 stack）
@@ -2224,8 +2268,11 @@ function App() {
       ro.disconnect();
       if (settleTimer !== null) window.clearTimeout(settleTimer);
     };
+  // Only docked panels change the page width; a floating panel opening or
+  // closing must not re-paginate (ResizeObserver still covers real resizes).
+  // 只有并排侧栏会改变正文宽度；浮动侧栏开合不应触发重排（真实尺寸变化仍由 ResizeObserver 处理）。
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarCollapsed, assistantCollapsed, currentBookSlug, readableBooks]);
+  }, [dbReaderChapter, readerTheme, readerFontFamily, readerFontSize, sidebarDocked, assistantDocked, currentBookSlug, readableBooks]);
 
   // Consume pendingSearchNavRef after the chapter has rendered. searchNavTick
   // ensures this effect fires even when the user re-clicks the same result in
@@ -2377,6 +2424,78 @@ function App() {
     card.addEventListener("wheel", onWheel, { passive: false });
     return () => card.removeEventListener("wheel", onWheel);
   }, []);
+
+  // ---- Floating side panels: tap on the page / Escape to close ----
+  // 浮动侧栏：点按正文（设为「点正文收起」时）或按 Esc 收起。
+  const tapStartRef = useRef<{ id: number; x: number; y: number; time: number } | null>(null);
+  const suppressPageClickUntilRef = useRef(0);
+  const readerTapRef = useRef<((phase: "down" | "up", event: PointerEvent, inSection: boolean) => void) | null>(null);
+  readerTapRef.current = (phase, event, inSection) => {
+    const closeLeft = sidebarPanelMode === "floating-dismiss" && !sidebarCollapsed;
+    const closeRight = assistantPanelMode === "floating-dismiss" && !assistantCollapsed;
+    if (!closeLeft && !closeRight) {
+      tapStartRef.current = null;
+      return;
+    }
+    if (phase === "down") {
+      const target = event.target as Element | null;
+      const onPage = inSection || Boolean(target?.closest?.(".reader-card"));
+      tapStartRef.current = onPage && event.isPrimary && event.button === 0
+        ? { id: event.pointerId, x: event.clientX, y: event.clientY, time: performance.now() }
+        : null;
+      return;
+    }
+    const start = tapStartRef.current;
+    tapStartRef.current = null;
+    if (!start || start.id !== event.pointerId) return;
+    // Drags select text or swipe; only a still, short press is a tap. / 拖动是选字或滑动，只有短促不动的点按才算。
+    if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > DISMISS_TAP_SLOP) return;
+    if (performance.now() - start.time > DISMISS_TAP_MAX_MS) return;
+    const selection = (event.view as Window | null)?.getSelection?.() ?? window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    if (closeLeft) setSidebarCollapsed(true);
+    if (closeRight) setAssistantCollapsed(true);
+    // The tap only closed the panel; it must not also turn the page beneath.
+    // 这一下只用来收起侧栏，不应同时触发下面的点边翻页。
+    if (!inSection) suppressPageClickUntilRef.current = performance.now() + 400;
+  };
+
+  useEffect(() => {
+    const onDown = (event: PointerEvent) => readerTapRef.current?.("down", event, false);
+    const onUp = (event: PointerEvent) => readerTapRef.current?.("up", event, false);
+    const onClick = (event: MouseEvent) => {
+      if (performance.now() > suppressPageClickUntilRef.current) return;
+      suppressPageClickUntilRef.current = 0;
+      // Capture phase on document runs before React's root listener. / document 捕获阶段先于 React 根节点监听执行。
+      event.stopPropagation();
+      event.preventDefault();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("pointerup", onUp, true);
+    document.addEventListener("click", onClick, true);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("pointerup", onUp, true);
+      document.removeEventListener("click", onClick, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    const floatingOpen = (sidebarPanelMode !== "docked" && !sidebarCollapsed)
+      || (assistantPanelMode !== "docked" && !assistantCollapsed);
+    if (!floatingOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      // An open dialog owns Escape. / 有弹窗时 Esc 归弹窗。
+      if (document.querySelector(".modal-backdrop")) return;
+      if (sidebarPanelMode !== "docked") setSidebarCollapsed(true);
+      if (assistantPanelMode !== "docked") setAssistantCollapsed(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [sidebarPanelMode, assistantPanelMode, sidebarCollapsed, assistantCollapsed]);
 
   function syncRenderedPagination(location?: EpubLocationLike | null) {
     const manager = renditionRef.current?.manager;
@@ -2637,10 +2756,14 @@ function App() {
       // so the handler may stop the browser's own "swipe to go back".
       // 正文上的双指滑动 / 滚轮事件同样只发到 iframe 里，交给同一个识别器；
       // 不设 passive，才能阻止浏览器自己的「滑动返回上一页」。
+      // A tap on the text closes floating panels set to dismiss on tap.
+      // 点按正文可收起设为「点正文收起」的浮动侧栏。
       const marks = doc as unknown as { __mingshiWheel?: boolean };
       if (!marks.__mingshiWheel) {
         marks.__mingshiWheel = true;
         doc.addEventListener("wheel", (event: WheelEvent) => readerWheelRef.current?.(event), { passive: false });
+        doc.addEventListener("pointerdown", (event: PointerEvent) => readerTapRef.current?.("down", event, true), true);
+        doc.addEventListener("pointerup", (event: PointerEvent) => readerTapRef.current?.("up", event, true), true);
       }
 
       if (!doc.querySelector("#mingshi-injected-fonts")) {
@@ -3188,7 +3311,9 @@ function App() {
       }
     }, 170);
     return () => window.clearTimeout(timer);
-  }, [sidebarCollapsed, assistantCollapsed, readerReady]);
+  // Floating panels never change the reader's width, so only docked ones count.
+  // 浮动侧栏不改变正文宽度，只有并排侧栏的开合才需要重新调整尺寸。
+  }, [sidebarDocked, assistantDocked, readerReady]);
 
   function clearSelection() {
     // EPUB iframe selection
@@ -4811,7 +4936,7 @@ function App() {
       : `${item.name} ${item.aliases.join(" ")} ${item.rank} ${item.keywords.join(" ")} ${item.subunits.join(" ")}`.includes(referenceQuery)
   );
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${assistantCollapsed ? "assistant-collapsed" : ""}`}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${assistantCollapsed ? "assistant-collapsed" : ""} ${sidebarPanelMode !== "docked" ? "sidebar-floating" : ""} ${assistantPanelMode !== "docked" ? "assistant-floating" : ""}`}>
       {sidebarCollapsed && (
         <button type="button" className="sidebar-toggle-btn" onClick={() => setSidebarCollapsed(false)} title="展开侧边栏">
           <span className="hamburger-icon">&#9776;</span>
@@ -6821,11 +6946,31 @@ function App() {
                                   <span>AI 操作前弹出补充说明提示</span>
                                 </label>
 
-                                {/* 双指滑动翻页。 / Swipe paging. */}
+                                {/* 侧栏显示方式（左右各自设置）与双指滑动翻页。
+                                    Side panel presentation per side and swipe paging. */}
                                 <div className="divider" />
                                 <div className="panel-headline small">
-                                  <BookOpenText size={14} />
-                                  <span>翻页</span>
+                                  <PanelLeft size={14} />
+                                  <span>侧栏与翻页</span>
+                                </div>
+                                <label className="field-label">
+                                  左侧栏（目录、搜索等）
+                                  <select className="select-input" value={sidebarPanelMode} onChange={(e) => setSidebarPanelMode(toSidePanelMode(e.target.value))}>
+                                    <option value="docked">并排显示：打开时正文让出位置</option>
+                                    <option value="floating">浮在正文上：正文不动</option>
+                                    <option value="floating-dismiss">浮在正文上：正文不动，点正文即收起</option>
+                                  </select>
+                                </label>
+                                <label className="field-label">
+                                  右侧栏（AI 助理、札记）
+                                  <select className="select-input" value={assistantPanelMode} onChange={(e) => setAssistantPanelMode(toSidePanelMode(e.target.value))}>
+                                    <option value="docked">并排显示：打开时正文让出位置</option>
+                                    <option value="floating">浮在正文上：正文不动</option>
+                                    <option value="floating-dismiss">浮在正文上：正文不动，点正文即收起</option>
+                                  </select>
+                                </label>
+                                <div className="muted-text" style={{ fontSize: "0.72rem" }}>
+                                  窗口较窄时两侧栏总是浮在正文上。浮在正文上的侧栏也可按 Esc 收起。
                                 </div>
                                 <label className="field-label">
                                   触控板双指滑动翻页
