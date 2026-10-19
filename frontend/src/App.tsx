@@ -232,6 +232,9 @@ type EpubRenditionLike = {
     override?: (key: string, value: string, priority?: boolean) => void;
   };
   getContents?: () => EpubContentsLike[];
+  // Removes the views on display, so the next display renders the section afresh.
+  // 移除正在显示的视图，下一次显示时重新渲染该章节。
+  clear?: () => void;
   reportLocation?: () => void;
   q?: { enqueue: (work: () => void) => Promise<unknown> };
   manager?: PaginatedManager;
@@ -357,18 +360,30 @@ const EPUB_REFLOW_CORRECTIONS = [160, 480];
 const EPUB_FONT_CORRECTIONS = [80, 260, 700, 1400];
 
 /**
- * 中文：重新打开 EPUB 书时正在进行的位置恢复：打开所用的 CFI + 要回到的页首字。
+ * 中文：EPUB 正在保持的阅读位置：重新打开书时要回到的页首字，或重新显示当前位置（切换显示设置、阅读器就绪）时要停住的那个字。
  *
- * A reading-position restore in progress after an EPUB book was reopened.
+ * An EPUB reading position being held: the saved first character while a
+ * reopened book is restored, or the character on display while the current
+ * location is re-displayed (a display setting changed, the reader became
+ * ready). Both run through the same correction path.
  *
- * @property cfi - The saved `last-location` CFI the book was opened at.
- *   Re-displaying it, or the current location, is not a navigation and keeps
- *   the restore going; any other target ends it.
- * @property anchor - The saved first character. Each correction keeps
- *   `screen` in step (-1 before the first one); `serial` and `displayCfi` are
- *   not used by the restore.
+ * @property cfi - The location displayed for it: the saved `last-location`
+ *   CFI the book was opened at, or the CFI a re-display shows. Re-displaying
+ *   it, or the current location, is not a navigation and keeps the hold
+ *   going; any other target ends it.
+ * @property anchor - The character to keep on screen. Each correction keeps
+ *   `screen` in step (-1 before the first one when restoring); `serial` and
+ *   `displayCfi` are not used here.
  */
 type EpubRestore = { cfi: string; anchor: EpubTextAnchor };
+
+/**
+ * 中文：章节文档上记下它是按哪套显示设置渲染的。
+ *
+ * A section document stamped with the display settings it was rendered with
+ * (see `epubDocumentPrefsKey` in `App`).
+ */
+type EpubStampedDocument = Document & { __mingshiDocPrefs?: string };
 
 /**
  * 中文：重新打开段落书时正在进行的位置恢复。
@@ -1910,7 +1925,22 @@ function App() {
     }
   }
 
+  /**
+   * 中文：章节渲染时套用的显示设置（排版方向 | 繁简 | 年号标注），用来判断已显示的章节是否需要重新渲染。
+   *
+   * Key of the display settings {@link applyReaderDocumentPreferences} bakes
+   * into a section when it renders. Date display and the emperor toggle are
+   * refreshed in place, and themes are plain CSS, so neither is part of it.
+   *
+   * @returns `"<layout>|<script>|<annotate 0/1>"`, e.g. `"horizontal|traditional|1"`.
+   */
+  function epubDocumentPrefsKey(): string {
+    return `${readerLayoutRef.current}|${scriptVariantRef.current}|${autoAnnotateRef.current ? 1 : 0}`;
+  }
+
   function applyReaderDocumentPreferences(doc: Document) {
+    // Remember which settings this section was rendered with. / 记下本章是按哪套设置渲染的。
+    (doc as EpubStampedDocument).__mingshiDocPrefs = epubDocumentPrefsKey();
     injectReaderDocumentStyles(doc, { layoutMode: readerLayoutRef.current });
     convertDocumentToTraditional(doc);
     if (autoAnnotateRef.current) {
@@ -2787,7 +2817,12 @@ function App() {
         shown = true;
       } catch { /* fall through to href attempts */ }
       if (shown) {
-        if (restore && keepsRestore) correctEpubRestore(rendition, restore);
+        // Correct to the position held now: a re-display queued after this one
+        // may have replaced the hold meanwhile (when the reader becomes ready,
+        // the three display-setting effects each re-display).
+        // 校正到此刻保持的位置：之后排队的重新显示可能已换了新的保持（阅读器就绪时三个显示设置 effect 各重新显示一次）。
+        const held = epubRestoreRef.current;
+        if (held && (target === held.cfi || target === currentCfiRef.current)) correctEpubRestore(rendition, held);
         return;
       }
     }
@@ -3258,6 +3293,33 @@ function App() {
   // EPUB 的跨次打开阅读位置：每次报告位置时随 CFI 一起保存，在保存的 CFI 处重新打开时恢复。
   // 这里只读取新算法的锚点，不改动它。
   const epubRestoreRef = useRef<EpubRestore | null>(null);
+  // The character the last hold (a restore, or a re-display below) kept, with
+  // the navigation serial when it ended on its own. Until the reader navigates
+  // it remains their position: the next re-display holds it again and it is
+  // what gets saved, so toggling a setting off and on, or reopening and then
+  // toggling, lands on the very same page even when a layout moved that
+  // character off the top of the screen (end of the previous screen, right
+  // column of a double page).
+  // 上一次保持（重新打开的恢复，或下文的重新显示）所停住的字，以及它自然结束时的导航序号。
+  // 读者翻页或跳转之前，它仍是读者的位置：下次重新显示再保持它，保存的也是它。所以来回切换设置、
+  // 重新打开后再切换，都回到同一页——即使版面把这个字挤离了屏首（上一屏末尾、双页的右栏）。
+  const epubLastHeldRef = useRef<{ anchor: EpubTextAnchor; serial: number } | null>(null);
+
+  /**
+   * 中文：上次保持过的字：读者此后没有翻页或跳转、仍在这一章且就在当前屏上时才算数。
+   *
+   * The character the last hold kept, while it still is the reader's
+   * position: no navigation since, same section, and still on this screen.
+   *
+   * @param geometry - Non-null result of {@link epubPagedGeometry}.
+   * @param sectionIndex - Spine index of the section on display.
+   * @returns The anchor, or `null`.
+   */
+  function lastHeldEpubAnchor(geometry: NonNullable<ReturnType<typeof epubPagedGeometry>>, sectionIndex: number): EpubTextAnchor | null {
+    const last = epubLastHeldRef.current;
+    if (!last || last.serial !== epubNavSerialRef.current || last.anchor.sectionIndex !== sectionIndex) return null;
+    return epubAnchorScreen(geometry, last.anchor) === geometry.screen ? last.anchor : null;
+  }
 
   /**
    * 中文：EPUB 当前屏的页首字（只计算，不改动重排算法的锚点）。
@@ -3278,9 +3340,11 @@ function App() {
    * 中文：把 EPUB 当前的阅读位置随刚报告的 CFI 一起存下。
    *
    * Persist the EPUB reading position together with the CFI just reported as
-   * `last-location`. The anchor is the restored character while a restore
-   * holds this screen, the anchored algorithm's sticky anchor while it holds
-   * this screen, else the first character of the screen.
+   * `last-location`. The anchor is the held character while a restore or
+   * re-display holds this screen, else the character the last hold kept while
+   * it is still the reader's position ({@link lastHeldEpubAnchor}), else the
+   * anchored algorithm's sticky anchor while it holds this screen, else the
+   * first character of the screen.
    *
    * @param rendition - The rendition that reported the location.
    * @param slug - Slug of the book that rendition shows.
@@ -3297,7 +3361,9 @@ function App() {
     const sticky = reflowAlgorithmRef.current === "anchored" && epubTextAnchorRef.current?.serial === epubNavSerialRef.current
       ? epubTextAnchorRef.current
       : null;
-    const anchor = holdsScreen(restored) ? restored : holdsScreen(sticky) ? sticky : epubScreenAnchor(geometry);
+    const anchor = holdsScreen(restored)
+      ? restored
+      : lastHeldEpubAnchor(geometry, sectionIndex) ?? (holdsScreen(sticky) ? sticky : epubScreenAnchor(geometry));
     saveReadingPosition(slug, epubReadingPosition(cfi, sectionIndex, anchor));
   }
 
@@ -3333,7 +3399,9 @@ function App() {
    * Follow-up corrections after reopening, because the layout keeps settling
    * after the first render (web fonts, images). They run through epub.js's
    * queue; the last one — after the timers and after the section's fonts have
-   * settled — ends the restore. Any navigation ends it earlier.
+   * settled — ends the restore, and its character stays the reader's position
+   * until they navigate ({@link lastHeldEpubAnchor}). Any navigation ends it
+   * earlier. Re-display holds end the same way.
    *
    * @param rendition - The rendition the restore belongs to.
    * @param restore - The restore in progress.
@@ -3343,7 +3411,10 @@ function App() {
     const correct = () => {
       correctEpubRestore(rendition, restore);
       remaining -= 1;
-      if (remaining === 0 && epubRestoreRef.current === restore) epubRestoreRef.current = null;
+      if (remaining === 0 && epubRestoreRef.current === restore) {
+        epubRestoreRef.current = null;
+        epubLastHeldRef.current = { anchor: restore.anchor, serial: epubNavSerialRef.current };
+      }
     };
     const queueCorrection = () => {
       if (renditionRef.current !== rendition || epubRestoreRef.current !== restore) return;
@@ -3352,6 +3423,213 @@ function App() {
     };
     for (const delay of EPUB_RESTORE_CORRECTIONS) window.setTimeout(queueCorrection, delay);
     void fontsSettled(epubPagedGeometry(rendition)?.doc).then(queueCorrection);
+  }
+
+  // ---- Re-displaying the current EPUB location without leaving the page ----
+  // Toggling year annotation, script conversion, the column layout, and the
+  // reader becoming ready all re-display the current location. epub.js would
+  // put the reader on the page of the paragraph start; the character on display
+  // is held through the restore path above instead.
+  // 重新显示当前位置（切换年号标注、繁简、分栏，阅读器就绪）时不离开原来那一页：
+  // epub.js 自己会回到段首所在页，这里改用上面的恢复通道保持屏上那个字。
+  // True while a re-display hides a section that is being rendered again. / 重新显示时为重新渲染而隐藏了正文。
+  const epubRedisplayHiddenRef = useRef(false);
+
+  /**
+   * 中文：正在显示的章节文档是按哪套显示设置渲染的。
+   *
+   * Display-settings key stamped on the section document on display by
+   * {@link applyReaderDocumentPreferences}.
+   *
+   * @param rendition - The live rendition.
+   * @returns The key, or `undefined` when no section is shown or its
+   *   `rendered` event has not run yet.
+   */
+  function epubShownDocumentPrefs(rendition: EpubRenditionLike): string | undefined {
+    try {
+      return (rendition.getContents?.()[0]?.document as EpubStampedDocument | undefined)?.__mingshiDocPrefs;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 中文：正在显示的章节是否按旧设置渲染，需要重新渲染新设置才生效。
+   *
+   * Whether the section on display was rendered with display settings other
+   * than the current ones. Annotation, script conversion and layout styles are
+   * applied once, when epub.js renders a section, and displaying a section
+   * that is already shown only scrolls it — so a changed setting shows only
+   * after the section is rendered again. A section whose `rendered` event is
+   * still pending has no stamp yet and picks up the current settings itself.
+   *
+   * @param rendition - The live rendition.
+   * @returns True when the section on display is stale.
+   */
+  function epubSectionNeedsRender(rendition: EpubRenditionLike): boolean {
+    const shown = epubShownDocumentPrefs(rendition);
+    return shown !== undefined && shown !== epubDocumentPrefsKey();
+  }
+
+  /**
+   * 中文：某个锚点字此刻在第几屏。
+   *
+   * Screen the anchor character is on in the current layout.
+   *
+   * @param geometry - Non-null result of {@link epubPagedGeometry}.
+   * @param anchor - The anchor to measure.
+   * @returns The zero-based screen index, or `null` when it cannot be found
+   *   or measured.
+   */
+  function epubAnchorScreen(geometry: NonNullable<ReturnType<typeof epubPagedGeometry>>, anchor: TextAnchor): number | null {
+    const nodes = collectAnchorTextNodes(geometry.doc.body);
+    const position = resolveTextAnchor(nodes, anchor);
+    return position ? pageOfTextPosition(nodes, position, epubCharMeasurer(geometry.doc, geometry.delta)) : null;
+  }
+
+  /**
+   * 中文：重新显示当前位置前，记下要停住的那个字：恢复进行中沿用恢复的字；上次保持过的字仍是读者位置时沿用；新算法的锚点仍在本屏时用它；否则取当前屏页首字。
+   *
+   * Hold the page on display across a re-display of the current location.
+   * The held character is, in order of preference (as
+   * {@link persistEpubReadingPosition} picks the one it saves):
+   * 1. the one a restore or hold in progress in this section is keeping;
+   * 2. the one the last hold kept, while it is still the reader's position
+   *    ({@link lastHeldEpubAnchor});
+   * 3. the anchored algorithm's sticky anchor while it still holds this
+   *    screen;
+   * 4. the first character of the screen.
+   * It becomes a restore of the current CFI, so the restore path re-applies it
+   * after the section is displayed and rendered, saves it as the reading
+   * position meanwhile, and drops it on any navigation. Must be called before
+   * anything changes the layout. The anchored algorithm's state is only read.
+   *
+   * @param rendition - The live rendition.
+   * @returns The hold now in `epubRestoreRef`, or `null` when there is no
+   *   current location, the text is vertical, or the screen shows no text —
+   *   the re-display then keeps epub.js's own placement, as before.
+   */
+  function holdEpubPage(rendition: EpubRenditionLike): EpubRestore | null {
+    const cfi = currentCfiRef.current;
+    if (!cfi || readerLayoutRef.current === "vertical" || epubShownDocumentPrefs(rendition)?.startsWith("vertical|")) return null;
+    const geometry = epubPagedGeometry(rendition);
+    const sectionIndex = geometry?.view.section?.index ?? -1;
+    if (!geometry || sectionIndex < 0) return null;
+    const held = ((): TextAnchor | null => {
+      const restoring = epubRestoreRef.current?.anchor;
+      if (restoring?.sectionIndex === sectionIndex) return restoring;
+      const last = lastHeldEpubAnchor(geometry, sectionIndex);
+      if (last) return last;
+      const sticky = epubTextAnchorRef.current;
+      if (reflowAlgorithmRef.current === "anchored" && sticky?.serial === epubNavSerialRef.current
+        && sticky.sectionIndex === sectionIndex && sticky.screen === geometry.screen) return sticky;
+      return epubScreenAnchor(geometry);
+    })();
+    if (!held) return null;
+    // A fresh object: corrections still scheduled for an earlier hold stop on their own.
+    // 每次新建对象：仍在排队的旧校正发现不是当前保持就自行停止。
+    const hold: EpubRestore = {
+      cfi,
+      anchor: { offset: held.offset, context: held.context, sectionIndex, screen: geometry.screen, displayCfi: "", serial: -1 },
+    };
+    epubRestoreRef.current = hold;
+    return hold;
+  }
+
+  /**
+   * 中文：算出指向锚点字的 CFI（不计年号标注的外层 span），供重新渲染时 epub.js 在未标注的新文档里直接定位。
+   *
+   * CFI of the anchor character, computed while ignoring the year-annotation
+   * wrappers, so epub.js can resolve it in a freshly rendered section before
+   * annotation runs. The CFI reported for the page was taken on the annotated
+   * document and often does not resolve there (epub.js then falls back to
+   * the section start).
+   *
+   * @param geometry - Non-null result of {@link epubPagedGeometry}.
+   * @param anchor - The anchor to point at.
+   * @returns The CFI, or `""` when it cannot be computed.
+   */
+  function epubAnchorDisplayCfi(geometry: NonNullable<ReturnType<typeof epubPagedGeometry>>, anchor: TextAnchor): string {
+    const nodes = collectAnchorTextNodes(geometry.doc.body);
+    const position = resolveTextAnchor(nodes, anchor);
+    if (!position) return "";
+    try {
+      const range = geometry.doc.createRange();
+      range.setStart(nodes[position.nodeIndex], position.offset);
+      range.collapse(true);
+      return geometry.view.contents?.cfiFromRange?.(range, YEAR_ANNOTATION_CLASS) ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * 中文：重新显示当前位置并停在原来那一页；设置变了的章节先重新渲染，渲染完成前隐藏正文。
+   *
+   * Re-display the current location after a display setting changed or the
+   * reader became ready, keeping the page on display.
+   *
+   * With a hold from {@link holdEpubPage}, the restore path corrects to the
+   * held character right after the display, again in `rendered` once a
+   * re-rendered section has been converted and annotated, and a few more
+   * times while its layout settles; the last correction ends the hold, and the
+   * held character stays the reader's position until they navigate
+   * ({@link lastHeldEpubAnchor}), so the next re-display holds it again.
+   *
+   * A section rendered with other settings is rendered again first. It is
+   * hidden until the `rendered` correction (the repaginating style, which
+   * also reveals it after a timeout), and epub.js is pointed at the held
+   * character's CFI so even its own placement is right.
+   *
+   * @param rendition - The live rendition.
+   * @param hold - The hold taken before anything changed, or `null`.
+   */
+  function redisplayEpubPage(rendition: EpubRenditionLike, hold: EpubRestore | null) {
+    let target = currentCfiRef.current;
+    if (!target) return;
+    if (epubSectionNeedsRender(rendition)) {
+      if (hold) {
+        const geometry = epubPagedGeometry(rendition);
+        const displayCfi = geometry ? epubAnchorDisplayCfi(geometry, hold.anchor) : "";
+        if (displayCfi) target = hold.cfi = displayCfi;
+        epubRedisplayHiddenRef.current = true;
+        setEpubRepaginating(true);
+      }
+      // Queued so a display already in progress finishes first; a throw would stall epub.js's queue.
+      // 排进 epub.js 队列，等正在进行的显示先完成；队列任务抛错会让队列卡住，所以吞掉异常。
+      const clear = () => {
+        if (renditionRef.current !== rendition) return;
+        try {
+          rendition.clear?.();
+        } catch {
+          // The display below renders the section either way. / 下面的显示无论如何都会渲染该章节。
+        }
+      };
+      if (rendition.q) void rendition.q.enqueue(clear).catch(() => {});
+      else clear();
+    }
+    void openLocation(target).then(() => {
+      if (hold && epubRestoreRef.current === hold && renditionRef.current === rendition) scheduleEpubRestoreCorrections(rendition, hold);
+    });
+  }
+
+  /**
+   * 中文：章节渲染完成（繁简转换、年号标注之后）：把保持的位置校正到位；若为重新渲染而隐藏了正文，此时显示。
+   *
+   * Called from `rendered`, after the section's text has been converted and
+   * annotated: correct a held position in that section, then reveal a section
+   * a re-display hid for re-rendering.
+   *
+   * @param rendition - The rendition that rendered the section.
+   * @param sectionIndex - Spine index of the rendered section.
+   */
+  function applyEpubHoldOnRender(rendition: EpubRenditionLike, sectionIndex: number | undefined) {
+    const restore = epubRestoreRef.current;
+    if (restore && sectionIndex === restore.anchor.sectionIndex) correctEpubRestore(rendition, restore);
+    if (epubRedisplayHiddenRef.current) {
+      epubRedisplayHiddenRef.current = false;
+      setEpubRepaginating(false);
+    }
   }
 
 
@@ -3366,6 +3644,8 @@ function App() {
     // A re-pagination of the previous book must not leave this one hidden.
     // 上一本书未完成的重排不能让这本书一直处于隐藏状态。
     setEpubRepaginating(false);
+    epubRedisplayHiddenRef.current = false;
+    epubLastHeldRef.current = null;
     epubPendingReflowRef.current = null;
     epubAnchorLockRef.current = null;
     epubTextAnchorRef.current = null;
@@ -3740,15 +4020,12 @@ function App() {
         scheduleEpubAnchorCorrections(rendition, pendingReflow, EPUB_REFLOW_CORRECTIONS);
       }
 
-      // Reopened book: the section opened at the saved location now carries its
-      // final text too, so move to the page holding the saved first character
-      // before it is ever painted at epub.js's coarser placement.
-      // 重新打开的书：在保存位置打开的章节此刻文字也已定型，趁 epub.js 的粗略定位尚未绘出，
-      // 先翻到保存的页首字所在页。
-      const restore = epubRestoreRef.current;
-      if (restore && (section as { index?: number } | undefined)?.index === restore.anchor.sectionIndex) {
-        correctEpubRestore(rendition, restore);
-      }
+      // Reopened book, or a section re-rendered for a display setting: it now
+      // carries its final text too, so move to the page holding the held
+      // character before it is ever painted at epub.js's coarser placement.
+      // 重新打开的书，或因显示设置重新渲染的章节：此刻文字也已定型，趁 epub.js 的粗略定位尚未绘出，
+      // 先翻到保持的那个字所在页。
+      applyEpubHoldOnRender(rendition, (section as { index?: number } | undefined)?.index);
 
       // Defensive re-sync: epub.js doesn't always fire `relocated` after a
       // display() call (in particular when navigating to a fresh anchor in
@@ -3909,6 +4186,7 @@ function App() {
     return () => {
       disposed = true;
       setEpubRepaginating(false);
+      epubRedisplayHiddenRef.current = false;
       epubRestoreRef.current = null;
       window.cancelAnimationFrame(resizeFrame);
       delayedUpdates.forEach((timer) => window.clearTimeout(timer));
@@ -4146,33 +4424,44 @@ function App() {
     return () => cancelAnimationFrame(id);
   }, [highlights, dbReaderChapter, dbReaderIndex, currentBookSlug, readableBooks]);
 
+  // Year annotation and script conversion are baked into a section when it
+  // renders, so a change re-renders the section on display; the page on
+  // display is held throughout. When the reader becomes ready the section
+  // already shows the current settings and is only re-displayed, still held.
+  // 年号标注、繁简转换在章节渲染时写入正文，切换后重新渲染当前章节，全程停在原来那一页；
+  // 阅读器就绪时章节已按当前设置渲染，只重新显示，同样停在原页。
   useEffect(() => {
-    if (!readerReady || !renditionRef.current || !currentCfiRef.current) return;
-
-    // For layout/script changes that only need a re-render of the current page
-    // (auto-annotate, script variant), just re-display.
-    // But for readerLayout changes, we must rebuild the rendition because
-    // epubjs paginated flow doesn't support vertical-rl at all.
-    void openLocation(currentCfiRef.current);
+    const rendition = renditionRef.current;
+    if (!readerReady || !rendition || !currentCfiRef.current) return;
+    redisplayEpubPage(rendition, holdEpubPage(rendition));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoAnnotate, scriptVariant, readerReady]);
 
-  // When layout changes, just re-display the current page to apply new styles.
+  // A layout change re-renders the section to apply its styles.
   // Vertical mode keeps paginated flow — epubjs reports total=1 per section
   // but that's fine because each section = one chapter after EPUB splitting.
-  // Prev/next simply go to prev/next chapter in vertical mode.
+  // Prev/next simply go to prev/next chapter in vertical mode. Vertical text
+  // keeps epub.js's own placement (no held page).
+  // 排版方向变化时重新渲染章节以套用样式；竖排不保持页面，沿用 epub.js 自己的定位。
   useEffect(() => {
-    if (!readerReady || !renditionRef.current || !currentCfiRef.current) return;
-    void openLocation(currentCfiRef.current);
+    const rendition = renditionRef.current;
+    if (!readerReady || !rendition || !currentCfiRef.current) return;
+    redisplayEpubPage(rendition, holdEpubPage(rendition));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readerLayout, readerReady]);
 
   useEffect(() => {
-    if (!readerReady || !renditionRef.current) return;
-    renditionRef.current.spread?.(getRenditionSpread(), 720);
-    if (currentCfiRef.current) {
-      void openLocation(currentCfiRef.current);
-    }
+    const rendition = renditionRef.current;
+    if (!readerReady || !rendition) return;
+    // Hold the character on display before the columns change in place.
+    // 分栏就地变化之前，先记下屏上要停住的那个字。
+    const hold = holdEpubPage(rendition);
+    rendition.spread?.(getRenditionSpread(), 720);
+    if (!currentCfiRef.current) return;
+    // Move there before the next frame, then re-display as before.
+    // 下一帧之前先翻到那个字所在屏，再照旧重新显示。
+    if (hold) correctEpubRestore(rendition, hold);
+    redisplayEpubPage(rendition, hold);
   // 分栏切换只调用 epubjs spread 并回到当前页；openLocation 用 ref 保持最新状态。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageSpread, readerReady]);
