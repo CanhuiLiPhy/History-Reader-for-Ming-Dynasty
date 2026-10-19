@@ -40,6 +40,16 @@ import {
   type CharPageMeasurer,
   type TextAnchor,
 } from "./lib/reflow-anchor";
+import {
+  dbPositionToRestore,
+  dbReadingPosition,
+  epubPositionToRestore,
+  epubReadingPosition,
+  parseReadingPosition,
+  readingPositionStorageName,
+  sameReadingPosition,
+  type ReadingPosition,
+} from "./lib/reading-position";
 import { ShixiTree } from "./components/ShixiTree";
 import { HistoricalCalculator } from "./components/HistoricalCalculator";
 import {
@@ -346,6 +356,53 @@ const EPUB_REFLOW_CORRECTIONS = [160, 480];
 /** 中文：EPUB 改字号/字体后分几次校正位置（ms）。 / Correction delays after an EPUB font change. */
 const EPUB_FONT_CORRECTIONS = [80, 260, 700, 1400];
 
+/**
+ * 中文：重新打开 EPUB 书时正在进行的位置恢复：打开所用的 CFI + 要回到的页首字。
+ *
+ * A reading-position restore in progress after an EPUB book was reopened.
+ *
+ * @property cfi - The saved `last-location` CFI the book was opened at.
+ *   Re-displaying it, or the current location, is not a navigation and keeps
+ *   the restore going; any other target ends it.
+ * @property anchor - The saved first character. Each correction keeps
+ *   `screen` in step (-1 before the first one); `serial` and `displayCfi` are
+ *   not used by the restore.
+ */
+type EpubRestore = { cfi: string; anchor: EpubTextAnchor };
+
+/**
+ * 中文：重新打开段落书时正在进行的位置恢复。
+ *
+ * A reading-position restore in progress after a paragraph book was reopened.
+ *
+ * @property key - `${slug}:${chapterIndex}` of the chapter it belongs to.
+ * @property anchor - The saved first character.
+ * @property page - Page it was last restored to, `null` before the chapter has
+ *   been laid out. A different logical target page afterwards means the reader
+ *   navigated, which ends the restore.
+ */
+type DbRestore = { key: string; anchor: TextAnchor; page: number | null };
+
+/** 中文：重新打开 EPUB 后（首次即时校正之外）再校正的时机（ms），应对字体加载等仍在变化的版面。 / Follow-up corrections after reopening an EPUB book. */
+const EPUB_RESTORE_CORRECTIONS = [120, 400, 900, 1600];
+
+/** 中文：恢复位置时最多等网络字体加载多久（ms）。 / Longest wait for web fonts before the final restore correction. */
+const RESTORE_FONT_WAIT_MS = 6000;
+
+/**
+ * 中文：等文档的网络字体加载完（最多等 RESTORE_FONT_WAIT_MS）。
+ *
+ * Resolve once `doc`'s pending web fonts have loaded, or after
+ * {@link RESTORE_FONT_WAIT_MS} at the latest.
+ *
+ * @param doc - The document whose `fonts.ready` to await, or `null`.
+ * @returns A promise that always resolves (never rejects).
+ */
+function fontsSettled(doc: Document | null | undefined): Promise<void> {
+  const ready = doc?.fonts?.ready?.then(() => undefined, () => undefined) ?? Promise.resolve();
+  return Promise.race([ready, new Promise<void>((resolve) => window.setTimeout(resolve, RESTORE_FONT_WAIT_MS))]);
+}
+
 /** 中文：年号标注外层 span 的类名。 / Class of the year-annotation wrapper spans. */
 const YEAR_ANNOTATION_CLASS = "mingshi-year-annotation";
 
@@ -624,6 +681,12 @@ function App() {
   const audioUrlRef = useRef("");
   const speechRequestRef = useRef(0);
   const initialLocationRef = useRef("");
+  // Precise reading position saved for the book being opened (read at boot and
+  // on a book switch); the EPUB reader applies it only together with the CFI
+  // it was saved with, see lib/reading-position.
+  // 正在打开的这本书保存的精确阅读位置（启动和切书时读入）；EPUB 只在打开所用的 CFI
+  // 与保存时一致时才采用，见 lib/reading-position。
+  const initialReadingPositionRef = useRef<ReadingPosition | null>(null);
   const currentCfiRef = useRef("");
   const currentHrefRef = useRef("");
   const pendingAnchorRef = useRef("");
@@ -1226,17 +1289,31 @@ function App() {
           : libraryBooksData.books.find((b) => b.slug === "ming-shi") || libraryBooksData.books[0];
         const initialSlug = initialBook?.slug || "ming-shi";
 
+        // The precise position saved for this book: the first character of the
+        // page last read. 这本书保存的精确阅读位置：上次那一页的页首字。
+        const initialPosition = parseReadingPosition(
+          await readPersistedState<unknown>(storageKey(readingPositionStorageName(initialSlug)), null),
+        );
+        if (cancelled) return;
+
         // Fetch the initial book's content (meta for EPUB books, chapters for DB books)
         let initialMeta: BookMeta | null = null;
         let initialDbChapters: DbReaderChaptersPayload | null = null;
         let initialDbChapter: DbReaderChapterPayload | null = null;
+        let initialDbRestore: DbRestore | null = null;
         try {
           if (initialBook?.hasEpub) {
             initialMeta = await fetchBookMeta(initialSlug);
           } else if (initialBook) {
             initialDbChapters = await fetchReaderChapters(initialSlug);
             if (initialDbChapters.chapters.length > 0) {
-              initialDbChapter = await fetchReaderChapter(initialSlug, 0);
+              // Reopen the saved chapter; its page is restored once laid out.
+              // 打开保存的那一章，排版完成后再翻到保存的那一页。
+              const restore = dbPositionToRestore(initialPosition, initialDbChapters.chapters.length);
+              initialDbChapter = await fetchReaderChapter(initialSlug, restore?.chapterIndex ?? 0);
+              if (restore && initialDbChapter.chapterIndex === restore.chapterIndex) {
+                initialDbRestore = { key: `${initialSlug}:${restore.chapterIndex}`, anchor: restore, page: null };
+              }
             }
           }
         } catch (error) {
@@ -1248,11 +1325,12 @@ function App() {
         setReadableBooks(libraryBooksData.books);
         activeBookSlugRef.current = initialSlug;
         dbChaptersRef.current = initialDbChapters;
+        dbRestoreRef.current = initialDbRestore;
         setCurrentBookSlug(initialSlug);
         setMeta(initialMeta);
         setDbReaderChapters(initialDbChapters);
         setDbReaderChapter(initialDbChapter);
-        setDbReaderIndex(0);
+        setDbReaderIndex(initialDbChapter?.chapterIndex ?? 0);
         setCustomActions(nextCustomActions);
         setAiSettings(mergeAiSettings(defaultsData, savedAiSettings, nextCustomActions));
         // Drop legacy unanchored db-cfis (just `db:slug:idx` — 3 parts). Both
@@ -1327,6 +1405,7 @@ function App() {
         const effectiveLastLocation = perBookLocation || (initialSlug === "ming-shi" ? savedLastLocation : "");
         setLastLocation(effectiveLastLocation);
         initialLocationRef.current = effectiveLastLocation;
+        initialReadingPositionRef.current = initialPosition;
         setHasLoadedLocalState(true);
       } catch (error) {
         if (cancelled) return;
@@ -2135,6 +2214,10 @@ function App() {
     bookRequestRef.current = controller;
     activeBookSlugRef.current = slug;
     dbChaptersRef.current = null;
+    // A restore still running for the book being left must not leak into this one.
+    // 上一本书尚未完成的位置恢复不能带到这本书。
+    epubRestoreRef.current = null;
+    dbRestoreRef.current = null;
     setMeta(null);
     setBookSwitching(true);
     setDbReaderLoading(false);
@@ -2158,9 +2241,16 @@ function App() {
       // Load the destination book's per-book saved location so we resume
       // where the user left off in THAT book instead of dropping them at
       // the in-page TOC every switch.
-      const savedForTarget = await readPersistedState<string>(storageKey(`last-location:${slug}`), "");
+      // A search jump navigates elsewhere right after the switch, so it skips
+      // the precise position. 检索跳转随后会去别处，不恢复精确位置。
+      const [savedForTarget, savedPositionValue] = await Promise.all([
+        readPersistedState<string>(storageKey(`last-location:${slug}`), ""),
+        preserveSearch ? Promise.resolve(null) : readPersistedState<unknown>(storageKey(readingPositionStorageName(slug)), null),
+      ]);
       if (controller.signal.aborted) return;
+      const savedPosition = parseReadingPosition(savedPositionValue);
       initialLocationRef.current = savedForTarget;
+      initialReadingPositionRef.current = savedPosition;
       setLastLocation(savedForTarget);
       pendingAnchorRef.current = "";
       currentCfiRef.current = "";
@@ -2184,7 +2274,11 @@ function App() {
         dbChaptersRef.current = chaptersData;
         setDbReaderChapters(chaptersData);
         if (chaptersData.chapters.length > 0) {
-          await loadDbReaderChapter(0);
+          // Back to the saved chapter; its page is restored once laid out.
+          // 回到保存的那一章，排版完成后再翻到保存的那一页。
+          const restore = dbPositionToRestore(savedPosition, chaptersData.chapters.length);
+          if (restore) dbRestoreRef.current = { key: `${slug}:${restore.chapterIndex}`, anchor: restore, page: null };
+          await loadDbReaderChapter(restore?.chapterIndex ?? 0);
         }
       }
     } catch (error) {
@@ -2200,6 +2294,9 @@ function App() {
     const chapters = dbChaptersRef.current;
     const slug = activeBookSlugRef.current;
     if (!chapters || chapters.slug !== slug || index < 0 || index >= chapters.chapters.length) return;
+    // Opening any other chapter is a navigation and ends a pending restore.
+    // 打开别的章节属于跳转，未完成的位置恢复随之作废。
+    if (dbRestoreRef.current && dbRestoreRef.current.key !== `${slug}:${index}`) dbRestoreRef.current = null;
     chapterRequestRef.current?.abort();
     const controller = new AbortController();
     chapterRequestRef.current = controller;
@@ -2345,13 +2442,86 @@ function App() {
    * @returns Its zero-based page in the current layout, or `null` when the
    *   chapter is not laid out.
    */
-  function resolveDbTextAnchorPage(anchor: DbTextAnchor): number | null {
+  function resolveDbTextAnchorPage(anchor: TextAnchor): number | null {
     const host = dbReaderHostRef.current;
     const article = host?.querySelector<HTMLElement>(".db-reader-article");
     if (!host || !article || !host.clientWidth) return null;
     const nodes = collectAnchorTextNodes(article);
     const position = resolveTextAnchor(nodes, anchor);
     return position ? pageOfTextPosition(nodes, position, dbCharMeasurer(host)) : null;
+  }
+
+  // ---- Reading position across reopenings (both book kinds) ----
+  // Each navigation stores the first character of the page on display next to
+  // the legacy last-location; reopening the book (page reload, or switching
+  // away and back) returns to that page. See lib/reading-position.
+  // 重新打开书时回到同一页：每次翻页都把当前页的页首字随旧的 last-location 一起存下，
+  // 重新打开（刷新页面，或切走再切回）时据此翻回那一页。见 lib/reading-position。
+  const dbRestoreRef = useRef<DbRestore | null>(null);
+  // Last record written per book, so unchanged positions are not rewritten. / 每本书最近写入的记录，避免重复写入。
+  const savedReadingPositionsRef = useRef(new Map<string, ReadingPosition>());
+
+  /**
+   * 中文：写入某本书的精确阅读位置；与上次写入完全相同时跳过。
+   *
+   * Persist a book's reading position, skipping a write identical to the
+   * previous one for that book.
+   *
+   * @param slug - Slug of the book the position belongs to.
+   * @param position - The record to store; `null` stores nothing.
+   */
+  function saveReadingPosition(slug: string, position: ReadingPosition | null) {
+    if (!slug || !position) return;
+    const saved = savedReadingPositionsRef.current;
+    if (sameReadingPosition(saved.get(slug) ?? null, position)) return;
+    saved.set(slug, position);
+    void writePersistedState(storageKey(readingPositionStorageName(slug)), position);
+  }
+
+  /**
+   * 中文：仍然有效的段落书位置恢复；放置后读者翻页、换章或跳转检索结果即作废。
+   *
+   * The paragraph-book restore while it still applies. After it has been
+   * placed, a different logical target page means the reader navigated (page
+   * turn, slider, chapter load) and a pending search jump navigates too; either
+   * ends it. Before its chapter is on display it is kept but not returned.
+   *
+   * @returns The restore to apply now, or `null`.
+   */
+  function heldDbRestore(): DbRestore | null {
+    const restore = dbRestoreRef.current;
+    if (!restore) return null;
+    if (pendingSearchNavRef.current || (restore.page !== null && dbTargetPageRef.current !== restore.page)) {
+      dbRestoreRef.current = null;
+      return null;
+    }
+    return restore.key === dbChapterKey() ? restore : null;
+  }
+
+  /**
+   * 中文：把段落书当前的阅读位置存下：恢复期间用保存的那个字，新算法锚点有效时用锚点字，否则用这一页的页首字。
+   *
+   * Persist the paragraph reader's position: the restored character while a
+   * restore holds, the anchored algorithm's sticky anchor while it holds one,
+   * else the first character of `page`. Neither algorithm's state is changed.
+   *
+   * @param page - Zero-based page on display, or the page being turned to.
+   */
+  function persistDbReadingPosition(page: number) {
+    const host = dbReaderHostRef.current;
+    const article = host?.querySelector<HTMLElement>(".db-reader-article");
+    const chapter = dbReaderChapter;
+    if (!host || !article || !chapter || !host.clientWidth || !Number.isFinite(page)) return;
+    if (chapter.slug !== activeBookSlugRef.current) return;
+    const restore = heldDbRestore();
+    let anchor: TextAnchor | null = restore && restore.page !== null ? restore.anchor : null;
+    if (!anchor && reflowAlgorithmRef.current === "anchored") anchor = usableDbTextAnchor();
+    if (!anchor) {
+      const nodes = collectAnchorTextNodes(article);
+      const position = findFirstTextPositionOnPage(nodes, dbCharMeasurer(host), Math.max(0, page));
+      anchor = position ? textAnchorAt(nodes, position) : null;
+    }
+    saveReadingPosition(chapter.slug, dbReadingPosition(chapter.chapterIndex, anchor));
   }
 
   // DB-reader（无 EPUB 的书）的滑动翻页。这类书直接渲染在主文档里，不在
@@ -2399,11 +2569,14 @@ function App() {
     }
     dbTargetPageRef.current = next;
     dbAnchorParaRef.current = null;
+    dbRestoreRef.current = null;
     // Anchored algorithm: the destination's first character is known now,
     // so a layout change during the smooth scroll still lands correctly.
     // 新算法：目标页页首字此刻即可确定，平滑滚动途中版面变化也能落对位置。
     if (reflowAlgorithmRef.current === "anchored") captureDbTextAnchor(next);
     host.scrollTo({ left: next * cw, behavior: "smooth" });
+    // Saved now so a reload right after the turn still reopens here. / 立即保存，翻页后马上刷新也能回到这一页。
+    persistDbReadingPosition(next);
     // The scroll-settle listener captures the anchor once navigation ends.
   }
 
@@ -2414,12 +2587,14 @@ function App() {
     const target = Math.round(Math.max(0, Math.min(1, progress)) * (total - 1));
     dbTargetPageRef.current = target;
     dbAnchorParaRef.current = null;
+    dbRestoreRef.current = null;
     // An explicit absolute jump cancels any in-flight smooth page turn.
     host.scrollTo({ left: target * host.clientWidth, behavior: "instant" });
     setDbPageTotal(total);
     setDbPageIndex(target);
     captureDbAnchor();
     if (reflowAlgorithmRef.current === "anchored") captureDbTextAnchor(target);
+    persistDbReadingPosition(target);
   }
 
   // Recompute total pages whenever the chapter content or theme/font changes.
@@ -2459,6 +2634,11 @@ function App() {
       const textAnchor = anchoredReflow ? usableDbTextAnchor() : null;
       const anchoredPage = textAnchor ? resolveDbTextAnchorPage(textAnchor) : null;
       if (anchoredPage !== null) targetPage = anchoredPage;
+      // Reopened book: until the reader navigates, the page holding the saved
+      // first character wins. 重新打开的书：读者翻页之前，以保存的页首字所在页为准。
+      const restore = heldDbRestore();
+      const restoredPage = restore ? resolveDbTextAnchorPage(restore.anchor) : null;
+      if (restoredPage !== null) targetPage = restoredPage;
       const clamped = Math.max(0, Math.min(total - 1, targetPage));
       const desired = clamped * cw;
       if (Math.abs(host.scrollLeft - desired) > 1) {
@@ -2466,13 +2646,16 @@ function App() {
       }
       dbTargetPageRef.current = clamped;
       setDbPageIndex(clamped);
+      if (restore && restoredPage !== null) restore.page = clamped;
       if (anchoredReflow) {
         // Same reading position, now kept on this page; otherwise a navigation
-        // just landed here and this page's first character becomes the anchor.
-        // 阅读位置不变，只记下它现在所在的页；否则是刚跳转到这里，以本页页首字为新锚点。
-        if (textAnchor && anchoredPage !== null) textAnchor.page = clamped;
+        // (a restore counts as one) just landed here and this page's first
+        // character becomes the anchor.
+        // 阅读位置不变，只记下它现在所在的页；否则是刚跳转到这里（恢复位置也算），以本页页首字为新锚点。
+        if (textAnchor && anchoredPage !== null && restoredPage === null) textAnchor.page = clamped;
         else captureDbTextAnchor(clamped);
       }
+      persistDbReadingPosition(clamped);
     };
     // Wait one frame so CSS columns have finished laying out
     let frame = requestAnimationFrame(recompute);
@@ -2511,10 +2694,30 @@ function App() {
         if (reflowAlgorithmRef.current === "anchored" && !usableDbTextAnchor()) {
           captureDbTextAnchor(dbTargetPageRef.current);
         }
+        persistDbReadingPosition(dbTargetPageRef.current);
       }, 220);
     };
     host.addEventListener("scroll", onScroll, { passive: true });
+    // Reopened book: web fonts that finish loading after the first layout
+    // re-flow the chapter, so place the restored page once more; the restore
+    // is over after that.
+    // 重新打开的书：网络字体在首次排版之后才加载完会让章节重排，届时再校正一次，恢复随即结束。
+    let effectActive = true;
+    let restoreFrame = 0;
+    const restoreAtSetup = dbRestoreRef.current;
+    if (restoreAtSetup) {
+      void fontsSettled(document).then(() => {
+        if (!effectActive) return;
+        restoreFrame = requestAnimationFrame(() => {
+          if (!effectActive || restoreAtSetup.page === null || heldDbRestore() !== restoreAtSetup) return;
+          recompute();
+          if (dbRestoreRef.current === restoreAtSetup) dbRestoreRef.current = null;
+        });
+      });
+    }
     return () => {
+      effectActive = false;
+      cancelAnimationFrame(restoreFrame);
       cancelAnimationFrame(frame);
       window.removeEventListener("resize", onResize);
       host.removeEventListener("scroll", onScroll);
@@ -2554,6 +2757,15 @@ function App() {
     const rendition = renditionRef.current;
     if (!rendition) return;
     epubNavSerialRef.current += 1;
+    // Re-displaying the location being restored, or the current location
+    // (settings toggles, the reader becoming ready), is not a navigation: the
+    // restore continues and is re-applied once it is shown. Any other target
+    // ends it.
+    // 重新显示正在恢复的位置或当前位置（切换设置、阅读器就绪时）不算跳转：恢复继续，
+    // 显示完再校正一次；跳到其他位置则结束恢复。
+    const restore = epubRestoreRef.current;
+    const keepsRestore = Boolean(restore && target && (target === restore.cfi || target === currentCfiRef.current));
+    if (restore && !keepsRestore) epubRestoreRef.current = null;
 
     // Look up chapter info from navigation map (for label & forced index)
     const navigation = chapterNavigationRef.current;
@@ -2569,10 +2781,15 @@ function App() {
 
     // CFI target (from progress bar, bookmarks, saved location)
     if (target.startsWith("epubcfi(")) {
+      let shown = false;
       try {
         await rendition.display(target);
-        return;
+        shown = true;
       } catch { /* fall through to href attempts */ }
+      if (shown) {
+        if (restore && keepsRestore) correctEpubRestore(rendition, restore);
+        return;
+      }
     }
 
     // href target — try several path variants because epub.js stores spine
@@ -2610,11 +2827,13 @@ function App() {
 
   function goNextPage() {
     epubNavSerialRef.current += 1;
+    epubRestoreRef.current = null;
     renditionRef.current?.next?.();
   }
 
   function goPrevPage() {
     epubNavSerialRef.current += 1;
+    epubRestoreRef.current = null;
     renditionRef.current?.prev?.();
   }
 
@@ -2783,6 +3002,7 @@ function App() {
     const rendition = renditionRef.current;
     if (!rendition?.manager) return;
     epubNavSerialRef.current += 1;
+    epubRestoreRef.current = null;
     const chapterHref = rendition.currentLocation?.()?.start?.href;
     const navigate = () => {
       if (renditionRef.current !== rendition || !rendition.manager) return;
@@ -3031,6 +3251,109 @@ function App() {
     rendition.resize?.(width, height);
   }
 
+  // ---- Reading position across reopenings: EPUB ----
+  // Saved with every reported location (lib/reading-position); restored when
+  // the book is reopened at the saved CFI. The anchored algorithm's state is
+  // only read here, never changed.
+  // EPUB 的跨次打开阅读位置：每次报告位置时随 CFI 一起保存，在保存的 CFI 处重新打开时恢复。
+  // 这里只读取新算法的锚点，不改动它。
+  const epubRestoreRef = useRef<EpubRestore | null>(null);
+
+  /**
+   * 中文：EPUB 当前屏的页首字（只计算，不改动重排算法的锚点）。
+   *
+   * First character of the EPUB screen on display, computed without touching
+   * the anchored algorithm's stored anchor.
+   *
+   * @param geometry - Non-null result of {@link epubPagedGeometry}.
+   * @returns The anchor, or `null` when the screen holds no text.
+   */
+  function epubScreenAnchor(geometry: NonNullable<ReturnType<typeof epubPagedGeometry>>): TextAnchor | null {
+    const nodes = collectAnchorTextNodes(geometry.doc.body);
+    const position = findFirstTextPositionOnPage(nodes, epubCharMeasurer(geometry.doc, geometry.delta), geometry.screen);
+    return position ? textAnchorAt(nodes, position) : null;
+  }
+
+  /**
+   * 中文：把 EPUB 当前的阅读位置随刚报告的 CFI 一起存下。
+   *
+   * Persist the EPUB reading position together with the CFI just reported as
+   * `last-location`. The anchor is the restored character while a restore
+   * holds this screen, the anchored algorithm's sticky anchor while it holds
+   * this screen, else the first character of the screen.
+   *
+   * @param rendition - The rendition that reported the location.
+   * @param slug - Slug of the book that rendition shows.
+   * @param cfi - The reported `location.start.cfi`.
+   */
+  function persistEpubReadingPosition(rendition: EpubRenditionLike, slug: string, cfi: string) {
+    if (!cfi || slug !== activeBookSlugRef.current || readerLayoutRef.current === "vertical") return;
+    const geometry = epubPagedGeometry(rendition);
+    const sectionIndex = geometry?.view.section?.index ?? -1;
+    if (!geometry || sectionIndex < 0) return;
+    const holdsScreen = (anchor: EpubTextAnchor | null | undefined): anchor is EpubTextAnchor =>
+      Boolean(anchor && anchor.sectionIndex === sectionIndex && anchor.screen === geometry.screen);
+    const restored = epubRestoreRef.current?.anchor;
+    const sticky = reflowAlgorithmRef.current === "anchored" && epubTextAnchorRef.current?.serial === epubNavSerialRef.current
+      ? epubTextAnchorRef.current
+      : null;
+    const anchor = holdsScreen(restored) ? restored : holdsScreen(sticky) ? sticky : epubScreenAnchor(geometry);
+    saveReadingPosition(slug, epubReadingPosition(cfi, sectionIndex, anchor));
+  }
+
+  /**
+   * 中文：把 EPUB 翻到正在恢复的那个字所在的屏；新算法正在重排时把位置交给它并结束恢复。
+   *
+   * Move the EPUB to the screen holding the character being restored. While
+   * an anchored re-pagination is in progress the position belongs to it — its
+   * anchor was taken from the screen on display — so the restore ends instead.
+   *
+   * @param rendition - The rendition the restore belongs to.
+   * @param restore - The restore to apply; ignored once no longer current.
+   * @returns True when the saved character was found and placed.
+   */
+  function correctEpubRestore(rendition: EpubRenditionLike, restore: EpubRestore): boolean {
+    if (epubRestoreRef.current !== restore || renditionRef.current !== rendition) return false;
+    const lock = epubAnchorLockRef.current;
+    if (epubPendingReflowRef.current || (lock && lock.until > performance.now())) {
+      epubRestoreRef.current = null;
+      return false;
+    }
+    try {
+      return moveEpubToAnchor(rendition, restore.anchor);
+    } catch {
+      // A half-torn-down view only loses this correction. / 视图正在销毁时只是少校正一次。
+      return false;
+    }
+  }
+
+  /**
+   * 中文：重新打开 EPUB 后再分几次校正（应对网络字体加载等仍在变化的版面），最后一次之后恢复结束。
+   *
+   * Follow-up corrections after reopening, because the layout keeps settling
+   * after the first render (web fonts, images). They run through epub.js's
+   * queue; the last one — after the timers and after the section's fonts have
+   * settled — ends the restore. Any navigation ends it earlier.
+   *
+   * @param rendition - The rendition the restore belongs to.
+   * @param restore - The restore in progress.
+   */
+  function scheduleEpubRestoreCorrections(rendition: EpubRenditionLike, restore: EpubRestore) {
+    let remaining = EPUB_RESTORE_CORRECTIONS.length + 1;
+    const correct = () => {
+      correctEpubRestore(rendition, restore);
+      remaining -= 1;
+      if (remaining === 0 && epubRestoreRef.current === restore) epubRestoreRef.current = null;
+    };
+    const queueCorrection = () => {
+      if (renditionRef.current !== rendition || epubRestoreRef.current !== restore) return;
+      if (rendition.q) void rendition.q.enqueue(correct).catch(() => {});
+      else correct();
+    };
+    for (const delay of EPUB_RESTORE_CORRECTIONS) window.setTimeout(queueCorrection, delay);
+    void fontsSettled(epubPagedGeometry(rendition)?.doc).then(queueCorrection);
+  }
+
 
   useEffect(() => {
     if (!meta || !hasLoadedLocalState || !readerHostRef.current || bookRef.current) return;
@@ -3046,6 +3369,10 @@ function App() {
     epubPendingReflowRef.current = null;
     epubAnchorLockRef.current = null;
     epubTextAnchorRef.current = null;
+    epubRestoreRef.current = null;
+    // The book this rendition shows; positions it reports are saved under it.
+    // 本 rendition 显示的书；它报告的阅读位置都存在这本书名下。
+    const renditionSlug = currentBookSlug;
 
     // epubjs needs concrete pixel dimensions for paginated flow to work.
     // "100%" makes it unable to calculate page breaks → total=1 for every section.
@@ -3384,6 +3711,7 @@ function App() {
       syncRenderedPagination(location);
       setCurrentChapterIndex(derived.chapterIndex);
       setLastLocation(nextCfi);
+      persistEpubReadingPosition(rendition, renditionSlug, nextCfi);
       pendingLocationLabelRef.current = "";
       pendingLocationTargetRef.current = "";
       setSelectionOverlay((prev) => ({ ...prev, visible: false }));
@@ -3410,6 +3738,16 @@ function App() {
         if (epubNavSerialRef.current === pendingReflow.serial) moveEpubToAnchor(rendition, pendingReflow);
         setEpubRepaginating(false);
         scheduleEpubAnchorCorrections(rendition, pendingReflow, EPUB_REFLOW_CORRECTIONS);
+      }
+
+      // Reopened book: the section opened at the saved location now carries its
+      // final text too, so move to the page holding the saved first character
+      // before it is ever painted at epub.js's coarser placement.
+      // 重新打开的书：在保存位置打开的章节此刻文字也已定型，趁 epub.js 的粗略定位尚未绘出，
+      // 先翻到保存的页首字所在页。
+      const restore = epubRestoreRef.current;
+      if (restore && (section as { index?: number } | undefined)?.index === restore.anchor.sectionIndex) {
+        correctEpubRestore(rendition, restore);
       }
 
       // Defensive re-sync: epub.js doesn't always fire `relocated` after a
@@ -3473,6 +3811,17 @@ function App() {
         pendingAnchorRef.current = extractAnchor(preferredStart);
         await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
         if (disposed) return;
+        // Opening at the saved CFI: the precise position saved with it brings
+        // back the exact page. 在保存的 CFI 处打开：用随它保存的精确位置回到原来那一页。
+        const saved = epubPositionToRestore(initialReadingPositionRef.current, startTarget);
+        initialReadingPositionRef.current = null;
+        const restore: EpubRestore | null = saved && readerLayoutRef.current !== "vertical"
+          ? {
+            cfi: saved.cfi,
+            anchor: { offset: saved.offset, context: saved.context, sectionIndex: saved.sectionIndex, screen: -1, displayCfi: "", serial: -1 },
+          }
+          : null;
+        epubRestoreRef.current = restore;
         if (import.meta.env.DEV) {
           console.info("epub:display:start", startTarget || "default");
         }
@@ -3482,6 +3831,7 @@ function App() {
           console.info("epub:display:done");
         }
         setReaderReady(true);
+        if (restore && epubRestoreRef.current === restore) scheduleEpubRestoreCorrections(rendition, restore);
         void book.ready
           .then(async () => {
             try {
@@ -3559,6 +3909,7 @@ function App() {
     return () => {
       disposed = true;
       setEpubRepaginating(false);
+      epubRestoreRef.current = null;
       window.cancelAnimationFrame(resizeFrame);
       delayedUpdates.forEach((timer) => window.clearTimeout(timer));
       delayedUpdates.clear();

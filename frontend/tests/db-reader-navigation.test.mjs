@@ -12,6 +12,11 @@ const anchorSource = readFileSync(new URL("../src/lib/reflow-anchor.ts", import.
 const anchorModule = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(anchorSource, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText).toString("base64")}`);
+// The reading-position records run for real too. / 阅读位置记录的逻辑同样真实运行。
+const positionSource = readFileSync(new URL("../src/lib/reading-position.ts", import.meta.url), "utf8");
+const positionModule = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(positionSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText).toString("base64")}`);
 
 const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -50,7 +55,8 @@ function keyboardEffect() {
 }
 
 const functions = ["loadDbReaderChapter", "captureDbAnchor", "flipDbPage", "jumpDbPage", "scrollToSearchTarget",
-  "dbChapterKey", "captureDbTextAnchor", "usableDbTextAnchor", "resolveDbTextAnchorPage"];
+  "dbChapterKey", "captureDbTextAnchor", "usableDbTextAnchor", "resolveDbTextAnchorPage",
+  "saveReadingPosition", "heldDbRestore", "persistDbReadingPosition"];
 const keyboard = keyboardEffect();
 const javascript = ts.transpileModule([
   ...functions.map(appFunction),
@@ -80,6 +86,9 @@ function createHarness({ index = 1, totalChapters = 3, page = 1, totalPages = 3 
   const timers = new Map();
   const requests = [];
   const scrolls = [];
+  const writes = [];
+  // Web fonts of the page; tests settle them explicitly. / 页面的网络字体，由用例显式「加载完」。
+  const fonts = deferred();
   const listeners = new Map();
   const windowListeners = new Map();
   const article = { style: { columnWidth: "500px" } };
@@ -157,6 +166,15 @@ function createHarness({ index = 1, totalChapters = 3, page = 1, totalPages = 3 
         return null;
       };
     },
+    // Reading position across reopenings. / 跨次打开的阅读位置。
+    dbRestoreRef: { current: null },
+    savedReadingPositionsRef: { current: new Map() },
+    fontsSettled: () => fonts.promise,
+    dbReadingPosition: positionModule.dbReadingPosition,
+    sameReadingPosition: positionModule.sameReadingPosition,
+    readingPositionStorageName: positionModule.readingPositionStorageName,
+    storageKey: (name) => `mingshi-reader-ai:${name}`,
+    writePersistedState: (key, value) => { writes.push({ key, value }); return Promise.resolve(); },
     skipNextDbScrollResetRef: { current: false },
     pendingSearchNavRef: { current: null },
     renditionRef: { current: null },
@@ -213,7 +231,7 @@ function createHarness({ index = 1, totalChapters = 3, page = 1, totalPages = 3 
   function pressKey(key) {
     windowListeners.get("keydown")?.({ key, target: null, preventDefault() {} });
   }
-  return { api: context.navigation, context, state, host, article, requests, scrolls, chapter,
+  return { api: context.navigation, context, state, host, article, requests, scrolls, writes, fonts, chapter,
     frames, timers, listeners, paragraph, render, flushFrames, layout, commitKeyboardEffect, pressKey };
 }
 
@@ -490,4 +508,123 @@ test("anchored reflow: a navigation that has not settled yet keeps its target pa
   resizeHost(h, 500);
   h.layout();
   assert.equal(h.state.page, 0);
+});
+
+// ---- Reopening a paragraph book at the saved page ----
+// 重新打开段落书：回到保存的那一页。
+
+/** A restore as switchBook / boot set it up for chapter `index` of the test book. */
+function savedRestore(offset, index = 1) {
+  return { key: `test-book:${index}`, anchor: { offset, context: String(Math.floor(offset / 100)).repeat(16) }, page: null };
+}
+
+/** Last reading position written for the test book. */
+function lastSaved(h) {
+  const writes = h.writes.filter((write) => write.key === "mingshi-reader-ai:reading-position:test-book");
+  return writes.at(-1)?.value;
+}
+
+test("reopening restores the page whose first character was saved, and saves it again unchanged", () => {
+  const h = createHarness({ index: 1, page: 0, totalPages: 20 });
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 0;
+  h.context.dbTargetPageRef.current = 0; // a freshly loaded chapter starts at page 0
+  h.context.dbRestoreRef.current = savedRestore(350);
+  h.layout();
+  assert.equal(h.state.page, 7, "character 350 at 50 per page is on page 7");
+  assert.equal(h.host.scrollLeft, 7 * 500);
+  assert.equal(h.context.dbTargetPageRef.current, 7);
+  assert.equal(h.context.dbRestoreRef.current.page, 7);
+  assert.deepEqual(lastSaved(h), { v: 1, kind: "db", chapterIndex: 1, offset: 350, context: "3".repeat(16) });
+});
+
+test("the restore holds through layout settling, then ends once the fonts have loaded", async () => {
+  const h = createHarness({ index: 1, page: 0, totalPages: 20 });
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 0;
+  h.context.dbTargetPageRef.current = 0;
+  h.context.dbRestoreRef.current = savedRestore(350);
+  h.render();
+  const cleanup = h.context.navigation.runPaginationEffect();
+  h.flushFrames();
+  assert.equal(h.state.page, 7);
+  // A web font finishing re-flows the chapter: 40 characters per page now. / 网络字体加载完，章节重排为每页 40 字。
+  resizeHost(h, 400);
+  h.fonts.resolve();
+  await flush();
+  h.flushFrames();
+  assert.equal(h.state.page, 8, "character 350 at 40 per page is on page 8");
+  assert.equal(h.host.scrollLeft, 8 * 400);
+  assert.equal(h.context.dbRestoreRef.current, null, "the restore is over after the fonts settled");
+  assert.equal(lastSaved(h).offset, 350);
+  cleanup();
+});
+
+test("turning the page ends the restore and saves the new page's first character", () => {
+  const h = createHarness({ index: 1, page: 0, totalPages: 20 });
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 0;
+  h.context.dbTargetPageRef.current = 0;
+  h.context.dbRestoreRef.current = savedRestore(350);
+  h.layout();
+  h.api.flipDbPage(1);
+  assert.equal(h.context.dbRestoreRef.current, null);
+  assert.equal(h.context.dbTargetPageRef.current, 8);
+  assert.equal(lastSaved(h).offset, 400, "saved at once, before the smooth scroll settles");
+  // The legacy algorithm handles the next layout change exactly as before. / 之后的版面变化仍按旧算法处理。
+  resizeHost(h, 400);
+  h.layout();
+  assert.equal(h.state.page, 8);
+});
+
+test("a restore waits for its own chapter; opening another chapter or a search jump cancels it", async () => {
+  const h = createHarness({ index: 1, page: 0, totalPages: 20 });
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 0;
+  h.context.dbTargetPageRef.current = 0;
+  h.context.dbRestoreRef.current = savedRestore(350, 2);
+  h.layout();
+  assert.equal(h.state.page, 0, "chapter 1 is not the saved chapter");
+  assert.ok(h.context.dbRestoreRef.current, "kept until its chapter is on display");
+  const other = h.api.loadDbReaderChapter(0);
+  assert.equal(h.context.dbRestoreRef.current, null, "opening another chapter is a navigation");
+  h.requests[0].resolve(h.chapter(0));
+  await other;
+
+  const s = createHarness({ index: 1, page: 0, totalPages: 20 });
+  useTextLayout(s, 500);
+  s.host.scrollLeft = 0;
+  s.context.dbTargetPageRef.current = 0;
+  s.context.dbRestoreRef.current = savedRestore(350);
+  s.context.pendingSearchNavRef.current = { paragraphId: 12, text: "", anchor: "", attempts: 0 };
+  s.layout();
+  assert.equal(s.context.dbRestoreRef.current, null, "a pending search jump wins");
+  assert.notEqual(s.state.page, 7);
+});
+
+test("anchored algorithm: the restored page's first character becomes its sticky anchor", async () => {
+  const h = createHarness({ index: 1, page: 0, totalPages: 20 });
+  h.context.reflowAlgorithmRef.current = "anchored";
+  useTextLayout(h, 500);
+  h.host.scrollLeft = 0;
+  h.context.dbTargetPageRef.current = 0;
+  h.context.dbRestoreRef.current = savedRestore(350);
+  h.render();
+  const cleanup = h.context.navigation.runPaginationEffect();
+  h.flushFrames();
+  h.fonts.resolve();
+  await flush();
+  h.flushFrames();
+  cleanup();
+  assert.equal(h.context.dbRestoreRef.current, null);
+  assert.equal(h.context.dbTextAnchorRef.current.offset, 350);
+  for (let round = 0; round < 2; round += 1) {
+    resizeHost(h, 400);
+    h.layout();
+    assert.equal(h.state.page, 8);
+    resizeHost(h, 500);
+    h.layout();
+    assert.equal(h.state.page, 7);
+  }
+  assert.equal(lastSaved(h).offset, 350, "the saved position is the sticky anchor");
 });
