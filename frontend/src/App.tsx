@@ -1126,6 +1126,9 @@ function App() {
   // page; floating sheets cover it and leave its layout alone.
   // 宽屏下左右侧栏各自的显示方式：并排会挤窄正文并重排，浮动则盖在正文上、不动版面。
   const [sidebarPanelMode, setSidebarPanelMode] = useState<SidePanelMode>("docked");
+  // Whether the bottom progress bar stays visible while the left sidebar is closed.
+  // 收起左侧栏时是否仍显示底部阅读进度条。
+  const [progressBarWhenCollapsed, setProgressBarWhenCollapsed] = useState(true);
   const [assistantPanelMode, setAssistantPanelMode] = useState<SidePanelMode>("docked");
   // Trackpad two-finger swipe / mouse wheel paging, mirrored into a ref for the
   // native listeners (they live outside React's render cycle).
@@ -1251,6 +1254,7 @@ function App() {
           savedAssistantPanelMode,
           savedWheelPagingMode,
           savedReflowAlgorithm,
+          savedProgressBarWhenCollapsed,
         ] =
           await Promise.all([
             fetchDefaults(),
@@ -1283,6 +1287,7 @@ function App() {
             readPersistedState<string>(storageKey("assistant-panel-mode"), "docked"),
             readPersistedState<string>(storageKey("wheel-paging-mode"), "horizontal"),
             readPersistedState<string>(storageKey("reflow-algorithm"), "legacy"),
+            readPersistedState<boolean>(storageKey("progress-bar-when-sidebar-collapsed"), true),
           ]);
 
         if (cancelled) return;
@@ -1408,6 +1413,7 @@ function App() {
         wheelPagingModeRef.current = toWheelPagingMode(savedWheelPagingMode);
         setReflowAlgorithm(toReflowAlgorithm(savedReflowAlgorithm));
         reflowAlgorithmRef.current = toReflowAlgorithm(savedReflowAlgorithm);
+        setProgressBarWhenCollapsed(savedProgressBarWhenCollapsed !== false);
         readerLayoutRef.current = savedReaderLayout;
         scriptVariantRef.current = savedScriptVariant;
         pageSpreadRef.current = savedPageSpread;
@@ -1725,6 +1731,7 @@ function App() {
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("sidebar-panel-mode"), sidebarPanelMode); }, [sidebarPanelMode, hasLoadedLocalState]);
   useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("assistant-panel-mode"), assistantPanelMode); }, [assistantPanelMode, hasLoadedLocalState]);
   useEffect(() => { wheelPagingModeRef.current = wheelPagingMode; if (hasLoadedLocalState) void writePersistedState(storageKey("wheel-paging-mode"), wheelPagingMode); }, [wheelPagingMode, hasLoadedLocalState]);
+  useEffect(() => { if (hasLoadedLocalState) void writePersistedState(storageKey("progress-bar-when-sidebar-collapsed"), progressBarWhenCollapsed); }, [progressBarWhenCollapsed, hasLoadedLocalState]);
 
   // v1.2 Cmd/Ctrl+Z 撤销最近一次勾画（不论是否在标记模式都生效，只要有 stack）
   useEffect(() => {
@@ -6108,7 +6115,7 @@ function App() {
       : `${item.name} ${item.aliases.join(" ")} ${item.rank} ${item.keywords.join(" ")} ${item.subunits.join(" ")}`.includes(referenceQuery)
   );
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${assistantCollapsed ? "assistant-collapsed" : ""} ${sidebarPanelMode !== "docked" ? "sidebar-floating" : ""} ${assistantPanelMode !== "docked" ? "assistant-floating" : ""}`}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${assistantCollapsed ? "assistant-collapsed" : ""} ${sidebarPanelMode !== "docked" ? "sidebar-floating" : ""} ${assistantPanelMode !== "docked" ? "assistant-floating" : ""} ${progressBarWhenCollapsed ? "" : "progress-with-sidebar-only"}`}>
       {sidebarCollapsed && (
         <button type="button" className="sidebar-toggle-btn" onClick={() => setSidebarCollapsed(false)} title="展开侧边栏">
           <span className="hamburger-icon">&#9776;</span>
@@ -8132,6 +8139,10 @@ function App() {
                                     <option value="floating">浮在正文上：正文不动</option>
                                     <option value="floating-dismiss">浮在正文上：正文不动，点正文即收起</option>
                                   </select>
+                                </label>
+                                <label className="toggle-row">
+                                  <input type="checkbox" checked={progressBarWhenCollapsed} onChange={(e) => setProgressBarWhenCollapsed(e.target.checked)} />
+                                  <span>收起左侧栏时仍显示阅读进度条</span>
                                 </label>
                                 <label className="field-label">
                                   右侧栏（AI 助理、札记）

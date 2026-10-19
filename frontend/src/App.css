@@ -2579,6 +2579,56 @@ g.reader-circle line {
   }
 }
 
+/* 外观设置「收起左侧栏时仍显示阅读进度条」关闭时：左栏收起，进度条整行让出，正文占满。
+   With "keep the progress bar while the left sidebar is closed" turned off,
+   closing the sidebar removes the bar's row entirely (no leftover grid gap). */
+.app-shell.progress-with-sidebar-only.sidebar-collapsed .reader-column {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.app-shell.progress-with-sidebar-only.sidebar-collapsed .reader-footer {
+  display: none;
+}
+
+/* 侧栏浮在正文上时（宽屏浮动模式、窄屏抽屉），随侧栏出现的进度条也浮在正文底部，
+   打开侧栏不改变正文高度、不重排。
+   While the sidebar floats over the page (wide-screen floating mode or the
+   narrow-screen drawer), the bar that comes with it floats over the bottom
+   of the page as well, so opening the sidebar never changes the page height. */
+@media (min-width: 1101px) {
+  .app-shell.progress-with-sidebar-only.sidebar-floating:not(.sidebar-collapsed) .reader-column {
+    position: relative;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .app-shell.progress-with-sidebar-only.sidebar-floating:not(.sidebar-collapsed) .reader-footer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    background: var(--ui-panel-bg), var(--ui-popover-bg);
+    box-shadow: 0 -8px 28px rgba(48, 30, 12, 0.18);
+  }
+}
+
+@media (max-width: 1100px) {
+  .app-shell.progress-with-sidebar-only:not(.sidebar-collapsed) .reader-column {
+    position: relative;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .app-shell.progress-with-sidebar-only:not(.sidebar-collapsed) .reader-footer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    background: var(--ui-panel-bg), var(--ui-popover-bg);
+    box-shadow: 0 -8px 28px rgba(48, 30, 12, 0.18);
+  }
+}
+
 @media (max-width: 1360px) {
   .app-shell {
     --assistant-width: 320px;
